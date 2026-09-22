@@ -34,6 +34,7 @@ function extractFunction(src, name) {
 
 const src = readFileSync(process.argv[2], 'utf8');
 const viewIndicesSrc = extractFunction(src, 'viewIndices');
+const rowHasTextSrc = extractFunction(src, 'rowHasText');
 
 function sortColumn(values, { dir = 1, filters = {} } = {}) {
   const tab = { rows: values.map(v => [v]), filters, sortCol: 0, sortDir: dir };
@@ -80,6 +81,24 @@ eq(sortColumn(['10.00', null, '2.00']), ['2.00','10.00',null],
 
 eq(sortColumn(['alpha','beta','alphabet'], { filters: { 0: 'alpha' } }), ['alpha','alphabet'],
    'filtering still narrows the view');
+
+
+// The toolbar's search: rows holding the text in any column, ignoring case; NULL never matches, an
+// empty search keeps everything, and a column filter still has to match as well.
+function search(rows, q, filters = {}) {
+  const tab = { rows, filters, sortCol: -1, sortDir: 1, search: q };
+  const viewIndices = new Function('T', `${rowHasTextSrc}
+${viewIndicesSrc}
+return viewIndices;`)(() => tab);
+  return viewIndices('t1');
+}
+const people = [['1','Alice','Zurich'], ['2','Bob','Bern'], ['3','Carol','ZUG'], ['4',null,'Basel']];
+eq(search(people, 'zu'), [0,2], 'the search keeps the rows holding the text in any column, ignoring case');
+eq(search(people, 'nobody'), [], 'a search nothing holds keeps no rows');
+eq(search([['a',null],['b','null']], ''), [0,1], 'an empty search keeps every row');
+eq(search([['a',null],['b','null']], 'null'), [1], 'a NULL never matches the search');
+eq(search([['alpha','x'],['alpha','y'],['beta','x']], 'x', { 0: 'alpha' }), [0],
+   'the search and a column filter must both match');
 
 process.exit(fail ? 1 : 0);
 '@

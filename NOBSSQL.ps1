@@ -2827,10 +2827,16 @@ function Get-MysqlDownloadInfo { param([string]$Html)
 }
 # Only the two binaries the app runs, from <root>/bin/. Both are self-contained - OpenSSL and MySQL
 # 8's default authentication are built in, which was checked by running them from an empty folder.
+# The two binaries the app runs, and the OpenSSL libraries they load. They are not self-contained:
+# mysql.exe and mysqldump.exe from the winx64 zip import libcrypto-3-x64.dll and libssl-3-x64.dll.
+# Taking only the .exe files left them working on a machine that happens to have MySQL installed -
+# its bin is on PATH, and that is where Windows found the libraries - and failing on one that does
+# not, with "libcrypto-3-x64.dll was not found" from the loader. MariaDB's tools do not import them.
 function Get-MysqlZipMember { param([string]$Name)
     $parts = ($Name -replace '\\', '/').Split('/')
     if ($parts.Count -ne 3 -or $parts[1] -ne 'bin') { return $null }
     if ($parts[2] -in 'mysql.exe', 'mysqldump.exe') { return $parts[2] }
+    if (($parts[2] -like 'libcrypto*' -or $parts[2] -like 'libssl*') -and $parts[2] -like '*.dll') { return $parts[2] }
     return $null
 }
 function Api-DownloadMysqlTools {
@@ -2874,7 +2880,9 @@ function Api-DownloadMysqlTools {
                 if ($base) { [IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path $dest $base), $true); $got += $base }
             }
         } finally { $zip.Dispose() }
-        if ($got.Count -lt 2) { return '{"ok":false,"error":'+(J-Str "$($info.File) was downloaded and checked, but mysql.exe and mysqldump.exe were not both inside.")+'}' }
+        if (-not ($got -contains 'mysql.exe') -or -not ($got -contains 'mysqldump.exe')) { return '{"ok":false,"error":'+(J-Str "$($info.File) was downloaded and checked, but mysql.exe and mysqldump.exe were not both inside.")+'}' }
+        # Without these the binaries above do not start at all on a machine with no MySQL of its own.
+        if (-not ($got | Where-Object { $_ -like 'libcrypto*' })) { return '{"ok":false,"error":'+(J-Str "$($info.File) held the client binaries but not the OpenSSL libraries they load (libcrypto-3-x64.dll), so they would not run on a machine without MySQL installed.")+'}' }
         $mb = Join-Path $dest 'mysql.exe'; $db = Join-Path $dest 'mysqldump.exe'
         $cfgSave = Load-Cfg; if (-not $cfgSave) { $cfgSave = [pscustomobject]@{} }
         $cfgSave | Add-Member -NotePropertyName mysql_bin_mysql -NotePropertyValue $mb -Force

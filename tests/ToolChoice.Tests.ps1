@@ -69,9 +69,14 @@ try {
     Check ($null -eq (Get-MysqlDownloadInfo '<html>nothing</html>')) 'no archive named, nothing claimed'
     Check ($null -eq (Get-MysqlDownloadInfo '(mysql-9.1.0-winx64.zip) and no checksum').Md5) 'no checksum on the page, none invented'
 
-    "`n-- only the two client binaries are taken from the archive --"
+    "`n-- the client binaries and the OpenSSL they load are taken from the archive --"
     Check ((Get-MysqlZipMember 'mysql-8.4.11-winx64/bin/mysql.exe') -eq 'mysql.exe') 'bin/mysql.exe'
     Check ((Get-MysqlZipMember 'mysql-8.4.11-winx64\bin\mysqldump.exe') -eq 'mysqldump.exe') 'bin\mysqldump.exe, backslashes'
+    # The libraries the two import - without them the loader refuses to start either.
+    Check ((Get-MysqlZipMember 'mysql-8.4.11-winx64/bin/libcrypto-3-x64.dll') -eq 'libcrypto-3-x64.dll') 'bin/libcrypto-3-x64.dll'
+    Check ((Get-MysqlZipMember 'mysql-8.4.11-winx64/bin/libssl-3-x64.dll') -eq 'libssl-3-x64.dll') 'bin/libssl-3-x64.dll'
+    Check ($null -eq (Get-MysqlZipMember 'mysql-8.4.11-winx64/lib/libcrypto-3-x64.dll')) 'not lib/libcrypto-3-x64.dll'
+    Check ($null -eq (Get-MysqlZipMember 'mysql-8.4.11-winx64/bin/abseil_dll.dll')) 'not bin/abseil_dll.dll'
     foreach ($n in 'mysql-8.4.11-winx64/bin/mysqld.exe', 'mysql-8.4.11-winx64/lib/plugin/mysql.exe', 'mysql-8.4.11-winx64/mysql.exe', 'mysql-8.4.11-winx64/bin/x/mysql.exe', 'mysql.exe') {
         Check ($null -eq (Get-MysqlZipMember $n)) "not $n"
     }

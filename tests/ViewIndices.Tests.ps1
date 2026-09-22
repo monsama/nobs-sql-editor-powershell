@@ -122,6 +122,24 @@ return gridSearchStep;`);
   eq([step2(1), step2(1)], [[0,1,1,2], [0,2,2,2]], 'a hidden column is stepped over, and an edit is what is searched');
 }
 
+
+// The status line's "LIMIT n in the query": only a LIMIT at the end of the statement limits the
+// result, and it reads the row count (LIMIT offset,n and LIMIT n OFFSET m alike).
+{
+  const trailingLimit = new Function(`${extractFunction(src, 'trailingLimit')}
+return trailingLimit;`)();
+  const cases = [
+  ['SELECT * FROM t LIMIT 1000', 1000],
+  ['select * from t limit 10, 20;', 20],
+  ['SELECT * FROM t LIMIT 5 OFFSET 10 ;  ', 5],
+  ['SELECT * FROM t WHERE id IN (SELECT id FROM u LIMIT 3)', null],
+  ['SELECT * FROM (SELECT 1 LIMIT 3) x', null],
+  ['SELECT * FROM t', null],
+  ['SELECT limit_col FROM t', null],
+];
+  eq(cases.map(([q]) => trailingLimit(q)), cases.map(c => c[1]), 'only a trailing LIMIT limits the result, read as its row count');
+}
+
 process.exit(fail ? 1 : 0);
 '@
 

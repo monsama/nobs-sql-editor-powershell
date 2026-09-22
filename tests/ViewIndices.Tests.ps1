@@ -35,6 +35,7 @@ function extractFunction(src, name) {
 const src = readFileSync(process.argv[2], 'utf8');
 const viewIndicesSrc = extractFunction(src, 'viewIndices');
 const rowHasTextSrc = extractFunction(src, 'rowHasText');
+const stepSrc = extractFunction(src, 'gridSearchStep');
 
 function sortColumn(values, { dir = 1, filters = {} } = {}) {
   const tab = { rows: values.map(v => [v]), filters, sortCol: 0, sortDir: dir };
@@ -99,6 +100,27 @@ eq(search([['a',null],['b','null']], ''), [0,1], 'an empty search keeps every ro
 eq(search([['a',null],['b','null']], 'null'), [1], 'a NULL never matches the search');
 eq(search([['alpha','x'],['alpha','y'],['beta','x']], 'x', { 0: 'alpha' }), [0],
    'the search and a column filter must both match');
+
+
+// Enter / Shift+Enter in the search box: which cell it goes to next.
+function stepper(rows, q, extra = {}) {
+  const tab = { rows, filters: {}, sortCol: -1, sortDir: 1, search: q, ...extra };
+  const gridFocus = {};
+  const make = new Function('T', 'gridFocus', 'gridSetFocus', 'updatePager', '$',
+    `${rowHasTextSrc}
+${viewIndicesSrc}
+${stepSrc}
+return gridSearchStep;`);
+  const step = make(() => tab, gridFocus, (id, ri, ci) => { gridFocus[id] = { ri, ci }; }, () => {}, () => ({ focus() {} }));
+  return dir => { step('t1', dir); const f = gridFocus.t1; return [f.ri, f.ci, ...tab._hitAt]; };
+}
+{
+  const step = stepper([['zug','x'], ['y','y'], ['a','Zurich']], 'zu');
+  eq([step(1), step(1), step(1), step(-1)], [[0,0,1,2], [2,1,2,2], [0,0,1,2], [2,1,2,2]],
+     'Enter goes through the matching cells in order, and wraps round');
+  const step2 = stepper([['zu','zu','old']], 'zu', { hiddenCols: new Set([0]), pending: { upd: { '0:2': 'zulu' } } });
+  eq([step2(1), step2(1)], [[0,1,1,2], [0,2,2,2]], 'a hidden column is stepped over, and an edit is what is searched');
+}
 
 process.exit(fail ? 1 : 0);
 '@

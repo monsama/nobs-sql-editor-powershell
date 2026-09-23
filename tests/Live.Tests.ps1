@@ -1110,6 +1110,45 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
         Api '/api/script' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.tx_tab' } | Out-Null
     }
 
+    # --- the user transfer script gives back what it was made from ------------------------------
+    # Roles went missing: MariaDB's could not be read at all, and a MySQL account with a default
+    # role came before its role, failed, and took its grants with it. The accounts are made, the
+    # script generated, the accounts dropped and the script replayed - twice, since it has to be
+    # safe to run again - and every account and the role must come back as they were.
+    $isMaria = (Peek 'SELECT VERSION()') -match 'MariaDB'
+    $role = if ($isMaria) { 'nobs_xfer_role' } else { "'nobs_xfer_role'@'%'" }
+    $xAccounts = @("'nobs_xfer_plain'@'%'", "'nobs_xfer_cols'@'localhost'")
+    function XferClean { foreach ($a in $xAccounts) { Api '/api/script' @{ conn = $conn; sql = "DROP USER IF EXISTS $a" } | Out-Null }; Api '/api/script' @{ conn = $conn; sql = "DROP ROLE IF EXISTS $role" } | Out-Null }
+    function XferSnap {
+        $o = @()
+        foreach ($a in $xAccounts + @($role)) {
+            $cu = Api '/api/query' @{ conn = $conn; sql = "SHOW CREATE USER $a" }
+            if ($a -ne $role) { $o += $(if ($cu.ok) { [string]$cu.rows[0][0] } else { '(missing)' }) }
+            $g = Api '/api/query' @{ conn = $conn; sql = "SHOW GRANTS FOR $a" }
+            $o += @($(if ($g.ok) { $g.rows | ForEach-Object { [string]$_[0] } } else { '(no grants)' }) | Sort-Object)
+        }
+        $o -join "`n"
+    }
+    try {
+        XferClean
+        $setup = Api '/api/script' @{ conn = $conn; sql = (@("CREATE ROLE $role", "GRANT SELECT ON nobs_test.* TO $role",
+            "CREATE USER 'nobs_xfer_plain'@'%' IDENTIFIED BY 'Plain-pw-1'", "GRANT INSERT ON nobs_test.* TO 'nobs_xfer_plain'@'%'",
+            "GRANT $role TO 'nobs_xfer_plain'@'%'", $(if ($isMaria) { "SET DEFAULT ROLE $role FOR 'nobs_xfer_plain'@'%'" } else { "SET DEFAULT ROLE $role TO 'nobs_xfer_plain'@'%'" }),
+            "CREATE USER 'nobs_xfer_cols'@'localhost' IDENTIFIED BY 'Cols-pw-2' WITH MAX_QUERIES_PER_HOUR 100 ACCOUNT LOCK",
+            "GRANT SELECT (id) ON nobs_test.ro_canary TO 'nobs_xfer_cols'@'localhost' WITH GRANT OPTION") -join ";`n") }
+        Check ($setup.ok) 'transfer: the test accounts are made' ($setup | ConvertTo-Json -Compress)
+        $xBefore = XferSnap
+        $others = Api '/api/query' @{ conn = $conn; sql = "SELECT DISTINCT user FROM mysql.user WHERE user NOT LIKE 'nobs\_xfer\_%'" }
+        $gen = Api '/api/gen-user-transfer' @{ conn = $conn; exclude = (@($others.rows | ForEach-Object { [string]$_[0] }) -join ',') }
+        Check ($gen.ok -and $gen.errorCount -eq 0) 'the transfer script reads every account and role' ($gen | ConvertTo-Json -Compress)
+        XferClean
+        $run1 = Api '/api/script' @{ conn = $conn; sql = $gen.sql }
+        $run2 = Api '/api/script' @{ conn = $conn; sql = $gen.sql }
+        Check ($run1.ok -and $run2.ok) 'it runs, and runs again on top of itself' "$($run1.error) / $($run2.error)"
+        $xAfter = XferSnap
+        Check ($xAfter -eq $xBefore) 'and gives back the accounts, their grants and the role as they were' "before:`n$xBefore`nafter:`n$xAfter"
+    } finally { XferClean }
+
     # --- an SSH tunnel that cannot be opened says why -------------------------------------------
     # There is no SSH server to tunnel through here; what can be pinned is that a tunnel which does
     # not come up gives ssh's own reason instead of a bare connection failure, and that "verify",

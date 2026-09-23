@@ -3798,13 +3798,43 @@ function Api-GenUserTransfer { param($conn,$data)
     # the default list. Named, not matched as mysql.%: an account called mysql.backup is a user's.
     foreach ($sys in @('mysql.sys','mysql.session','mysql.infoschema','mariadb.sys')) { if ($excl -notcontains $sys) { $excl += $sys } }
     $inList = ($excl | ForEach-Object { SqlLit $_ }) -join ','
-    $usersR = Run-Query2 $conn ("SELECT user, host FROM mysql.user WHERE user NOT IN ($inList) AND user <> ''") $null $null
+    $vr = Run-Query2 $conn 'SELECT VERSION()' $null $null
+    $version = if ($vr.ok -and $vr.rows.Count) { [string]$vr.rows[0][0] } else { '' }
+    $maria = $version -match 'MariaDB'
+    $bt = [string][char]96
+    # MariaDB keeps its roles in mysql.user as rows with no host and is_role='Y'. They are not
+    # accounts: SHOW CREATE USER cannot read them, so they went to the "could not be read" list, and
+    # every GRANT of a role and SET DEFAULT ROLE after them failed on the target. They are made with
+    # CREATE ROLE here instead, ahead of everything that names them.
+    $hasIsRole = $false
+    if ($maria) { $ir = Run-Query2 $conn "SELECT 1 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='mysql' AND TABLE_NAME='user' AND COLUMN_NAME='is_role'" $null $null; $hasIsRole = $ir.ok -and $ir.rows.Count -gt 0 }
+    $notRole = if ($hasIsRole) { " AND is_role <> 'Y'" } else { '' }
+    $usersR = Run-Query2 $conn ("SELECT user, host FROM mysql.user WHERE user NOT IN ($inList) AND user <> ''$notRole") $null $null
     if (-not $usersR.ok) { return '{"ok":false,"error":'+(J-Str $usersR.err)+'}' }
-    if ($usersR.rows.Count -eq 0) { return '{"ok":true,"sql":"-- No accounts matched (everything was excluded, or mysql.user is empty).","userCount":0,"errorCount":0}' }
+    $mariaRoles = @()
+    if ($hasIsRole) { $rr = Run-Query2 $conn ("SELECT user FROM mysql.user WHERE is_role = 'Y' AND user NOT IN ($inList)") $null $null; if ($rr.ok) { $mariaRoles = @($rr.rows | ForEach-Object { [string]$_[0] }) } }
+    $users = @($usersR.rows)
+    # MySQL 8's roles are accounts, but one can only be granted, or named as a default role, once it
+    # exists: a user whose CREATE USER carried DEFAULT ROLE came before its role, failed, and took
+    # every grant of that user down with it. Roles are made first.
+    if (-not $maria) {
+        $er = Run-Query2 $conn 'SELECT FROM_USER, FROM_HOST FROM mysql.role_edges UNION SELECT DEFAULT_ROLE_USER, DEFAULT_ROLE_HOST FROM mysql.default_roles' $null $null
+        if ($er.ok) {
+            $isRole = @{}; foreach ($x in $er.rows) { $isRole[[string]$x[0] + '@' + [string]$x[1]] = $true }
+            $users = @($users | Where-Object { $isRole.ContainsKey([string]$_[0] + '@' + [string]$_[1]) }) + @($users | Where-Object { -not $isRole.ContainsKey([string]$_[0] + '@' + [string]$_[1]) })
+        }
+    }
+    if ($users.Count -eq 0 -and $mariaRoles.Count -eq 0) { return '{"ok":true,"sql":"-- No accounts matched (everything was excluded, or mysql.user is empty).","userCount":0,"errorCount":0}' }
 
     $createLines = New-Object System.Collections.ArrayList
     $grantLines = New-Object System.Collections.ArrayList
     $errors = New-Object System.Collections.ArrayList
+    foreach ($role in $mariaRoles) {
+        $rq = $bt + $role.Replace($bt, $bt + $bt) + $bt
+        [void]$createLines.Add("CREATE ROLE IF NOT EXISTS $rq;")
+        $rg = Run-Query2 $conn ("SHOW GRANTS FOR $rq") $null $null
+        if ($rg.ok) { foreach ($grow in $rg.rows) { [void]$grantLines.Add([string]$grow[0] + ';') } } else { [void]$errors.Add("SHOW GRANTS for role '$role': " + $rg.err) }
+    }
 
     # A MySQL 8 caching_sha2_password hash carries a salt of arbitrary 7-bit bytes, control
     # characters included. This edition used to show a value holding control characters as hex, so the
@@ -3814,14 +3844,14 @@ function Api-GenUserTransfer { param($conn,$data)
     # statement instead - plain text, and safe to paste or save. It is a session variable, and each
     # query here is its own mysql.exe session, so it goes in front of the statement itself.
     $hexPrefix = ''
-    $vr = Run-Query2 $conn 'SELECT VERSION()' $null $null
-    if ($vr.ok -and (Test-MySqlHexIdentified ([string]$vr.rows[0][0]))) { $hexPrefix = 'SET SESSION print_identified_with_as_hex = ON; ' }
-    foreach ($row in $usersR.rows) {
+    if (Test-MySqlHexIdentified $version) { $hexPrefix = 'SET SESSION print_identified_with_as_hex = ON; ' }
+    foreach ($row in $users) {
         $u = [string]$row[0]; $h = [string]$row[1]
         $uq = $u -replace "'", "''"
         $hq = $h -replace "'", "''"
         $cr = Run-Query2 $conn ($hexPrefix + "SHOW CREATE USER '$uq'@'$hq'") $null $null
-        if ($cr.ok -and $cr.rows.Count -gt 0) { [void]$createLines.Add([string]$cr.rows[0][0] + ';') }
+        # IF NOT EXISTS, so the script can run again on a server that has some of them.
+        if ($cr.ok -and $cr.rows.Count -gt 0) { [void]$createLines.Add(([string]$cr.rows[0][0] -replace '^\s*CREATE USER (?!IF NOT EXISTS)', 'CREATE USER IF NOT EXISTS ') + ';') }
         else { [void]$errors.Add("SHOW CREATE USER for '$u'@'$h': " + $(if ($cr.err) { $cr.err } else { 'no result returned' })) }
 
         $gr = Run-Query2 $conn ("SHOW GRANTS FOR '$uq'@'$hq'") $null $null
@@ -3830,11 +3860,21 @@ function Api-GenUserTransfer { param($conn,$data)
     }
 
     $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine("-- Generated user transfer script - $($usersR.rows.Count) account(s) matched (after exclusions)")
-    [void]$sb.AppendLine("-- Run this on the TARGET server. CREATE USER statements are listed first so the GRANT")
-    [void]$sb.AppendLine("-- statements below can reference them.")
+    [void]$sb.AppendLine("-- Generated user transfer script - $($users.Count) account(s)$(if ($mariaRoles.Count) { " and $($mariaRoles.Count) role(s)" }) matched (after exclusions)")
+    [void]$sb.AppendLine("-- Made on $version.")
+    [void]$sb.AppendLine("-- Run this on the TARGET server, after its databases are in place: a grant on a table or a")
+    [void]$sb.AppendLine("-- routine needs that table or routine to exist. Roles and accounts come first, so the grants")
+    [void]$sb.AppendLine("-- can name them; each is made only if it is not there yet, so the script can run again.")
     [void]$sb.AppendLine("")
-    [void]$sb.AppendLine("-- ===== CREATE USER =====")
+    # The first statement stops the script on the other kind of server, before anything is changed:
+    # password hashes and role statements are written differently on MySQL and MariaDB, and every
+    # statement failed there. A scalar subquery of two rows is an error on both, and this line - which
+    # says why - is what a client shows with it.
+    $made = if ($maria) { 'MariaDB' } else { 'MySQL' }; $want = if ($maria) { 'LIKE' } else { 'NOT LIKE' }
+    [void]$sb.AppendLine("-- This script only runs on $($made): the next line stops it anywhere else.")
+    [void]$sb.AppendLine("SELECT IF(VERSION() $want '%MariaDB%', 'ok', (SELECT 'This script was made on $made and cannot run on this server' UNION SELECT 'stopped')) AS target_check;")
+    [void]$sb.AppendLine("")
+    [void]$sb.AppendLine("-- ===== CREATE ROLE / CREATE USER =====")
     foreach ($l in $createLines) { [void]$sb.AppendLine($l) }
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("-- ===== GRANTS =====")
@@ -3845,7 +3885,7 @@ function Api-GenUserTransfer { param($conn,$data)
         foreach ($e in $errors) { [void]$sb.AppendLine("-- " + ($e -replace "[\r\n]+", " ")) }
     }
 
-    '{"ok":true,"sql":'+(J-Str $sb.ToString())+',"userCount":'+$usersR.rows.Count+',"errorCount":'+$errors.Count+'}'
+    '{"ok":true,"sql":'+(J-Str $sb.ToString())+',"userCount":'+$users.Count+',"errorCount":'+$errors.Count+'}'
 }
 function Api-CompareRows { param($data)
     $src = Resolve-SavedConn $data.sourceConnName; $tgt = Resolve-SavedConn $data.targetConnName

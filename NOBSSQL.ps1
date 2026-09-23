@@ -2709,9 +2709,41 @@ function Get-ToolVersionLabel { param([string]$Text)
     if ($Text -match 'Ver (\d+\.\d+\.\d+)\b.*MySQL') { return "MySQL $($Matches[1])" }
     return $null
 }
+# Reading a tool's --version means starting a process, and Settings asks for four of them every
+# time it opens - noticeable on a machine whose antivirus inspects each start. The answer cannot
+# change unless the file does, so it is remembered per path, with the file's length and write time
+# as the receipt. Kept beside the config so it survives a restart, which is when the wait was worst.
+# Windows' loader refuses to start a program whose DLLs are missing and reports it as this status
+# rather than anything on stdout; naming it turns "no version" into the one thing worth knowing.
+function Get-ToolVersionCacheFile { Join-Path (Split-Path -Parent $script:CfgFile) 'tool-versions.json' }
+function Get-ToolStamp { param([string]$Path)
+    try { $i = Get-Item -LiteralPath $Path -ErrorAction Stop; return "$($i.Length):$([int64]($i.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds)" } catch { return $null }
+}
 function Get-ToolVersion { param([string]$Path)
     if (-not $Path -or $Path -eq '(not found)' -or -not (Test-Path -LiteralPath $Path)) { return $null }
-    try { return Get-ToolVersionLabel ((& $Path --version 2>$null) -join ' ') } catch { return $null }
+    $stamp = Get-ToolStamp $Path
+    $file = Get-ToolVersionCacheFile
+    $cache = $null
+    if (Test-Path -LiteralPath $file) { try { $cache = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json } catch { $cache = $null } }
+    if ($stamp -and $cache -and $cache.PSObject.Properties[$Path] -and $cache.$Path.stamp -eq $stamp) {
+        $v = [string]$cache.$Path.version
+        if ($v) { return $v } else { return $null }
+    }
+    $dllNotFound = -1073741515   # 0xC0000135, STATUS_DLL_NOT_FOUND
+    $label = $null
+    try {
+        $out = (& $Path --version 2>$null) -join ' '
+        if ($LASTEXITCODE -eq $dllNotFound) { $label = 'cannot start - a library it needs is missing (download the tools again)' }
+        else { $label = Get-ToolVersionLabel $out }
+    } catch { $label = $null }
+    if ($stamp) {
+        try {
+            if (-not $cache) { $cache = [pscustomobject]@{} }
+            $cache | Add-Member -NotePropertyName $Path -NotePropertyValue ([pscustomobject]@{ stamp = $stamp; version = [string]$label }) -Force
+            $cache | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $file -Encoding utf8
+        } catch {}
+    }
+    return $label
 }
 # Endpoint: report whether the mysql client tools were found.
 function Api-ToolsStatus {
@@ -2725,12 +2757,13 @@ function Api-ToolsStatus {
     # and checking either against it aborts the whole export with "unknown variable". Running
     # --version once here lets the export dialog grey those options out up front instead of
     # letting the user discover it mid-export.
+    # Get-ToolVersion has read this binary already and remembers it per file, so the flavour comes
+    # out of that label rather than starting the program a second time.
+    $dumpVersion = Get-ToolVersion $d
     $dumpIsMariaDb = 'null'
-    if($script:MysqldumpPath){
-        try { $ver = & $script:MysqldumpPath --version 2>$null; if($ver -match '(?i)mariadb'){ $dumpIsMariaDb='true' } else { $dumpIsMariaDb='false' } } catch {}
-    }
+    if($script:MysqldumpPath -and $dumpVersion){ if($dumpVersion -match '(?i)mariadb'){ $dumpIsMariaDb='true' } else { $dumpIsMariaDb='false' } }
     $myM = Get-MysqlFlavorTool 'mysql'; $myD = Get-MysqlFlavorTool 'mysqldump'
-    $versions = ',"mysql_version":'+(J-Str (Get-ToolVersion $m))+',"mysqldump_version":'+(J-Str (Get-ToolVersion $d))+
+    $versions = ',"mysql_version":'+(J-Str (Get-ToolVersion $m))+',"mysqldump_version":'+(J-Str $dumpVersion)+
         ',"mysql_for_mysql_version":'+(J-Str (Get-ToolVersion $myM.Path))+',"mysqldump_for_mysql_version":'+(J-Str (Get-ToolVersion $myD.Path))
     $forMysql = $versions+',"mysql_for_mysql":'+(J-Str $myM.Path)+',"mysql_for_mysql_source":'+(J-Str $myM.Source)+',"mysqldump_for_mysql":'+(J-Str $myD.Path)+',"mysqldump_for_mysql_source":'+(J-Str $myD.Source)
     '{"ok":true,"mysql":'+(J-Str $m)+',"mysqldump":'+(J-Str $d)+',"mysql_source":'+(J-Str $ms)+',"mysqldump_source":'+(J-Str $ds)+',"mysqldump_is_mariadb":'+$dumpIsMariaDb+$forMysql+',"download_dir":'+(J-Str $script:ToolsDir)+',"config_file":'+(J-Str $script:CfgFile)+'}'
@@ -4989,7 +5022,10 @@ if(localStorage.getItem('theme')!=='light')document.body.classList.add('dark');
 // context menu
 function _clearKeys(includeAll){const keys=[];for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(!k)continue;if(k.indexOf('overviewCache')===0||k.indexOf('tableSizes')===0){keys.push(k);}else if(includeAll&&['session','history','connmeta','accents','theme'].indexOf(k)>=0){keys.push(k);}}keys.forEach(k=>localStorage.removeItem(k));return keys.length;}
 async function clearAllData(){if(!(await ask('Clear ALL app data?\n\nThis permanently deletes:\n\u2022 saved connections (host / user / password)\n\u2022 the query library\n\u2022 caches, accent colors, environment labels, history and session tabs.\n\nThis cannot be undone.')))return;const n=_clearKeys(true);try{await api('/api/conn-clear');}catch(e){}try{await api('/api/lib-clear');}catch(e){}log('Cleared '+n+' local entr'+(n===1?'y':'ies')+' + saved connections + library. Reloading...');setTimeout(()=>location.reload(),500);}
-async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}if($('cfgUpdateCheck'))$('cfgUpdateCheck').checked=updateCheckOn();if($('cfgToastMs'))$('cfgToastMs').value=String(toastMs());show('mSettings');refreshToolsStatus();}
+async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}if($('cfgUpdateCheck'))$('cfgUpdateCheck').checked=updateCheckOn();if($('cfgToastMs'))$('cfgToastMs').value=String(toastMs());show('mSettings');
+ // The first call answers from what is remembered about each binary; the second re-reads them and
+ // updates the cards if a tool was replaced behind the app's back.
+ await refreshToolsStatus();setTimeout(()=>refreshToolsStatus(false,true),50);}
 // Export and Import shell out to mysql.exe / mysqldump.exe. When the backend reports one
 // missing, the bare error leaves the user stuck - it names PATH and an environment variable but
 // not the dialog that actually fixes it - so pair it with a button that opens Settings, where the
@@ -5042,7 +5078,9 @@ async function showToolsInUse(st){
  el.textContent='The connected server is '+(r.serverIsMariadb?'MariaDB':'MySQL')+', so it uses the tools for '+(ownMysql?'MySQL servers.':'MariaDB servers'+(r.serverIsMariadb?'.':' - there are no MySQL tools.'));
  mark(ownMysql?my:ma);
 }
-async function refreshToolsStatus(){const el=$('cfgStatus');if(!el)return;el.innerHTML='Checking...';try{const r=await api('/api/tools-status');if(!r||!r.ok){el.textContent='';return;}renderToolsStatus(r);
+// Opening Settings shows what was found last time straight away and asks again behind it, so the
+// cards are never blank while four processes start; "Checking..." is only for a check you asked for.
+async function refreshToolsStatus(manual,quiet){const el=$('cfgStatus');if(!el)return;if(!quiet)el.innerHTML='Checking...';try{const r=await api('/api/tools-status');if(!r||!r.ok){el.textContent='';return;}renderToolsStatus(r);
  if(r.mysql&&r.mysql!=='(not found)'&&!$('cfgMysql').value)$('cfgMysql').value=r.mysql;
  if(r.mysqldump&&r.mysqldump!=='(not found)'&&!$('cfgDump').value)$('cfgDump').value=r.mysqldump;
  const pe=$('cfgPaths');if(pe)pe.innerHTML='Downloads: '+esc(r.download_dir)+'<br>Config: '+esc(r.config_file);}catch(e){el.textContent='';}}

@@ -30,12 +30,17 @@ function extractFunction(src, name) {
 }
 
 const src = readFileSync(process.argv[2], 'utf8');
-const NAMES = ['strLit', 'lit', 'newUser', 'dropUser', 'grantUser', 'revokeUser', 'lockUser'];
+const NAMES = ['strLit', 'lit', 'newUser', 'dropUser', 'grantUser', 'revokeUser', 'lockUser',
+  'uRef', 'uName', 'uKey', 'authPlugins', 'identifiedBy', 'acctExpiry', 'acctSettingFields', 'acctSettingSql', 'logNoSecrets'];
 const bundle = NAMES.map(n => extractFunction(src, n)).join('\n');
 
 function harness({ dialog = {}, selected = null } = {}) {
   const sql = [];
+  const [u, h] = selected ? selected.split('\x01') : [];
   const env = {
+    api: async (path, p) => { if (path === '/api/script') { sql.push(...p.sql.split('\n')); return { ok: true }; } return { ok: true, rows: [] }; },
+    log: () => {}, usersLoad: async () => true, usersSelect: () => {},
+    qid: n => '`' + String(n).replace(/`/g, '``') + '`',
     inputBox: async () => dialog,
     grantRevokeDialog: async () => dialog,
     ask: async () => true,
@@ -43,7 +48,7 @@ function harness({ dialog = {}, selected = null } = {}) {
     openUsers: () => {},
     showGrants: () => {},
     exec: async (s) => { sql.push(s); return true; },
-    window: { _selUser: selected },
+    window: { _selUser: selected, _selAcct: selected ? { u, h, role: false } : null, mariadb: false },
   };
   const keys = Object.keys(env);
   const fns = new Function(...keys, `${bundle}\nreturn {newUser,dropUser,grantUser,revokeUser,lockUser};`)(
@@ -61,17 +66,17 @@ const SEP = '\x01'; // how the Users list packs user+host into _selUser
 
 let h = harness({ dialog: { user: "o'brien", host: 'localhost', pw: 'pw' } });
 await h.fns.newUser();
-eq(h.sql[0], "CREATE USER 'o''brien'@'localhost' IDENTIFIED BY 'pw'", 'a quoted user name is escaped, not broken');
+eq(h.sql[0], "CREATE USER 'o''brien'@'localhost' IDENTIFIED BY 'pw';", 'a quoted user name is escaped, not broken');
 
 // lit() passes 0x.. through UNQUOTED - right for a BIT/BINARY column value, wrong for a name.
 // "CREATE USER 0xAB@'%'" is a syntax error, so an account called 0xAB could not be created at all.
 h = harness({ dialog: { user: '0xAB', host: '%', pw: 'pw' } });
 await h.fns.newUser();
-eq(h.sql[0], "CREATE USER '0xAB'@'%' IDENTIFIED BY 'pw'", 'a name that looks like a hex literal is still quoted');
+eq(h.sql[0], "CREATE USER '0xAB'@'%' IDENTIFIED BY 'pw';", 'a name that looks like a hex literal is still quoted');
 
 h = harness({ dialog: { user: 'alice', host: '0xff', pw: 'pw' } });
 await h.fns.newUser();
-eq(h.sql[0], "CREATE USER 'alice'@'0xff' IDENTIFIED BY 'pw'", 'a host that looks like a hex literal is quoted too');
+eq(h.sql[0], "CREATE USER 'alice'@'0xff' IDENTIFIED BY 'pw';", 'a host that looks like a hex literal is quoted too');
 
 h = harness({ selected: `0xAB${SEP}%` });
 await h.fns.dropUser();

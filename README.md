@@ -68,6 +68,10 @@ Requires Windows PowerShell 5.1 or later.
 - Explain draws the plan: every table read as a card, a full scan in red and an
   index lookup in green, with the joins, sorts and subqueries around them.
 - A result charts as bars or a line, from the rows the grid shows.
+- Users and privileges: privileges as a checklist per server, database or table, with
+  the GRANT and REVOKE shown before they run; roles and default roles; clone an
+  account; sign-in method, SSL, password expiry and limits; who has access to a
+  database; and a transfer script that carries roles and can run again.
 - Export tables or query results to CSV, INSERT statements, Excel, JSON or
   Markdown; CSV import.
 - Table designer, DDL view and edit, users and privileges, table maintenance,

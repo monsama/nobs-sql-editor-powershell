@@ -58,10 +58,12 @@ Requires Windows PowerShell 5.1 or later.
   show/hide, and a row-detail form view for wide tables.
 - Inline and full-row editing staged as pending changes and applied in a single
   transaction; add and delete rows. Typing with several cells picked writes the
-  value into all of them.
+  value into all of them. Right-click Apply (or Ctrl+Shift+S) to see the SQL
+  it would run first.
 - Manual transactions: with Auto-commit off a tab keeps one transaction open
   across its runs until Commit or Rollback. Commit also saves grid edits
-  not applied yet; Rollback discards them.
+  not applied yet; Rollback discards them. The count beside Commit opens
+  the transaction's log: what it has run so far, and how each run went.
 - Export tables or query results to CSV, INSERT statements, Excel, JSON or
   Markdown; CSV import.
 - Table designer, DDL view and edit, users and privileges, table maintenance,

@@ -46,7 +46,7 @@ function harness({ dialog = {}, selected = null } = {}) {
     ask: async () => true,
     toast: () => {},
     openUsers: () => {},
-    showGrants: () => {},
+    showGrants: () => {}, usersReloadKeep: async () => {},
     exec: async (s) => { sql.push(s); return true; },
     window: { _selUser: selected, _selAcct: selected ? { u, h, role: false } : null, mariadb: false },
   };

@@ -74,6 +74,8 @@ Requires Windows PowerShell 5.1 or later.
   database; and a transfer script that carries roles and can run again.
 - Export tables or query results to CSV, INSERT statements, Excel, JSON or
   Markdown; CSV import.
+- Data export / import via the MySQL/MariaDB command-line tools: structure and data,
+  structure only or data only, as a file per table, per database or one file.
 - Table designer, DDL view and edit, users and privileges, table maintenance,
   ER diagrams, server process list, and a reusable query library
   (a query can be saved to it straight from the history).

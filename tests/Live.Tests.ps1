@@ -1079,6 +1079,7 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     try {
         $w = Api '/api/script' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = "UPDATE tx_tab SET v='b' WHERE id=1; INSERT INTO tx_tab VALUES (2,'c')" }
         Check ($w.ok -eq $true) 'a script runs in the tab''s transaction' ($w | ConvertTo-Json -Compress)
+        Check ([long]$w.affected -eq 2) 'and says how many rows it changed' ($w | ConvertTo-Json -Compress)
         $inside = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = 'SELECT id, v FROM tx_tab ORDER BY id' }
         Check (($inside.rows | ForEach-Object { $_ -join ':' }) -join ',' -eq '1:b,2:c') 'the next run sees what the tab has not committed' ($inside | ConvertTo-Json -Compress)
         $other = Peek 'SELECT GROUP_CONCAT(v ORDER BY id) FROM tx_tab'
@@ -1090,6 +1091,11 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
         $grid = Api '/api/script' @{ conn = $conn; db = 'nobs_test'; session = $sess; transaction = $true; sql = "UPDATE tx_tab SET v='g' WHERE id=2 LIMIT 1;`nINSERT INTO tx_tab VALUES (1,'dup');" }
         $g = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = 'SELECT v FROM tx_tab WHERE id=2' }
         Check ((-not $grid.ok) -and [string]$g.rows[0][0] -eq 'c') 'a failed grid save is undone on its own, not the whole transaction' "$($grid.error) / v=$($g.rows[0][0])"
+        # A result in the transaction comes a page at a time, like any other.
+        $pq = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; session = $sess; pageSize = 5; sql = 'SELECT TABLE_NAME FROM information_schema.TABLES ORDER BY TABLE_SCHEMA, TABLE_NAME LIMIT 12' }
+        $pages = @($pq.rows.Count); $cur = $pq
+        while ($cur.hasMore -and $pages.Count -lt 5) { $cur = Api '/api/fetch-cursor-batch' @{ cursorId = $cur.cursorId; pageSize = 5 }; $pages += $cur.rows.Count }
+        Check (($pages -join ',') -eq '5,5,2') 'a result in the transaction is read in pages' ($pages -join ',')
         $rb = Api '/api/session-end' @{ conn = $conn; session = $sess; action = 'rollback' }
         Check ($rb.ok -eq $true -and (Peek 'SELECT COUNT(*) FROM tx_tab') -eq '1') 'Rollback throws it all away' ($rb | ConvertTo-Json -Compress)
         Api '/api/script' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = "UPDATE tx_tab SET v='z' WHERE id=1" } | Out-Null
@@ -1120,11 +1126,11 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     $said = Said $verify
     Check ($said -match 'verify-ca') 'SSL "verify" through a tunnel is refused, naming verify-ca' $said
 
-    # A real tunnel, when an SSH server is named: NOBS_TEST_SSH = host|port|user|key file (key
-    # optional). The server has to reach the database at the address in NOBS_TEST_DSN.
+    # A real tunnel, when an SSH server is named: NOBS_TEST_SSH = host|port|user|key file|password (key
+    # and password optional). The server has to reach the database at the address in NOBS_TEST_DSN.
     if ($env:NOBS_TEST_SSH) {
         $sp = $env:NOBS_TEST_SSH.Split('|')
-        $via = $conn.Clone(); $via.sshHost = $sp[0]; $via.sshPort = $sp[1]; $via.sshUser = $sp[2]; if ($sp.Count -gt 3) { $via.sshKey = $sp[3] }
+        $via = $conn.Clone(); $via.sshHost = $sp[0]; $via.sshPort = $sp[1]; $via.sshUser = $sp[2]; if ($sp.Count -gt 3) { $via.sshKey = $sp[3] }; if ($sp.Count -gt 4) { $via.sshPassword = $sp[4] }
         $one = Api '/api/query' @{ conn = $via; sql = 'SELECT 1+1' }
         Check ($one.ok -and [string]$one.rows[0][0] -eq '2') 'a query goes through the SSH tunnel' ($one | ConvertTo-Json -Compress)
         $two = Api '/api/query' @{ conn = $via; db = 'nobs_test'; sql = 'SELECT COUNT(*) FROM ro_canary' }

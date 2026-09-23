@@ -320,7 +320,7 @@ function Get-Endpoint { param($conn)
         throw 'SSL mode "verify" cannot check the server''s host name through an SSH tunnel, because the connection is made to 127.0.0.1. Use "verify-ca" instead: the certificate chain is still validated.'
     }
     $sp = ([string]$conn.sshPort).Trim(); if (-not $sp) { $sp = '22' }
-    $su = ([string]$conn.sshUser).Trim(); $key = ([string]$conn.sshKey).Trim()
+    $su = ([string]$conn.sshUser).Trim(); $key = ([string]$conn.sshKey).Trim(); $spw = [string]$conn.sshPassword
     $id = "$su@${sh}:$sp|$key|${h}:$p"
     # Held while a tunnel opens, so two connections at once do not open two.
     [System.Threading.Monitor]::Enter($script:Tunnels)
@@ -330,25 +330,36 @@ function Get-Endpoint { param($conn)
             if (-not $t.Process.HasExited) { return @{ host = '127.0.0.1'; port = [string]$t.Port } }
             $null = $script:Tunnels.TryRemove($id, [ref]$null)
         }
-        $t = Open-Tunnel $sh $sp $su $key $h $p
+        $t = Open-Tunnel $sh $sp $su $key $h $p $spw
         $script:Tunnels[$id] = $t
         return @{ host = '127.0.0.1'; port = [string]$t.Port }
     } finally { [System.Threading.Monitor]::Exit($script:Tunnels) }
 }
-function Open-Tunnel { param([string]$SshHost, [string]$SshPort, [string]$SshUser, [string]$Key, [string]$DbHost, [string]$DbPort)
+function Open-Tunnel { param([string]$SshHost, [string]$SshPort, [string]$SshUser, [string]$Key, [string]$DbHost, [string]$DbPort, [string]$Password)
     Initialize-DumpDb
     $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0); $l.Start(); $local = $l.LocalEndpoint.Port; $l.Stop()
     $exe = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'; if (-not (Test-Path $exe)) { $exe = 'ssh' }
     $target = if ($DbHost.Contains(':')) { "[$DbHost]" } else { $DbHost }
-    $a = @('-N', '-T', '-o', 'BatchMode=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'StrictHostKeyChecking=accept-new',
+    $a = @('-N', '-T', '-o', 'ExitOnForwardFailure=yes', '-o', 'StrictHostKeyChecking=accept-new',
            '-o', 'ServerAliveInterval=30', '-o', 'ConnectTimeout=15', '-L', "127.0.0.1:${local}:${target}:$DbPort", '-p', $SshPort)
     if ($Key) { $a += @('-i', $Key, '-o', 'IdentitiesOnly=yes') }
+    # Nobody can answer a prompt, so without a password there is none: a login that needs one fails.
+    # With one, it goes to ssh the one way ssh takes a password without a terminal - a program it
+    # runs and reads it from, here a small script that prints it from the environment it is given.
+    # The script holds no secret; one try, so a wrong password fails at once.
+    if (-not $Password) { $a += @('-o', 'BatchMode=yes') } else { $a += @('-o', 'NumberOfPasswordPrompts=1') }
     # After "--" the destination cannot be read as an option, whatever it starts with.
     $a += @('--', $(if ($SshUser) { "$SshUser@$SshHost" } else { $SshHost }))
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $exe; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.RedirectStandardInput = $true; $psi.RedirectStandardError = $true; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
     $psi.Arguments = Format-Args $a
+    if ($Password) {
+        $ask = Join-Path $env:TEMP 'nobs-ssh-askpass.cmd'
+        $body = '@powershell.exe -NoProfile -NonInteractive -Command "[Console]::Out.Write($env:NOBS_SSH_PW)"' + [char]13 + [char]10
+        if (-not (Test-Path $ask) -or (Get-Content -Raw $ask) -ne $body) { [IO.File]::WriteAllText($ask, $body) }
+        $psi.EnvironmentVariables['SSH_ASKPASS'] = $ask; $psi.EnvironmentVariables['SSH_ASKPASS_REQUIRE'] = 'force'; $psi.EnvironmentVariables['NOBS_SSH_PW'] = $Password
+    }
     $proc = New-Object System.Diagnostics.Process; $proc.StartInfo = $psi
     try { [void]$proc.Start() } catch { throw "Could not start ssh ($(Get-InnerMessage $_)). SSH tunnels use the OpenSSH client; on Windows it is the optional feature ""OpenSSH Client""." }
     # Read as it comes, so a chatty tunnel never fills the pipe and stalls.
@@ -1541,6 +1552,14 @@ function Api-FetchCursorBatch { param($data)
     [System.Threading.Monitor]::Enter($cursor.Lock)
     try {
         $cursor.LastUsed = [DateTime]::UtcNow
+        # A transaction's result, already read (see Api-TxRun): the next rows of it.
+        if ($cursor.Memory) {
+            $take = [Math]::Min($ps, $cursor.Memory.Count - $cursor.At)
+            $rows = $cursor.Memory.GetRange($cursor.At, $take); $cursor.At += $take
+            $more = $cursor.At -lt $cursor.Memory.Count
+            if (-not $more) { $null = $script:OpenCursors.TryRemove($cid, [ref]$null) }
+            return '{"ok":true,"columns":'+(J-Arr $cursor.Headers)+',"rows":'+(J-RowsFast $rows)+',"hasMore":'+$(if ($more) { 'true,"cursorId":"'+$cid+'"' } else { 'false' })+'}'
+        }
         $page = Read-CursorRows $cursor $ps
         if ($cursor.ExactMap) { $page.rows = [NobsXmlRows]::Exact($page.rows, $cursor.ExactMap.keep, $cursor.ExactMap.targets) }
         if (-not $page.hasMore) {
@@ -1561,7 +1580,7 @@ function Api-CloseCursor { param($data)
     $cid = [string]$data.cursorId
     if ($cid) {
         $cursor = $null
-        if ($script:OpenCursors.TryRemove($cid, [ref]$cursor)) {
+        if ($script:OpenCursors.TryRemove($cid, [ref]$cursor) -and -not $cursor.Memory) {
             try { if (-not $cursor.Process.HasExited) { $cursor.Process.Kill() } } catch {}
             $null = Close-QueryCursorProc $cursor
         }
@@ -1611,14 +1630,15 @@ function Open-TxSession { param([string]$Id, $conn)
 function Invoke-TxStatements { param($s, [string[]]$Stmts, [int]$MaxRows)
     Initialize-DumpDb
     $sets = New-Object 'System.Collections.Generic.List[NobsResultSet]'
-    $n = 0
+    $n = 0; $affected = 0
     foreach ($st in $Stmts) {
         $n++
         $marker = 'nobs_tx_' + [Guid]::NewGuid().ToString('N')
         # A statement with a semicolon of its own - a procedure body - goes in under a delimiter it
         # does not contain.
         $body = if ($st.Contains(';')) { "DELIMITER ~~nobs~~`n$st`n~~nobs~~`nDELIMITER ;`n" } else { "$st;`n" }
-        $bytes = [Text.Encoding]::UTF8.GetBytes($body + "SELECT '$marker' AS nobs_marker;`nSIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='$marker';`n")
+        # ROW_COUNT() in the marker is what the statement before it changed, for the transaction's log.
+        $bytes = [Text.Encoding]::UTF8.GetBytes($body + "SELECT '$marker' AS nobs_marker, ROW_COUNT() AS nobs_rows;`nSIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='$marker';`n")
         try { $s.Process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length); $s.Process.StandardInput.BaseStream.Flush() }
         catch { return @{ sets=$sets; lost=$true; err=$script:TxLost } }
         $part = $s.Out.SetsUntil($MaxRows, $marker)
@@ -1632,9 +1652,10 @@ function Invoke-TxStatements { param($s, [string[]]$Stmts, [int]$MaxRows)
         # MariaDB's client echoes the failing statement around its error, and a statement can hold
         # the word "error" itself, so only the client's own ERROR line counts.
         $e = @(([string]$said) -split "`n" | Where-Object { $_ -match '^ERROR \d+' }) | Select-Object -First 1
-        if ($e) { return @{ sets=$sets; err=$e.Trim(); at=$n } }
+        if ($e) { return @{ sets=$sets; err=$e.Trim(); at=$n; affected=$affected } }
+        $rc = 0; if ($s.Out.MarkerRow -and $s.Out.MarkerRow.Length -gt 1 -and [long]::TryParse([string]$s.Out.MarkerRow[1], [ref]$rc) -and $rc -gt 0) { $affected += $rc }
     }
-    @{ sets=$sets; err=$null }
+    @{ sets=$sets; err=$null; affected=$affected }
 }
 # The tab's session, opened the first time, and held for the caller until Exit-TxSession.
 function Enter-TxSession { param([string]$Id, $conn)
@@ -1673,7 +1694,8 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
         $first = $stmts.Count
         foreach ($x in $user) { $stmts.Add($x) }
         if ($batch) { $stmts.Add('RELEASE SAVEPOINT nobs_batch') }
-        $maxRows = 100000
+        # A query keeps up to a million rows and hands them to the grid a page at a time (below).
+        $maxRows = 1000000
         if ($Kind -eq 'script-results') { $maxRows = [int]$data.maxRows; if ($maxRows -lt 1) { $maxRows = 1000 } }
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $r = Invoke-TxStatements $s $stmts.ToArray() $maxRows
@@ -1694,7 +1716,7 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
             if ($batch) { $msg += "`n`nNone of these changes were applied. The tab's transaction is still open." }
             return '{"ok":false,"error":'+(J-Str $msg)+'}'
         }
-        if ($Kind -eq 'script') { return '{"ok":true}' }
+        if ($Kind -eq 'script') { return '{"ok":true,"affected":' + [long]$r.affected + '}' }
         if ($Kind -eq 'query') {
             $set = $null; foreach ($x in $r.sets) { $set = $x }
             if ($null -eq $set) { return '{"ok":true,"columns":[],"rows":[],"elapsedMs":'+$sw.ElapsedMilliseconds+',"message":"Query OK. No result set."}' }
@@ -1703,6 +1725,14 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
             if ($set.Names.Count -eq 0 -and (Test-SqlSafeToRerun ([string]$set.Statement))) {
                 $h = Get-ResultHeaders $conn ([string]$set.Statement) ([string]$data.db)
                 if ($h) { $set.Names.AddRange([string[]]@($h)) }
+            }
+            # The session had to read the whole result before its next statement, so the rest of it is
+            # already here: a cursor over it in memory gives the grid its pages the way a live one does.
+            $ps = [int]$data.pageSize
+            if ($ps -gt 0 -and $set.Rows.Count -gt $ps) {
+                $cid = 'txmem' + [Guid]::NewGuid().ToString('N')
+                $script:OpenCursors[$cid] = [pscustomobject]@{ Memory=$set.Rows; At=$ps; Headers=[string[]]@($set.Names); Lock=(New-Object object); LastUsed=[DateTime]::UtcNow }
+                return '{"ok":true,"columns":'+(J-Arr @($set.Names))+',"rows":'+(J-RowsFast $set.Rows.GetRange(0, $ps))+',"hasMore":true,"cursorId":"'+$cid+'","elapsedMs":'+$sw.ElapsedMilliseconds+'}'
             }
             return '{"ok":true,"columns":'+(J-Arr @($set.Names))+',"rows":'+(J-RowsFast $set.Rows)+',"elapsedMs":'+$sw.ElapsedMilliseconds+'}'
         }
@@ -3078,7 +3108,7 @@ function Api-ConnSetPrimary { param($data)
     $name=[string]$data.name
     $list = Load-Conns | ForEach-Object {
         $pass = if($_.pass){ [string]$_.pass } else { '' }
-        [pscustomobject]@{name=$_.name;host=$_.host;port=$_.port;user=$_.user;ssl=$_.ssl;sslCa=[string]$_.sslCa;sshHost=[string]$_.sshHost;sshPort=[string]$_.sshPort;sshUser=[string]$_.sshUser;sshKey=[string]$_.sshKey;pass=$pass;primary=($name -ne '' -and $_.name -eq $name);accent=[string]$_.accent;env=[string]$_.env;readonly=[bool]$_.readonly}
+        [pscustomobject]@{name=$_.name;host=$_.host;port=$_.port;user=$_.user;ssl=$_.ssl;sslCa=[string]$_.sslCa;sshHost=[string]$_.sshHost;sshPort=[string]$_.sshPort;sshUser=[string]$_.sshUser;sshKey=[string]$_.sshKey;sshPass=[string]$_.sshPass;pass=$pass;primary=($name -ne '' -and $_.name -eq $name);accent=[string]$_.accent;env=[string]$_.env;readonly=[bool]$_.readonly}
     }
     Save-Conns @($list); '{"ok":true}'
 }
@@ -3474,7 +3504,7 @@ function Resolve-SavedConn { param($name)
     # so between servers in different zones every copied TIMESTAMP moved by the difference (Zurich
     # to UTC: 12:00 UTC arrived as 14:00 UTC), and equal values showed as different. utc runs
     # both sessions in UTC (see New-Cnf), so the text means the same instant everywhere.
-    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; sslCa=[string]$c.sslCa; password=$pass; readonly=[bool]$c.readonly; utc=$true; sshHost=[string]$c.sshHost; sshPort=[string]$c.sshPort; sshUser=[string]$c.sshUser; sshKey=[string]$c.sshKey }
+    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; sslCa=[string]$c.sslCa; password=$pass; readonly=[bool]$c.readonly; utc=$true; sshHost=[string]$c.sshHost; sshPort=[string]$c.sshPort; sshUser=[string]$c.sshUser; sshKey=[string]$c.sshKey; sshPassword=(Unprotect-SshPw ([string]$c.sshPass)) }
 }
 # Returns an ordered map of table -> ordered list of columns {name,type,null,default,extra} for
 # every table in the given schema, via one information_schema query (cheap, single round trip).
@@ -4203,7 +4233,13 @@ function Api-ConnGet { param($data)
     if(-not $c){ return '{"ok":false}' }
     $pass=''
     if($c.pass){ try { $sec=ConvertTo-SecureString $c.pass; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec); $pass=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($b); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } catch {} }
-    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"sslCa":'+(J-Str ([string]$c.sslCa))+',"sshHost":'+(J-Str ([string]$c.sshHost))+',"sshPort":'+(J-Str ([string]$c.sshPort))+',"sshUser":'+(J-Str ([string]$c.sshUser))+',"sshKey":'+(J-Str ([string]$c.sshKey))+',"password":'+(J-Str $pass)+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
+    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"sslCa":'+(J-Str ([string]$c.sslCa))+',"sshHost":'+(J-Str ([string]$c.sshHost))+',"sshPort":'+(J-Str ([string]$c.sshPort))+',"sshUser":'+(J-Str ([string]$c.sshUser))+',"sshKey":'+(J-Str ([string]$c.sshKey))+',"sshPassword":'+(J-Str (Unprotect-SshPw ([string]$c.sshPass)))+',"password":'+(J-Str $pass)+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
+}
+# A saved connection's SSH password, encrypted for this Windows user the way its database password is.
+function Protect-SshPw { param([string]$Pw) if (-not $Pw) { return '' }; ConvertFrom-SecureString (ConvertTo-SecureString $Pw -AsPlainText -Force) }
+function Unprotect-SshPw { param([string]$Enc)
+    if (-not $Enc) { return '' }
+    try { $b = [Runtime.InteropServices.Marshal]::SecureStringToBSTR((ConvertTo-SecureString $Enc)); try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } } catch { '' }
 }
 function Api-ConnSave { param($data)
     $name=[string]$data.name; if(-not $name){ return '{"ok":false,"error":"name required"}' }
@@ -4225,8 +4261,10 @@ function Api-ConnSave { param($data)
     if($data.PSObject.Properties['accent']){ $accent=[string]$data.accent } elseif($prevObj){ $accent=[string]$prevObj.accent } else { $accent='' }
     if($data.PSObject.Properties['env']){ $env=[string]$data.env } elseif($prevObj){ $env=[string]$prevObj.env } else { $env='' }
     if($data.PSObject.Properties['readonly']){ $ro=[bool]$data.readonly } elseif($prevObj -and $prevObj.readonly){ $ro=$true } else { $ro=$false }
+    # Saved with the database password, and only when that is: "type it each time" covers both.
+    $sshEnc = if ($savePw) { Protect-SshPw ([string]$c.sshPassword) } else { '' }
     $list=@($before | Where-Object { $_.name -ne $name })
-    $list+=[pscustomobject]@{name=$name;host=$c.host;port=$c.port;user=$c.user;ssl=$c.ssl;sslCa=[string]$c.sslCa;sshHost=[string]$c.sshHost;sshPort=[string]$c.sshPort;sshUser=[string]$c.sshUser;sshKey=[string]$c.sshKey;pass=$enc;primary=$prevPrimary;accent=$accent;env=$env;readonly=$ro}
+    $list+=[pscustomobject]@{name=$name;host=$c.host;port=$c.port;user=$c.user;ssl=$c.ssl;sslCa=[string]$c.sslCa;sshHost=[string]$c.sshHost;sshPort=[string]$c.sshPort;sshUser=[string]$c.sshUser;sshKey=[string]$c.sshKey;sshPass=$sshEnc;pass=$enc;primary=$prevPrimary;accent=$accent;env=$env;readonly=$ro}
     Save-Conns $list
     '{"ok":true}'
 }
@@ -4572,6 +4610,20 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  .ison .ic{color:var(--accent)}
  .fit1 input.gsearch{width:120px !important} .fit3 input.gsearch{width:90px !important} /* When the bar is too narrow and scrolls, the run settings stay at its right edge: that is where a hand looks for them. */
  .runopts{position:sticky;right:-8px;padding:0 8px 0 6px;margin-right:-8px;background:var(--panel);box-shadow:-10px 0 8px -8px rgba(0,0,0,.45);z-index:2}
+ .plan,.plan ul{list-style:none;margin:0;padding-left:18px} .plan{padding-left:0;margin-top:8px} .plan li{position:relative;padding:3px 0 3px 14px}
+ .plan ul li::before{content:'';position:absolute;left:0;top:0;bottom:0;border-left:1px solid var(--bd)} .plan ul li:last-child::before{bottom:auto;height:15px}
+ .plan ul li::after{content:'';position:absolute;left:0;top:15px;width:11px;border-top:1px solid var(--bd)}
+ .pstep{font-weight:600;font-size:12px;padding:2px 0} .pcard{display:inline-block;border:1px solid var(--bd);border-left:4px solid var(--muted);border-radius:4px;padding:4px 9px;background:var(--bg);font-size:12px;max-width:100%;box-sizing:border-box}
+ .pcard.bad,.psum.bad{border-left-color:#d32f2f} .pcard.warn{border-left-color:#ef6c00} .pcard.ok{border-left-color:#f9a825} .pcard.good,.psum.good{border-left-color:#2e7d32}
+ .pacc,.pfacts{color:var(--muted);font-weight:400} .pcond{font-family:'Cascadia Code',Consolas,monospace;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .psum{border-left:4px solid var(--muted);padding:4px 9px;font-size:12px;background:var(--panel)} .pjson{margin-top:10px;font-size:12px} .pjson pre{font-size:11px;max-height:300px;overflow:auto}
+ /* Chart colours: eight in a fixed order, checked for colour vision and contrast on both themes. */
+ .viz-root{--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s7:#4a3aa7;--s8:#e34948} body.dark .viz-root{--s1:#3987e5;--s2:#d95926;--s3:#199e70;--s4:#c98500;--s5:#d55181;--s6:#008300;--s7:#9085e9;--s8:#e66767}
+ .chart .s1.cmark,.chart .s1.cdot,.cleg i.s1,.ctip i.s1{fill:var(--s1);background:var(--s1)} .chart .cline.s1{stroke:var(--s1)} .chart .s2.cmark,.chart .s2.cdot,.cleg i.s2,.ctip i.s2{fill:var(--s2);background:var(--s2)} .chart .cline.s2{stroke:var(--s2)} .chart .s3.cmark,.chart .s3.cdot,.cleg i.s3,.ctip i.s3{fill:var(--s3);background:var(--s3)} .chart .cline.s3{stroke:var(--s3)} .chart .s4.cmark,.chart .s4.cdot,.cleg i.s4,.ctip i.s4{fill:var(--s4);background:var(--s4)} .chart .cline.s4{stroke:var(--s4)} .chart .s5.cmark,.chart .s5.cdot,.cleg i.s5,.ctip i.s5{fill:var(--s5);background:var(--s5)} .chart .cline.s5{stroke:var(--s5)} .chart .s6.cmark,.chart .s6.cdot,.cleg i.s6,.ctip i.s6{fill:var(--s6);background:var(--s6)} .chart .cline.s6{stroke:var(--s6)} .chart .s7.cmark,.chart .s7.cdot,.cleg i.s7,.ctip i.s7{fill:var(--s7);background:var(--s7)} .chart .cline.s7{stroke:var(--s7)} .chart .s8.cmark,.chart .s8.cdot,.cleg i.s8,.ctip i.s8{fill:var(--s8);background:var(--s8)} .chart .cline.s8{stroke:var(--s8)}
+ .chart{display:block} .chart .cgrid{stroke:var(--bd2);stroke-width:1} .chart .cbase{stroke:var(--bd);stroke-width:1} .chart .caxis{fill:var(--muted);font-size:11px}
+ .chart .cline{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round} .chart .cdot{stroke:var(--bg);stroke-width:2} .chart .chit{fill:transparent} .chart .cross{stroke:var(--muted);stroke-width:1}
+ .cleg{font-size:12px;display:inline-flex;align-items:center} .cleg i,.ctip i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px}
+ .ctip{position:absolute;display:none;pointer-events:none;background:var(--panel);border:1px solid var(--bd);border-radius:4px;padding:6px 9px;font-size:12px;box-shadow:0 3px 10px rgba(0,0,0,.25);white-space:nowrap} .ctip span{color:var(--muted);margin-left:6px}
  .tog.ison{background:var(--hover);border-color:var(--accent);color:var(--accent)}
  .fit3 #connStatus{max-width:120px} .fit3 #envChip{max-width:90px}
  .fit3 #coffeeImg{width:22px;object-fit:cover;object-position:-3px 0} /* at 26px high the cup is centred 14px in, and the "B" starts at 25px */ .fitb .brand{display:none} .tight .tbsep:not(.fixedsep){margin:2px 3px !important} .tight .tbchunk{gap:4px} .tight#barTop,.tight #barRight{column-gap:4px}
@@ -4655,7 +4707,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
   <span class="fld">Host <input id="host" class="h" value="127.0.0.1" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">Port <input id="port" class="s" value="3306" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">User <input id="user" class="s" style="width:80px" value="root" autocomplete="off" name="mwt_user" data-lpignore="true" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">Pass <input id="pass" class="p" type="password" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" name="mwt_secret" data-lpignore="true" data-form-type="other" onkeydown="if(event.key==='Enter')connect()"></span>
   <select id="ssl" onchange="sslCaToggle()"><option value="default">default</option><option value="disabled">disabled</option><option value="required">required</option><option value="verify">verify</option><option value="verify-ca">verify-ca</option></select>
   <span class="fld" id="sslcaWrap" style="display:none">CA <input id="sslca" class="s" style="width:150px" placeholder="CA certificate (.pem)" title="The CA certificate that signed this server's certificate. Needed for &quot;verify&quot; against a server using a private or self-signed certificate - which is what MariaDB and MySQL generate by default, and which no system trust store accepts. Leave empty to verify against the system trust store instead." onkeydown="if(event.key==='Enter')connect()"><button class="sm" title="Browse for the CA certificate file" onclick="browse({title:'Select CA certificate',filter:'*.pem',mode:'file',onPick:pp=>$('sslca').value=pp})">...</button></span>
-  <span class="fld"><button class="sm" id="sshBtn" onclick="editSsh()" title="Configure SSH tunnel">SSH</button><input type="hidden" id="sshhost"><input type="hidden" id="sshport"><input type="hidden" id="sshuser"><input type="hidden" id="sshkey"></span>
+  <span class="fld"><button class="sm" id="sshBtn" onclick="editSsh()" title="Configure SSH tunnel">SSH</button><input type="hidden" id="sshhost"><input type="hidden" id="sshport"><input type="hidden" id="sshuser"><input type="hidden" id="sshkey"><input type="hidden" id="sshpass"></span>
   <button class="primary" title="Connect to the server with the details above" onclick="connect()">Connect</button><button class="sm" title="Disconnect and lock the UI" onclick="disconnectAsk()">Disconnect</button>
   <span style="flex:1"></span>
  </div>
@@ -4839,6 +4891,14 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 <div class="modal floating" id="mHist"><div class="box" style="top:60px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mHist')" title="Drag to move"><h3 style="margin:0">Query History</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mHist')" title="Maximize" id="maxBtn_mHist" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mHist')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div id="histList" style="max-height:400px;overflow:auto"></div>
  <div class="row" style="justify-content:flex-end;flex:none"><button class="warn" onclick="clearHistory()">Clear history</button><button onclick="hide('mHist')">Close</button></div></div></div>
+<div class="modal floating" id="mPlan"><div class="box" style="width:780px;max-width:95vw;height:560px;display:flex;flex-direction:column;overflow:hidden;top:70px;left:160px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mPlan')" title="Drag to move"><h3 id="planTitle" style="margin:0 0 10px">Query plan</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mPlan')" title="Maximize" id="maxBtn_mPlan" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mPlan')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
+ <div id="planBody" style="overflow:auto;flex:1;min-height:0"></div>
+ <div class="row" style="justify-content:flex-end;flex:none"><button onclick="hide('mPlan')">Close</button></div></div></div>
+<div class="modal floating" id="mChart"><div class="box viz-root" style="width:860px;max-width:95vw;height:560px;display:flex;flex-direction:column;overflow:hidden;top:60px;left:140px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mChart')" title="Drag to move"><h3 id="chartTitle" style="margin:0 0 10px">Chart</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mChart')" title="Maximize" id="maxBtn_mChart" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mChart')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
+ <div class="row" style="flex:none;gap:8px;align-items:center;flex-wrap:wrap"><select id="chartType" onchange="chartDraw()"><option value="bar">Bars</option><option value="line">Line</option></select><span class="muted">along</span><select id="chartX" onchange="chartDraw()"></select><span class="muted">of</span><span id="chartSeries" style="display:inline-flex;gap:10px;flex-wrap:wrap"></span></div>
+ <div id="chartLegend" style="flex:none;display:flex;gap:14px;flex-wrap:wrap;margin:6px 0 2px"></div>
+ <div id="chartPlot" style="position:relative;flex:1;min-height:0;overflow:hidden"></div>
+ <div class="row" style="justify-content:space-between;flex:none;align-items:center"><span class="muted" id="chartNote" style="font-size:12px"></span><button onclick="hide('mChart')">Close</button></div></div></div>
 <div class="modal floating" id="mRowForm"><div class="box" style="width:560px;max-width:94vw;top:70px;left:160px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mRowForm')" title="Drag to move"><h3 id="rfTitle" style="margin:0">Edit row</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mRowForm')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
  <div id="rfFields" style="max-height:60vh;overflow:auto"></div>
  <div class="row" style="justify-content:flex-end;margin-top:6px"><button class="go" onclick="rfSave()">Save to pending</button><button onclick="hide('mRowForm')">Cancel</button></div></div></div>
@@ -5039,13 +5099,13 @@ function hexA(hex,a){hex=(hex||'').replace('#','');if(hex.length===3)hex=hex.spl
 function applyAccent(color){const bar=$('bar');if(!bar)return;if(!color){bar.style.borderTop='';bar.style.borderBottom='';bar.style.boxShadow='';return;}bar.style.borderTop='2px solid '+color;bar.style.borderBottom='';bar.style.boxShadow='';}
 window.curAccent='';
 function getConn(){return {host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value,sslCa:$('sslca').value,
- sshHost:$('sshhost').value,sshPort:$('sshport').value,sshUser:$('sshuser').value,sshKey:$('sshkey').value};}
+ sshHost:$('sshhost').value,sshPort:$('sshport').value,sshUser:$('sshuser').value,sshKey:$('sshkey').value,sshPassword:$('sshpass').value};}
 // ---- SSH tunnel ----
 // The tunnel's settings ride with the connection form in hidden fields, so everything that reads
 // the form through getConn() carries them. Signing in to SSH is the OpenSSH client's own: an agent,
 // the key given here, or ~/.ssh/config. It never asks for a password.
-function sshOf(c){c=c||{};return {sshHost:String(c.sshHost||'').trim(),sshPort:String(c.sshPort||'').trim(),sshUser:String(c.sshUser||'').trim(),sshKey:String(c.sshKey||'').trim()};}
-function sshSet(c){const v=sshOf(c);$('sshhost').value=v.sshHost;$('sshport').value=v.sshPort;$('sshuser').value=v.sshUser;$('sshkey').value=v.sshKey;sshPaint();}
+function sshOf(c){c=c||{};return {sshHost:String(c.sshHost||'').trim(),sshPort:String(c.sshPort||'').trim(),sshUser:String(c.sshUser||'').trim(),sshKey:String(c.sshKey||'').trim(),sshPassword:String(c.sshPassword||'')};}
+function sshSet(c){const v=sshOf(c);$('sshhost').value=v.sshHost;$('sshport').value=v.sshPort;$('sshuser').value=v.sshUser;$('sshkey').value=v.sshKey;$('sshpass').value=v.sshPassword;sshPaint();}
 function sshPaint(){const b=$('sshBtn');if(!b)return;const h=$('sshhost').value.trim();b.textContent=h?'SSH: '+h:'SSH';b.classList.toggle('on',!!h);
  b.title=h?'SSH tunnel: '+h+' (click to change)':'Configure SSH tunnel';}
 // grouped: behind a "Use SSH tunnel" checkbox, for the Save and Edit dialogs, where four
@@ -5054,7 +5114,8 @@ function sshFields(c,grouped){c=sshOf(c);const f=[
  {key:'sshHost',label:'SSH host (or a host alias from ~/.ssh/config)',value:c.sshHost,placeholder:'bastion.example.com'},
  {key:'sshPort',label:'SSH port',value:c.sshPort,placeholder:'22'},
  {key:'sshUser',label:'SSH user',value:c.sshUser},
- {key:'sshKey',label:'Private key file (optional - defaults to the SSH agent and ~/.ssh; key-based authentication only)',type:'file',browseTitle:'Select private key file',placeholder:'e.g. C:\\Users\\me\\.ssh\\id_ed25519',value:c.sshKey}];
+ {key:'sshKey',label:'Private key file (optional - defaults to the SSH agent and ~/.ssh)',type:'file',browseTitle:'Select private key file',placeholder:'e.g. C:\\Users\\me\\.ssh\\id_ed25519',value:c.sshKey},
+ {key:'sshPassword',label:'SSH password (only if the server asks for one; a key is better)',type:'password',value:c.sshPassword}];
  if(!grouped)return f;
  return [{key:'useSsh',label:'Use SSH tunnel',type:'checkbox',value:!!c.sshHost,reveals:'ssh'},...f.map(x=>({...x,group:'ssh'}))];}
 // What a dialog says about SSH: nothing at all when its box is not ticked.
@@ -5107,7 +5168,7 @@ function hideDead(){const d=$('deadOverlay');if(d)d.style.display='none';}
 async function api(path,p,signal){
  const txe=(p&&p.session)?txWatch(path,p):null;
  const r=await apiCall(path,p,signal);
- if(txe){txe.ok=!!(r&&r.ok);if(r&&!r.ok)txe.error=r.error||(r.aborted?'Cancelled.':'Failed.');}
+ if(txe){txe.ok=!!(r&&r.ok);if(r&&!r.ok)txe.error=r.error||(r.aborted?'Cancelled.':'Failed.');if(r&&r.affected!=null)txe.affected=+r.affected;}
  if(p&&p.session&&r&&r.ok===false&&TX_LOST.test(r.error||''))txLost(p.session);
  if(path!=='/api/query'||!p||p.pageSize!=null||!r||!r.ok||!r.hasMore||!r.cursorId)return r;
  // The desktop backend does not repeat cursorId in a fetch answer; the id stays the same.
@@ -5910,6 +5971,7 @@ const ICONS={
  clearf:'<path d="M3 4h14l-6 7v6l-3 2v-8zM17 13l4 4M21 13l-4 4"/>',
  trash:'<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>',
  undo:'<path d="M9 14L4 9l5-5M4 9h11a5 5 0 0 1 0 10h-3"/>',
+ chart:'<path d="M3 20h18M6 20v-6M11 20V6M16 20v-9M21 20V3"/>',
  skiperr:'<path d="M3 12h12M11 7l5 5-5 5"/><path d="M20 5v14"/>',
  autocommit:'<path d="M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/>',
 };
@@ -6904,12 +6966,13 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   // two independent buttons - stacked in one shared grid cell (both always in layout, only one
   // ever visible) so swapping between them on every run/cancel never shifts Run Query Selection/
   // Explain/Format, which display:none toggling used to do on every single query execution.
-  '<div class="toolbar"><span style="display:inline-grid"><button class="primary" id="runbtn_'+id+'" style="grid-area:1/1" title="Run the query (F5)" onclick="runTab(\''+id+'\')">Run Query</button><button class="warn" id="cancelbtn_'+id+'" style="grid-area:1/1;visibility:hidden" title="Cancel the running query" onclick="cancelQuery(\''+id+'\')">Cancel</button></span><button title="Run the selected text (Ctrl+Enter) - or, if nothing is selected, whichever statement the cursor is currently inside" onclick="runSel(\''+id+'\')" data-ic="runsel">Run Query Selection</button><button title="Prepend EXPLAIN to the current statement and run it" onclick="explainTab(\''+id+'\')" data-ic="explain">Explain</button><button title="Reformat the query for readability (safe - only changes whitespace/line breaks, never the query itself)" onclick="formatTabSql(\''+id+'\')" data-ic="format">Format</button>'+
+  '<div class="toolbar"><span style="display:inline-grid"><button class="primary" id="runbtn_'+id+'" style="grid-area:1/1" title="Run the query (F5)" onclick="runTab(\''+id+'\')">Run Query</button><button class="warn" id="cancelbtn_'+id+'" style="grid-area:1/1;visibility:hidden" title="Cancel the running query" onclick="cancelQuery(\''+id+'\')">Cancel</button></span><button title="Run the selected text (Ctrl+Enter) - or, if nothing is selected, whichever statement the cursor is currently inside" onclick="runSel(\''+id+'\')" data-ic="runsel">Run Query Selection</button><button title="Show how the server will run the current statement: the plan as a diagram, and the EXPLAIN table in the results" onclick="explainTab(\''+id+'\')" data-ic="explain">Explain</button><button title="Reformat the query for readability (safe - only changes whitespace/line breaks, never the query itself)" onclick="formatTabSql(\''+id+'\')" data-ic="format">Format</button>'+
   '<span class="tbsep"></span>'+
   lastBtn+selBtn+applyBtn+
   '<span class="tbsep"></span>'+
   '<span id="resultActions_'+id+'"'+(tab.ddl?'':' data-reserve')+' style="display:none;gap:9px;align-items:center" class="tbgroup">'+
   '<button title="Copy the grid to the clipboard, as CSV or Markdown, all rows or just the selected (checked) ones (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="event.stopPropagation();toggleCopyMenu(\''+id+'\',this)" data-ic="copy" data-fit="2">Copy \u25BE</button>'+'<button class="sm" id="wrapbtn_'+id+'" title="Toggle text wrapping in the grid" onclick="toggleWrap(\''+id+'\')" data-ic="wrap" data-fit="2"><span class="stk"><span class="off">Wrap: On</span><span>Wrap: Off</span></span></button>'+'<button class="sm" id="colsbtn_'+id+'" title="Show or hide columns" onclick="event.stopPropagation();toggleColPicker(\''+id+'\',this)" data-ic="columns" data-fit="2">Columns</button>'+'<input type="search" id="gsearch_'+id+'" placeholder="Search" title="Show only the rows holding this text in any column, and mark the cells that hold it (Ctrl+F from the grid; Enter / Shift+Enter: next / previous match; Esc clears). Searches the rows loaded so far, and says how many match in every result of a script." oninput="setGridSearch(\''+id+'\',this.value)" onkeydown="gsearchKey(event,\''+id+'\',this)" class="gsearch" style="width:170px;font-size:12px">'+'<button class="sm" id="clrflt_'+id+'" style="display:none" title="Clear the column filters and the search" onclick="clearGridFilters(\''+id+'\')" data-ic="clearf" data-fit="2">Clear filters</button>'+
+  '<button class="sm" title="Chart the rows the grid shows, as bars or a line" onclick="chartOpen(\''+id+'\')" data-ic="chart" data-fit="2">Chart</button>'+
   '</span>'+
   '<span style="flex:1 1 auto"></span>'+
   '<span id="edit_'+id+'"'+(tab.ddl?'':' data-reserve')+' style="display:none;align-items:center;gap:6px"></span>'+
@@ -7158,7 +7221,114 @@ async function explainTab(id){
  const src=sel||ta.value;const stmts=splitStmts(src).filter(s=>!isCommentOnly(s));const stmt=(stmts[0]||src).trim().replace(/;+\s*$/,'');
  if(!stmt){toast('Nothing to explain.',true);return;}
  await runSql(id,'EXPLAIN '+stmt);
+ planShow(id,stmt);
 }
+// ---- the plan as a picture ----
+// EXPLAIN FORMAT=JSON drawn as a tree. Every table read is a card saying how it is read - a full
+// scan in red, an index lookup in green - with the key, the rows expected and the condition; the
+// steps around them (joins, sorts, groupings, subqueries) are its branches. MySQL and MariaDB
+// shape the JSON differently, so the drawing walks what it is given rather than a fixed layout.
+const PLAN_ACCESS={ALL:['bad','full table scan'],index:['warn','full index scan'],range:['ok','index range'],index_merge:['ok','several indexes merged'],ref:['good','index lookup'],ref_or_null:['good','index lookup'],eq_ref:['good','one row per join, by a unique key'],const:['good','one row'],system:['good','one row'],fulltext:['ok','fulltext index'],unique_subquery:['good','unique subquery lookup'],index_subquery:['good','subquery by index']};
+const PLAN_STEP={query_block:'Query',nested_loop:'Join',ordering_operation:'Sort (ORDER BY)',grouping_operation:'Group (GROUP BY)',duplicates_removal:'Remove duplicates',union_result:'Union',query_specifications:'Parts of the union',materialized_from_subquery:'Derived table',attached_subqueries:'Subqueries',subqueries:'Subqueries',having_subqueries:'Subqueries in HAVING',optimized_away_subqueries:'Subqueries, optimized away',filesort:'Sort',temporary_table:'Temporary table',read_sorted_file:'Read the sorted rows',windowing:'Window functions','block-nl-join':'Join (block nested loop)',buffer_type:'Join buffer'};
+// Keys that are details of a step, not steps of their own.
+const PLAN_SKIP=new Set(['cost_info','used_columns','possible_keys','used_key_parts','key_parts','ref','r_loops','r_rows','r_filtered','r_total_time_ms','r_table_time_ms','r_other_time_ms','r_engine_stats','sort_key','partitions']);
+function planNum(v){const n=+v;return isNaN(n)?String(v):(n>=100||Number.isInteger(n))?fmtCount(Math.round(n)):String(+n.toPrecision(3));}
+function planTable(t){const a=t.access_type||'',k=PLAN_ACCESS[a]||['',''],rows=t.rows_examined_per_scan!=null?t.rows_examined_per_scan:t.rows;
+ const cost=t.cost_info&&t.cost_info.prefix_cost!=null?t.cost_info.prefix_cost:t.cost;
+ const facts=[];if(t.key)facts.push('key '+t.key);else if(t.possible_keys)facts.push('could use '+[].concat(t.possible_keys).join(', '));
+ if(rows!=null)facts.push(planNum(rows)+' row'+(+rows===1?'':'s'));if(t.filtered!=null&&+t.filtered<100)facts.push(planNum(t.filtered)+'% kept');
+ if(cost!=null)facts.push('cost '+planNum(cost));
+ ['using_index','using_filesort','using_temporary_table','using_join_buffer','using_index_condition','using_MRR'].forEach(f=>{if(t[f])facts.push(f.replace(/^using_/,'').replace(/_/g,' '));});
+ return '<div class="pcard '+k[0]+'"><b>'+esc(t.table_name||'?')+'</b> <span class="pacc">'+esc(a)+(k[1]?' - '+esc(k[1]):'')+'</span>'+
+  (facts.length?'<div class="pfacts">'+esc(facts.join(' · '))+'</div>':'')+
+  (t.attached_condition?'<div class="pcond" title="'+esc(t.attached_condition)+'">where '+esc(clip(t.attached_condition,160))+'</div>':'')+'</div>';}
+// The <li>s for what an object holds: a table's card, or a branch for each step inside it.
+function planItems(v){if(!v||typeof v!=='object')return '';
+ const kids=Object.keys(v).filter(k=>!PLAN_SKIP.has(k)&&v[k]&&typeof v[k]==='object').map(k=>planNode(k,v[k])).join('');
+ if(v.table_name)return '<li>'+planTable(v)+(kids?'<ul>'+kids+'</ul>':'')+'</li>';
+ return kids;}
+function planNode(k,v){if(k==='table')return planItems(v);
+ if(Array.isArray(v)){const inner=v.map(planItems).join('');return inner?'<li><div class="pstep">'+esc(PLAN_STEP[k]||k.replace(/_/g,' '))+'</div><ul>'+inner+'</ul></li>':'';}
+ const facts=[];if(v.select_id!=null)facts.push('select #'+v.select_id);
+ const qc=v.cost_info&&v.cost_info.query_cost!=null?v.cost_info.query_cost:(k==='query_block'?v.cost:null);if(qc!=null)facts.push('cost '+planNum(qc));
+ ['using_filesort','using_temporary_table'].forEach(f=>{if(v[f])facts.push(f.replace(/^using_/,'').replace(/_/g,' '));});
+ const inner=planItems(v);
+ return '<li><div class="pstep">'+esc(PLAN_STEP[k]||k.replace(/_/g,' '))+(facts.length?' <span class="pfacts">'+esc(facts.join(' · '))+'</span>':'')+'</div>'+(inner?'<ul>'+inner+'</ul>':'')+'</li>';}
+// The whole drawing: a line saying what matters most - how many tables are read in full - then
+// the tree, then the JSON itself for anyone who wants it.
+function planHtml(json){let plan;try{plan=typeof json==='string'?JSON.parse(json):json;}catch(e){return '<div class="muted">The server did not answer with a plan this can read.</div><pre>'+esc(String(json))+'</pre>';}
+ const scans=[];(function walk(o){if(!o||typeof o!=='object')return;if(Array.isArray(o)){o.forEach(walk);return;}if(o.table_name&&o.access_type==='ALL')scans.push(o.table_name);Object.keys(o).forEach(k=>walk(o[k]));})(plan);
+ const head=scans.length?'<div class="psum bad">'+scans.length+' table'+(scans.length===1?' is':'s are')+' read in full: '+esc(scans.join(', '))+'</div>':'<div class="psum good">No table is read in full.</div>';
+ return head+'<ul class="plan">'+Object.keys(plan).map(k=>planNode(k,plan[k])).join('')+'</ul><details class="pjson"><summary>The plan as the server gave it (JSON)</summary><pre>'+esc(JSON.stringify(plan,null,2))+'</pre></details>';}
+async function planShow(id,stmt){const t=T(id);if(!t)return;
+ const r=await api('/api/query',{sql:'EXPLAIN FORMAT=JSON '+stmt,db:dbOf(t),session:sessOf(t)});
+ $('planTitle').textContent='Query plan - '+t.title;
+ $('planBody').innerHTML=r.ok&&r.rows&&r.rows.length?planHtml(r.rows[0][0]):'<div class="muted">'+esc(r.error||'The server gave no plan for this statement.')+'</div>';
+ show('mPlan');}
+// ---- a chart of the result ----
+// Bars or a line from the rows the grid shows, in its order and with its filters - so sorting or
+// filtering the grid is how the chart is shaped, and the grid beside it is its table. The first
+// column that is not numbers is the axis; the columns of numbers are the series, coloured in one
+// fixed order (validated for colour vision and both themes) and never more than eight.
+const CHART_MAX_ROWS=500,CHART_MAX_SERIES=8;let _chartTab=null;
+function chartIsNum(v){return v!=null&&v!==''&&/^-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(String(v).trim());}
+// Which columns hold numbers: nine in ten of the values that are there, and at least one.
+function chartNumericCols(cols,rows){return cols.map((c,ci)=>{let n=0,ok=0;rows.forEach(r=>{const v=r[ci];if(v==null||v==='')return;n++;if(chartIsNum(v))ok++;});return n>0&&ok/n>=0.9;});}
+// Round steps (1, 2 or 5 times a power of ten) covering lo..hi in about count of them.
+function chartTicks(lo,hi,count){if(!(hi>lo))hi=lo+1;const raw=(hi-lo)/Math.max(1,count),mag=Math.pow(10,Math.floor(Math.log10(raw))),f=raw/mag,step=(f<=1?1:f<=2?2:f<=5?5:10)*mag;
+ const out=[];for(let v=Math.floor(lo/step)*step;v<=Math.ceil(hi/step)*step+step/2;v+=step)out.push(+v.toPrecision(12));return out;}
+function chartFmt(v){const a=Math.abs(v);return a>=1e9?+(v/1e9).toPrecision(3)+'B':a>=1e6?+(v/1e6).toPrecision(3)+'M':a>=1e4?+(v/1e3).toPrecision(3)+'k':String(+(+v).toPrecision(6));}
+// A bar with its data end rounded and its baseline end square, growing up or down from y0.
+function chartBar(x,top,w,h,r,up){if(h<=0)return 'M'+x+' '+top+'h'+w;const R=Math.min(r,w/2,h),b=top+h;
+ return up?'M'+x+' '+b+'V'+(top+R)+'Q'+x+' '+top+' '+(x+R)+' '+top+'H'+(x+w-R)+'Q'+(x+w)+' '+top+' '+(x+w)+' '+(top+R)+'V'+b+'Z'
+          :'M'+x+' '+top+'V'+(b-R)+'Q'+x+' '+b+' '+(x+R)+' '+b+'H'+(x+w-R)+'Q'+(x+w)+' '+b+' '+(x+w)+' '+(b-R)+'V'+top+'Z';}
+// The picture: {labels, series:[{name, values}], type:'bar'|'line', width, height} -> SVG.
+function chartSvg(o){const W=o.width,H=o.height,m={l:56,r:14,t:10,b:30},pw=W-m.l-m.r,ph=H-m.t-m.b,n=Math.max(1,o.labels.length);
+ const all=o.series.flatMap(x=>x.values).filter(v=>v!=null);
+ // Bars stand on zero; a line may start where its data does.
+ let lo=o.type==='line'&&all.length?Math.min(...all):Math.min(0,...all),hi=o.type==='line'&&all.length?Math.max(...all):Math.max(0,...all);
+ const ticks=chartTicks(lo,hi,5),y0=ticks[0],y1=ticks[ticks.length-1],Y=v=>m.t+ph-(v-y0)/((y1-y0)||1)*ph,base=Y(Math.max(y0,Math.min(0,y1)));
+ const band=pw/n,cx=i=>m.l+band*(i+.5);
+ let s='<svg class="chart" viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" role="img" aria-label="'+esc(o.series.map(x=>x.name).join(', '))+'">';
+ ticks.forEach(t=>{const y=Y(t).toFixed(1);s+='<line class="cgrid" x1="'+m.l+'" x2="'+(W-m.r)+'" y1="'+y+'" y2="'+y+'"/><text class="caxis" x="'+(m.l-7)+'" y="'+(+y+4)+'" text-anchor="end">'+esc(chartFmt(t))+'</text>';});
+ // As many axis labels as fit side by side, never on top of each other.
+ const longest=Math.min(14,Math.max(1,...o.labels.map(l=>String(l==null?'NULL':l).length))),every=Math.max(1,Math.ceil((longest*6.6+10)/band));
+ o.labels.forEach((l,i)=>{if(i%every)return;let t=String(l==null?'NULL':l);if(t.length>14)t=t.slice(0,13)+'…';s+='<text class="caxis" x="'+cx(i).toFixed(1)+'" y="'+(H-m.b+16)+'" text-anchor="middle">'+esc(t)+'</text>';});
+ const k=o.series.length;
+ if(o.type==='bar'){const gap=2,inner=Math.min(band*0.8,k*24+(k-1)*gap),bw=Math.max(1,(inner-(k-1)*gap)/k);
+  o.series.forEach((se,si)=>se.values.forEach((v,i)=>{if(v==null)return;const x=m.l+band*i+(band-inner)/2+si*(bw+gap),y=Y(v);
+   s+='<path class="cmark s'+(si+1)+'" d="'+chartBar(+x.toFixed(2),+Math.min(y,base).toFixed(2),+bw.toFixed(2),+Math.abs(base-y).toFixed(2),4,v>=0)+'"/>';}));}
+ else o.series.forEach((se,si)=>{let d='';se.values.forEach((v,i)=>{if(v==null)return;d+=(d?'L':'M')+cx(i).toFixed(1)+' '+Y(v).toFixed(1);});
+  s+='<path class="cline s'+(si+1)+'" d="'+d+'"/>';
+  if(o.labels.length<=60)se.values.forEach((v,i)=>{if(v!=null)s+='<circle class="cdot s'+(si+1)+'" cx="'+cx(i).toFixed(1)+'" cy="'+Y(v).toFixed(1)+'" r="4"/>';});});
+ s+='<line class="cbase" x1="'+m.l+'" x2="'+(W-m.r)+'" y1="'+base.toFixed(1)+'" y2="'+base.toFixed(1)+'"/>';
+ s+='<line class="cross" x1="0" x2="0" y1="'+m.t+'" y2="'+(m.t+ph)+'" style="display:none"/>';
+ for(let i=0;i<o.labels.length;i++)s+='<rect class="chit" data-i="'+i+'" x="'+(m.l+band*i).toFixed(2)+'" y="'+m.t+'" width="'+band.toFixed(2)+'" height="'+ph+'"/>';
+ return s+'</svg>';}
+function chartOpen(id){const t=T(id);if(!t||!t.cols||!t.cols.length)return;
+ const rows=viewIndices(id).slice(0,CHART_MAX_ROWS).map(ri=>t.rows[ri]),num=chartNumericCols(t.cols,rows);
+ if(!num.some(Boolean)){toast('There is no column of numbers in this result to chart.',true);return;}
+ _chartTab=id;const xi=num.findIndex(b=>!b);let left=CHART_MAX_SERIES;
+ $('chartX').innerHTML='<option value="-1">Row number</option>'+t.cols.map((c,ci)=>'<option value="'+ci+'"'+(ci===xi?' selected':'')+'>'+esc(c)+'</option>').join('');
+ $('chartSeries').innerHTML=t.cols.map((c,ci)=>num[ci]?'<label class="ck"><input type="checkbox" value="'+ci+'"'+(ci!==xi&&left-->0?' checked':'')+' onchange="chartDraw()"> '+esc(c)+'</label>':'').join('');
+ $('chartTitle').textContent='Chart - '+t.title;show('mChart');chartDraw();}
+function chartDraw(){const id=_chartTab,t=T(id),box=$('chartPlot');if(!t||!box)return;
+ const shown=viewIndices(id),rows=shown.slice(0,CHART_MAX_ROWS).map(ri=>t.rows[ri]),xi=+$('chartX').value,type=$('chartType').value;
+ const picked=[...$('chartSeries').querySelectorAll('input:checked')].map(b=>+b.value).filter(ci=>ci!==xi);
+ const labels=rows.map((r,i)=>xi<0?String(i+1):r[xi]);
+ const series=picked.slice(0,CHART_MAX_SERIES).map(ci=>({name:t.cols[ci],values:rows.map(r=>chartIsNum(r[ci])?+r[ci]:null),raw:rows.map(r=>r[ci])}));
+ $('chartNote').textContent=(shown.length>CHART_MAX_ROWS?'The first '+CHART_MAX_ROWS+' of '+fmtCount(shown.length)+' rows':fmtCount(rows.length)+' row'+(rows.length===1?'':'s'))+', in the grid\'s order and with its filters.'+(picked.length>CHART_MAX_SERIES?' Eight series at most - the first eight picked are drawn.':'');
+ if(!series.length){box.innerHTML='<div class="muted" style="padding:20px">Pick a column of numbers to chart.</div>';$('chartLegend').innerHTML='';return;}
+ box.innerHTML=chartSvg({labels,series,type,width:Math.max(360,box.clientWidth-2),height:Math.max(220,box.clientHeight-2)})+'<div class="ctip" id="chartTip"></div>';
+ $('chartLegend').innerHTML=series.length>1?series.map((x,i)=>'<span class="cleg"><i class="s'+(i+1)+'"></i>'+esc(x.name)+'</span>').join(''):'';
+ const svg=box.querySelector('svg'),tip=$('chartTip'),cross=svg.querySelector('.cross');
+ svg.querySelectorAll('.chit').forEach(r=>{
+  r.onmousemove=e=>{const i=+r.dataset.i,x=(+r.getAttribute('x')+(+r.getAttribute('width'))/2).toFixed(1);cross.setAttribute('x1',x);cross.setAttribute('x2',x);cross.style.display='';
+   tip.innerHTML='<b>'+esc(labels[i]==null?'NULL':labels[i])+'</b>'+series.map((x2,si)=>'<div><i class="s'+(si+1)+'"></i>'+esc(x2.name)+' <span>'+esc(x2.raw[i]==null?'NULL':x2.raw[i])+'</span></div>').join('');
+   tip.style.display='block';const b=box.getBoundingClientRect();tip.style.left=Math.max(0,Math.min(e.clientX-b.left+14,b.width-tip.offsetWidth-4))+'px';tip.style.top=Math.max(0,e.clientY-b.top-tip.offsetHeight-8)+'px';};
+  r.onmouseleave=()=>{tip.style.display='none';cross.style.display='none';};});}
+// Drawn again when its window changes size (maximize, a drag at the corner).
+if(typeof ResizeObserver!=='undefined')document.addEventListener('DOMContentLoaded',()=>{const b=$('chartPlot');if(b){let w=0;new ResizeObserver(()=>{if(b.clientWidth&&b.clientWidth!==w&&$('mChart').classList.contains('show')){w=b.clientWidth;chartDraw();}}).observe(b);}});
 // Heuristic SQL formatter, built on the SAME tokenizer as the syntax highlighter (hl()), so it
 // can never touch the CONTENT of a string, comment, or identifier - only the whitespace and line
 // breaks BETWEEN tokens. Not a full parser (deeply nested subqueries won't get perfect
@@ -7500,7 +7670,7 @@ function txWatch(path,p){if(!/^\/api\/(query|script|script-results)$/.test(path)
 function txLost(session){const t=tabs.find(x=>x.txSession===session);if(t){t.txDirty=false;t.txLog=[];txPaint(t.id);}}
 function txShowLog(id){const t=T(id);const log=(t&&t.txLog)||[];
  const pad=n=>String(n).padStart(2,'0'),hm=d=>pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
- const txt=log.map(e=>'-- '+hm(e.at)+(e.grid?'  grid edits':'')+(e.ok===undefined?'  running':e.ok?'':'  FAILED: '+String(e.error).split('\n')[0])+'\n'+e.sql.trim()).join('\n\n');
+ const txt=log.map(e=>'-- '+hm(e.at)+(e.grid?'  grid edits':'')+(e.affected!=null&&e.ok?'  '+e.affected+' row'+(e.affected===1?'':'s')+' changed':'')+(e.ok===undefined?'  running':e.ok?'':'  FAILED: '+String(e.error).split('\n')[0])+'\n'+e.sql.trim()).join('\n\n');
  viewText('Not committed yet - '+log.length+' run'+(log.length===1?'':'s')+' in this transaction',txt||'Nothing has changed anything in this transaction yet.',{readonly:true});}
 function txToggle(id,manual){const t=T(id);if(!t)return;
  if(manual){t.txOn=true;t.txSession=t.txSession||('tx_'+id+'_'+Date.now().toString(36));}
@@ -11059,7 +11229,7 @@ while ($run) {
         foreach ($kv in @($script:OpenCursors.GetEnumerator())) {
             if ($kv.Value.LastUsed -lt $idleCutoff) {
                 $idleCursor = $null
-                if ($script:OpenCursors.TryRemove($kv.Key, [ref]$idleCursor)) {
+                if ($script:OpenCursors.TryRemove($kv.Key, [ref]$idleCursor) -and -not $idleCursor.Memory) {
                     try { if (-not $idleCursor.Process.HasExited) { $idleCursor.Process.Kill() } } catch {}
                     $null = Close-QueryCursorProc $idleCursor
                 }

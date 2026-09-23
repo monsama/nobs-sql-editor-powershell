@@ -46,7 +46,7 @@ Requires Windows PowerShell 5.1 or later.
 - Connections with saved profiles, a per-connection accent colour and
   environment label, and a **read-only / safe mode** to protect production
   servers.
-- SSH tunnels through the system's OpenSSH client (key or agent authentication;
+- SSH tunnels through the system's OpenSSH client (key, agent or password;
   host aliases and ProxyJump from ~/.ssh/config work too).
 - Browse schemas, tables, views, procedures, functions, triggers and events,
   with quick filtering and search across all schemas.
@@ -63,7 +63,11 @@ Requires Windows PowerShell 5.1 or later.
 - Manual transactions: with Auto-commit off a tab keeps one transaction open
   across its runs until Commit or Rollback. Commit also saves grid edits
   not applied yet; Rollback discards them. The count beside Commit opens
-  the transaction's log: what it has run so far, and how each run went.
+  the transaction's log: what it has run so far, how many rows each run changed,
+  and how it went.
+- Explain draws the plan: every table read as a card, a full scan in red and an
+  index lookup in green, with the joins, sorts and subqueries around them.
+- A result charts as bars or a line, from the rows the grid shows.
 - Export tables or query results to CSV, INSERT statements, Excel, JSON or
   Markdown; CSV import.
 - Table designer, DDL view and edit, users and privileges, table maintenance,

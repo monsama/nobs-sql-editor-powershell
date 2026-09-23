@@ -1119,6 +1119,21 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     $verify = $conn.Clone(); $verify.sshHost = 'bastion.invalid'; $verify.ssl = 'verify'
     $said = Said $verify
     Check ($said -match 'verify-ca') 'SSL "verify" through a tunnel is refused, naming verify-ca' $said
+
+    # A real tunnel, when an SSH server is named: NOBS_TEST_SSH = host|port|user|key file (key
+    # optional). The server has to reach the database at the address in NOBS_TEST_DSN.
+    if ($env:NOBS_TEST_SSH) {
+        $sp = $env:NOBS_TEST_SSH.Split('|')
+        $via = $conn.Clone(); $via.sshHost = $sp[0]; $via.sshPort = $sp[1]; $via.sshUser = $sp[2]; if ($sp.Count -gt 3) { $via.sshKey = $sp[3] }
+        $one = Api '/api/query' @{ conn = $via; sql = 'SELECT 1+1' }
+        Check ($one.ok -and [string]$one.rows[0][0] -eq '2') 'a query goes through the SSH tunnel' ($one | ConvertTo-Json -Compress)
+        $two = Api '/api/query' @{ conn = $via; db = 'nobs_test'; sql = 'SELECT COUNT(*) FROM ro_canary' }
+        Check ($two.ok -and [string]$two.rows[0][0] -eq '3') 'and the next one reuses it' ($two | ConvertTo-Json -Compress)
+        $tsess = 'tx_ssh_' + [Guid]::NewGuid().ToString('N')
+        $ts = Api '/api/query' @{ conn = $via; db = 'nobs_test'; session = $tsess; sql = 'SELECT CONNECTION_ID()' }
+        Api '/api/session-end' @{ conn = $via; session = $tsess; action = 'close' } | Out-Null
+        Check ($ts.ok) 'a transaction runs through it too' ($ts | ConvertTo-Json -Compress)
+    } else { "  skip  NOBS_TEST_SSH not set - no tunnel was opened" }
 }
 finally {
     if ($token -and $base) {

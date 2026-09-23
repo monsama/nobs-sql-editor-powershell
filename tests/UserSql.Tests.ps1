@@ -276,7 +276,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
                 pending: { upd, del: new Set(), ins } };
     const env = {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
-      openRun: async () => {}, refreshTabDirty: () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, true, false],
+      openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, tableColTypes: async () => ({}), gridBinCols: async () => [false, true, false],
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
     };
@@ -367,7 +367,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
                 pending: { upd: { '0:1': 'y' }, del: new Set(), ins: [] } };
     const env = {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
-      openRun: async () => {}, refreshTabDirty: () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, false],
+      openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, tableColTypes: async () => ({}), gridBinCols: async () => [false, false],
       tableNulTextCount: async () => nulRows, fmtCount: n => String(n),
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },

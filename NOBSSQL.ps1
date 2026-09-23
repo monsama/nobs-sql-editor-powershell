@@ -62,6 +62,11 @@ $script:RunningJobs = [System.Collections.Concurrent.ConcurrentDictionary[string
 # is the pscustomobject built by Open-QueryCursor (Process/Reader/Rows/Headers/RequestId/
 # Cnf/LastUsed/Lock). See Open-QueryCursor, Api-FetchCursorBatch, Api-CloseCursor below.
 $script:OpenCursors = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+# Tabs with auto-commit off: session id -> the mysql.exe holding its transaction (see Open-TxSession).
+$script:TxSessions = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+# Open SSH tunnels: SSH login and database address -> the ssh.exe holding it (see Get-Endpoint).
+$script:Tunnels = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+$script:TxLost = "The connection holding this tab's transaction was lost, so the server rolled back everything it had not committed. The next run starts a new transaction."
 # What each server is (host:port -> $true for MariaDB), shared by every runspace - see Get-ServerIsMariaDB.
 $script:ServerFlavor = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 # A simple thread-safe set of requestIds the user has asked to cancel. Compare operations run
@@ -300,11 +305,78 @@ function Get-BrowseCharset {
 }
 # -Tool: the binary the file is for, when it is not the default mysql.exe. SSL option names and
 # the plugin directory both depend on which client reads the file.
+# ---------- SSH tunnels ----------
+# A connection with an SSH host reaches its database through `ssh -L` - the system's OpenSSH
+# client - listening on a free local port, and New-Cnf points every mysql.exe and mysqldump.exe at
+# that port instead. One tunnel per SSH login and database address, kept for whatever connects to
+# it next, until the app exits. Signing in is the client's own business: an agent, a key file, or
+# ~/.ssh/config, which brings host aliases and ProxyJump with it. BatchMode means it never waits on
+# a password prompt nobody can see; a login that would need one fails, with ssh's own reason.
+function Get-Endpoint { param($conn)
+    $h = ([string]$conn.host).Trim(); $p = ([string]$conn.port).Trim(); if (-not $p) { $p = '3306' }
+    $sh = ([string]$conn.sshHost).Trim()
+    if (-not $sh) { return @{ host = $h; port = $p } }
+    if ([string]$conn.ssl -eq 'verify') {
+        throw 'SSL mode "verify" cannot check the server''s host name through an SSH tunnel, because the connection is made to 127.0.0.1. Use "verify-ca" instead: the certificate chain is still validated.'
+    }
+    $sp = ([string]$conn.sshPort).Trim(); if (-not $sp) { $sp = '22' }
+    $su = ([string]$conn.sshUser).Trim(); $key = ([string]$conn.sshKey).Trim()
+    $id = "$su@${sh}:$sp|$key|${h}:$p"
+    # Held while a tunnel opens, so two connections at once do not open two.
+    [System.Threading.Monitor]::Enter($script:Tunnels)
+    try {
+        $t = $null
+        if ($script:Tunnels.TryGetValue($id, [ref]$t)) {
+            if (-not $t.Process.HasExited) { return @{ host = '127.0.0.1'; port = [string]$t.Port } }
+            $null = $script:Tunnels.TryRemove($id, [ref]$null)
+        }
+        $t = Open-Tunnel $sh $sp $su $key $h $p
+        $script:Tunnels[$id] = $t
+        return @{ host = '127.0.0.1'; port = [string]$t.Port }
+    } finally { [System.Threading.Monitor]::Exit($script:Tunnels) }
+}
+function Open-Tunnel { param([string]$SshHost, [string]$SshPort, [string]$SshUser, [string]$Key, [string]$DbHost, [string]$DbPort)
+    Initialize-DumpDb
+    $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0); $l.Start(); $local = $l.LocalEndpoint.Port; $l.Stop()
+    $exe = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'; if (-not (Test-Path $exe)) { $exe = 'ssh' }
+    $target = if ($DbHost.Contains(':')) { "[$DbHost]" } else { $DbHost }
+    $a = @('-N', '-T', '-o', 'BatchMode=yes', '-o', 'ExitOnForwardFailure=yes', '-o', 'StrictHostKeyChecking=accept-new',
+           '-o', 'ServerAliveInterval=30', '-o', 'ConnectTimeout=15', '-L', "127.0.0.1:${local}:${target}:$DbPort", '-p', $SshPort)
+    if ($Key) { $a += @('-i', $Key, '-o', 'IdentitiesOnly=yes') }
+    # After "--" the destination cannot be read as an option, whatever it starts with.
+    $a += @('--', $(if ($SshUser) { "$SshUser@$SshHost" } else { $SshHost }))
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $exe; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true; $psi.RedirectStandardError = $true; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $psi.Arguments = Format-Args $a
+    $proc = New-Object System.Diagnostics.Process; $proc.StartInfo = $psi
+    try { [void]$proc.Start() } catch { throw "Could not start ssh ($(Get-InnerMessage $_)). SSH tunnels use the OpenSSH client; on Windows it is the optional feature ""OpenSSH Client""." }
+    # Read as it comes, so a chatty tunnel never fills the pipe and stalls.
+    $said = New-Object NobsLineSink $proc.StandardError
+    # ssh listens on the local port once it has signed in, so a connection there means the tunnel is up.
+    $deadline = (Get-Date).AddSeconds(25)
+    while ($true) {
+        if ($proc.HasExited) {
+            $why = @(([string]$said.Drain(50, 300)) -split "`n" | Where-Object { $_.Trim() -and $_ -notmatch '^Warning: Permanently added' }) | Select-Object -Last 1
+            throw "Could not establish SSH tunnel to ${SshHost}: $(if ($why) { $why.Trim() } else { 'ssh exited.' })"
+        }
+        $c = New-Object System.Net.Sockets.TcpClient
+        try { if ($c.ConnectAsync('127.0.0.1', $local).Wait(200) -and $c.Connected) { break } } catch { } finally { $c.Close() }
+        if ((Get-Date) -gt $deadline) {
+            try { $proc.Kill() } catch { }
+            throw "SSH tunnel to $SshHost timed out after 25 seconds."
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    [pscustomobject]@{ Process = $proc; Port = $local; Said = $said }
+}
 function New-Cnf {
     param($conn, [string]$Tool)
     $tmp = Join-Path $env:TEMP ("mysqlcnf_" + [Guid]::NewGuid().ToString('N') + ".cnf")
     $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$(Get-CnfSafe $conn.host)"); [void]$sb.AppendLine("port=$(Get-CnfSafe $conn.port)"); [void]$sb.AppendLine("user=$(Get-CnfSafe $conn.user)")
+    # Through the SSH tunnel when the connection has one (Get-Endpoint).
+    $ep = Get-Endpoint $conn
+    [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$(Get-CnfSafe $ep.host)"); [void]$sb.AppendLine("port=$(Get-CnfSafe $ep.port)"); [void]$sb.AppendLine("user=$(Get-CnfSafe $conn.user)")
     if ($conn.password) { [void]$sb.AppendLine("password=$((Get-CnfSafe $conn.password) -replace '\\','\\')") }
     # Every statement this app sends is UTF-8. Without this MySQL's mysql.exe takes the console code
     # page (cp850 here), so text written through it was converted as if it were cp850: an accented
@@ -1501,11 +1573,193 @@ function Api-CloseCursor { param($data)
 # under its original RequestId in $script:RunningQueries for its whole life (see Open-QueryCursor
 # / Close-QueryCursorProc above), so Cancel keeps working across "fetch next" calls too, not just
 # the very first page.
+# ---------- Transactions a tab keeps open ----------
+# With auto-commit off, a tab's statements run in one mysql.exe of its own, started with
+# autocommit=0 and kept running until Commit, Rollback or the tab closing. The statements go in one
+# at a time, each followed by a marker SELECT that also reads @@error_count - the errors of the
+# statement before it - so a script stops at its first error as it does elsewhere, while the
+# transaction stays open. --force keeps the client running after an error; without it the client
+# would exit and the server would roll everything back.
+function Open-TxSession { param([string]$Id, $conn)
+    Initialize-DumpDb
+    $my = Get-Mysql $conn
+    $ra = Get-ResultArgs $my $conn
+    $cnf = New-Cnf $conn -Tool $my
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $my; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = $script:RawEnc; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        $psi.Arguments = Format-Args (@("--defaults-extra-file=$cnf", '--comments', '--force', '--unbuffered') + $ra)
+        $p = New-Object System.Diagnostics.Process; $p.StartInfo = $psi; [void]$p.Start()
+        $s = [pscustomobject]@{ Id=$Id; Process=$p; Out=(New-Object NobsXmlRows $p.StandardOutput); Err=(New-Object NobsLineSink $p.StandardError); Lock=(New-Object object); Cid=0; Conn=$conn }
+        $r = Invoke-TxStatements $s @('SET autocommit=0', 'SELECT CONNECTION_ID()') 1
+        if ($r.err) { try { if (-not $p.HasExited) { $p.Kill() } } catch {}; throw $r.err }
+        $s.Cid = [long]$r.sets[0].Rows[0][0]
+        return $s
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+}
+# Runs statements in a session. Returns the result sets, and on a failure the error, which of the
+# statements it was (at) and whether the session itself is gone (lost).
+function Invoke-TxStatements { param($s, [string[]]$Stmts, [int]$MaxRows)
+    $sets = New-Object 'System.Collections.Generic.List[NobsResultSet]'
+    $n = 0
+    foreach ($st in $Stmts) {
+        $n++
+        $marker = 'nobs_tx_' + [Guid]::NewGuid().ToString('N')
+        # A statement with a semicolon of its own - a procedure body - goes in under a delimiter it
+        # does not contain.
+        $body = if ($st.Contains(';')) { "DELIMITER ~~nobs~~`n$st`n~~nobs~~`nDELIMITER ;`n" } else { "$st;`n" }
+        $bytes = [Text.Encoding]::UTF8.GetBytes($body + "SELECT '$marker' AS nobs_marker, @@error_count AS nobs_errors;`n")
+        try { $s.Process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length); $s.Process.StandardInput.BaseStream.Flush() }
+        catch { return @{ sets=$sets; lost=$true; err=$script:TxLost } }
+        $part = $s.Out.SetsUntil($MaxRows, $marker)
+        if ($null -eq $part) {
+            $e = $s.Err.Drain(50, 200)
+            return @{ sets=$sets; lost=$true; err=$(if ($e) { FirstErr $e } else { $script:TxLost }) }
+        }
+        foreach ($x in $part) { $sets.Add($x) }
+        $errs = 0
+        if ($s.Out.MarkerRow -and $s.Out.MarkerRow.Length -gt 1) { [void][int]::TryParse([string]$s.Out.MarkerRow[1], [ref]$errs) }
+        if ($errs -gt 0) {
+            $e = $s.Err.Drain(20, 1000)
+            return @{ sets=$sets; err=$(if ($e) { FirstErr $e } else { 'The statement failed.' }); at=$n }
+        }
+        # Warnings and notes the client printed are not errors; they are let go here.
+        [void]$s.Err.Drain(0, 0)
+    }
+    @{ sets=$sets; err=$null }
+}
+# The tab's session, opened the first time, and held for the caller until Exit-TxSession.
+function Enter-TxSession { param([string]$Id, $conn)
+    $s = $null
+    if (-not $script:TxSessions.TryGetValue($Id, [ref]$s)) {
+        $s = Open-TxSession $Id $conn
+        if (-not $script:TxSessions.TryAdd($Id, $s)) { Stop-TxSession $s; $null = $script:TxSessions.TryGetValue($Id, [ref]$s) }
+    }
+    if (-not [System.Threading.Monitor]::TryEnter($s.Lock, 15000)) { throw "This tab's transaction is still busy with the statement before. Wait for it, or cancel it, and run again." }
+    if ($s.Process.HasExited) { [System.Threading.Monitor]::Exit($s.Lock); $null = $script:TxSessions.TryRemove($Id, [ref]$null); throw $script:TxLost }
+    return $s
+}
+function Exit-TxSession { param($s) try { [System.Threading.Monitor]::Exit($s.Lock) } catch {} }
+# Closing its input ends mysql.exe, and the server rolls back what was not committed.
+function Stop-TxSession { param($s)
+    try { $s.Process.StandardInput.Close() } catch {}
+    try { if (-not $s.Process.WaitForExit(2000)) { $s.Process.Kill() } } catch {}
+}
+# /api/query, /api/script and /api/script-results for a tab with auto-commit off. A grid save
+# (transaction:true) is a savepoint in the tab's transaction rather than one of its own: a COMMIT
+# would commit everything the tab had not, and a ROLLBACK would throw it away.
+function Api-TxRun { param($conn, $data, [string]$Kind)
+    $id = [string]$data.session
+    $sql = [string]$data.sql
+    if (-not $sql.Trim()) { return '{"ok":false,"error":"Empty query."}' }
+    try { Initialize-DumpDb; $s = Enter-TxSession $id $conn } catch { return '{"ok":false,"error":'+(J-Str (Get-InnerMessage $_))+'}' }
+    $rid = [string]$data.requestId
+    $entry = $null
+    try {
+        if ($rid) { $entry = [pscustomobject]@{ Process=$null; Cancelled=$false; TxSession=$s }; $script:RunningQueries[$rid] = $entry }
+        $stmts = [System.Collections.Generic.List[string]]::new()
+        if ($data.db) { $bt = [string][char]96; $stmts.Add("USE $bt$(([string]$data.db).Replace($bt, $bt+$bt))$bt") }
+        $user = [NobsTxSql]::Split($sql)
+        $batch = ($Kind -eq 'script') -and [bool]$data.transaction
+        if ($batch) { $stmts.Add('SAVEPOINT nobs_batch') }
+        $first = $stmts.Count
+        foreach ($x in $user) { $stmts.Add($x) }
+        if ($batch) { $stmts.Add('RELEASE SAVEPOINT nobs_batch') }
+        $maxRows = 100000
+        if ($Kind -eq 'script-results') { $maxRows = [int]$data.maxRows; if ($maxRows -lt 1) { $maxRows = 1000 } }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $r = Invoke-TxStatements $s $stmts.ToArray() $maxRows
+        $sw.Stop()
+        if ($r.lost) { $null = $script:TxSessions.TryRemove($id, [ref]$null); return '{"ok":false,"error":'+(J-Str $script:TxLost)+'}' }
+        if ($entry -and $entry.Cancelled) {
+            if ($batch) { $null = Invoke-TxStatements $s @('ROLLBACK TO SAVEPOINT nobs_batch') 1 }
+            return '{"ok":false,"error":"Query cancelled.","cancelled":true}'
+        }
+        if ($r.err) {
+            if ($batch) { $null = Invoke-TxStatements $s @('ROLLBACK TO SAVEPOINT nobs_batch') 1 }
+            $k = [int]$r.at - $first
+            $msg = [string]$r.err
+            if ($k -ge 1 -and $k -le $user.Count -and $user.Count -gt 1) {
+                $pv = $user[$k-1]; if ($pv.Length -gt 120) { $pv = $pv.Substring(0, 120) + '...' }
+                $msg = "Statement $k of $($user.Count) failed: $msg`n`n$pv"
+            }
+            if ($batch) { $msg += "`n`nNone of these changes were applied. The tab's transaction is still open." }
+            return '{"ok":false,"error":'+(J-Str $msg)+'}'
+        }
+        if ($Kind -eq 'script') { return '{"ok":true}' }
+        if ($Kind -eq 'query') {
+            $set = $null; foreach ($x in $r.sets) { $set = $x }
+            if ($null -eq $set) { return '{"ok":true,"columns":[],"rows":[],"elapsedMs":'+$sw.ElapsedMilliseconds+',"message":"Query OK. No result set."}' }
+            # A result without rows carries no column names (see NobsXmlRows); they are read on a
+            # connection of their own, which is safe for a statement that only reads.
+            if ($set.Names.Count -eq 0 -and (Test-SqlSafeToRerun ([string]$set.Statement))) {
+                $h = Get-ResultHeaders $conn ([string]$set.Statement) ([string]$data.db)
+                if ($h) { $set.Names.AddRange([string[]]@($h)) }
+            }
+            return '{"ok":true,"columns":'+(J-Arr @($set.Names))+',"rows":'+(J-RowsFast $set.Rows)+',"elapsedMs":'+$sw.ElapsedMilliseconds+'}'
+        }
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append('[')
+        $n = 0
+        foreach ($x in $r.sets) {
+            if ($n -gt 0) { [void]$sb.Append(',') }
+            $n++
+            $stmt = [string]$x.Statement; if ($stmt.Length -gt 120) { $stmt = $stmt.Substring(0, 120) }
+            [void]$sb.Append('{"statement":' + $n + ',"sql":' + (J-Str $stmt) + ',"columns":' + (J-Arr @($x.Names)) + ',"rows":' + (J-RowsFast $x.Rows) +
+                             ',"rowCount":' + $x.Count + ',"truncated":' + $(if ($x.Count -gt $x.Rows.Count) { 'true' } else { 'false' }) + '}')
+        }
+        [void]$sb.Append(']')
+        return '{"ok":true,"results":'+$sb.ToString()+'}'
+    } finally {
+        if ($rid) { $null = $script:RunningQueries.TryRemove($rid, [ref]$null) }
+        Exit-TxSession $s
+    }
+}
+# Endpoint: Commit, Rollback, or Close (roll back and end the session) for a tab. A session that
+# was never opened has nothing to commit or roll back, which is not an error.
+function Api-SessionEnd { param($conn, $data)
+    $id = [string]$data.session
+    $action = [string]$data.action
+    $s = $null
+    if (-not $id -or -not $script:TxSessions.TryGetValue($id, [ref]$s)) { return '{"ok":true,"open":false}' }
+    if ($action -eq 'close') {
+        $null = $script:TxSessions.TryRemove($id, [ref]$null)
+        Stop-TxSession $s
+        return '{"ok":true,"open":false}'
+    }
+    try { $s = Enter-TxSession $id $conn } catch {
+        $m = Get-InnerMessage $_
+        return '{"ok":false,"error":'+(J-Str $m)+',"lost":'+$(if ($m -eq $script:TxLost) { 'true' } else { 'false' })+'}'
+    }
+    try {
+        $r = Invoke-TxStatements $s @($(if ($action -eq 'commit') { 'COMMIT' } else { 'ROLLBACK' })) 1
+        if ($r.lost) { $null = $script:TxSessions.TryRemove($id, [ref]$null); return '{"ok":false,"error":'+(J-Str $script:TxLost)+',"lost":true}' }
+        if ($r.err) { return '{"ok":false,"error":'+(J-Str $(if ($action -eq 'commit') { "Could not commit: $($r.err)" } else { $r.err }))+'}' }
+        return '{"ok":true,"open":true}'
+    } finally { Exit-TxSession $s }
+}
+# Cancel for a statement running in a tab's transaction: KILL QUERY from a connection of its own,
+# as the desktop edition does, so the transaction survives. A session still stuck after that is
+# waiting for input that will not come (a quote never closed), and is ended.
+function Stop-TxQuery { param($entry)
+    $s = $entry.TxSession
+    $my = Get-Mysql $s.Conn
+    $cnf = New-Cnf $s.Conn -Tool $my
+    try { $null = Run-Proc $my @("--defaults-extra-file=$cnf", '-e', "KILL QUERY $($s.Cid)") } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+    for ($i = 0; $i -lt 30; $i++) {
+        if (-not $script:RunningQueries.Values.Contains($entry)) { return }
+        Start-Sleep -Milliseconds 100
+    }
+    try { if (-not $s.Process.HasExited) { $s.Process.Kill() } } catch {}
+}
 function Api-CancelQuery { param($data)
     $rid = [string]$data.requestId
     if (-not $rid) { return '{"ok":false,"error":"no requestId"}' }
     $entry = $null
     if ($script:RunningQueries.TryGetValue($rid, [ref]$entry)) {
+        if ($entry.TxSession) { $entry.Cancelled = $true; Stop-TxQuery $entry; return '{"ok":true,"message":"Cancel signal sent."}' }
         try {
             $entry.Cancelled = $true
             if (-not $entry.Process.HasExited) { $entry.Process.Kill() }
@@ -2084,6 +2338,49 @@ public sealed class NobsXmlRows {
         }
         return list;
     }
+    // The result sets up to the marker SELECT that follows each statement of a tab's transaction
+    // (see Invoke-TxStatements), which is read into MarkerRow and not returned. null when the
+    // output ends first: the process is gone.
+    public string[] MarkerRow;
+    public List<NobsResultSet> SetsUntil(int maxRows, string marker) {
+        var list = new List<NobsResultSet>();
+        NobsResultSet cur = null;
+        bool isMarker = false;
+        MarkerRow = null;
+        while (true) {
+            int c = Read();
+            if (c < 0) return null;
+            if (c != '<') continue;
+            string tag = TagName();
+            if (tag == "?xml") {
+                TagRest(null);
+                if (!eolKnown) { eolKnown = true; crlf = Peek() == '\r'; }
+            } else if (tag == "resultset") {
+                var attrs = new StringBuilder();
+                bool closed = TagRest(attrs);
+                bool found;
+                string st = AttrValue(attrs.ToString(), "statement", out found);
+                Names.Clear();
+                isMarker = st != null && st.Contains(marker);
+                if (isMarker) { cur = null; continue; }
+                cur = new NobsResultSet { Statement = st };
+                list.Add(cur);
+                if (closed) cur = null;
+            } else if (tag == "/resultset") {
+                TagRest(null);
+                if (isMarker) return list;
+                cur = null;
+            } else if (tag == "row") {
+                TagRest(null);
+                if (isMarker) { MarkerRow = Row(true); continue; }
+                if (cur == null) { Row(false); continue; }
+                bool keep = cur.Rows.Count < maxRows;
+                string[] row = Row(keep);
+                if (keep) { cur.Rows.Add(row); if (cur.Names.Count == 0) cur.Names.AddRange(Names); }
+                cur.Count++;
+            } else TagRest(null);
+        }
+    }
     // Writes data to a process's input and closes it, without waiting: the process writes its
     // results meanwhile, and they are read as they come.
     public static System.Threading.Tasks.Task FeedAndClose(Stream s, byte[] data) {
@@ -2347,6 +2644,94 @@ public static class NobsDumpDb {
                 while (r.Next(line)) { var b = RewriteLine(line.GetBuffer(), (int)line.Length, from, to); w.Write(b, 0, b.Length); }
                 w.Flush();
             } catch (IOException) { }
+        }
+    }
+}
+// A tab's transaction is one mysql.exe kept running and fed a statement at a time (see
+// Open-TxSession). These are the parts of that PowerShell does badly: splitting a script into its
+// statements as the client would, and reading the client's error output as it arrives.
+public static class NobsTxSql {
+    // The statements of a script without their delimiters, honouring quotes, comments and
+    // DELIMITER lines - the rules of the desktop edition's split_sql_statements. A piece that is
+    // only comments is left out: sent on its own the server answers it with "Query was empty".
+    public static List<string> Split(string sql) {
+        var list = new List<string>();
+        var buf = new StringBuilder();
+        string delim = ";";
+        bool lineStart = true;
+        int i = 0, n = sql.Length;
+        while (i < n) {
+            char c = sql[i];
+            if (lineStart && i + 9 <= n && string.Compare(sql, i, "DELIMITER", 0, 9, StringComparison.OrdinalIgnoreCase) == 0 && (i + 9 == n || sql[i + 9] == ' ' || sql[i + 9] == '\t')) {
+                int j = i + 9; while (j < n && (sql[j] == ' ' || sql[j] == '\t')) j++;
+                int k = j; while (k < n && sql[k] != '\r' && sql[k] != '\n') k++;
+                string d = sql.Substring(j, k - j).Trim(); if (d.Length > 0) delim = d;
+                i = k; buf.Clear(); lineStart = true; continue;
+            }
+            if (c == '/' && i + 1 < n && sql[i + 1] == '*') {
+                int e = sql.IndexOf("*/", i + 2, StringComparison.Ordinal); int end = e < 0 ? n : e + 2;
+                buf.Append(sql, i, end - i); i = end; continue;
+            }
+            if (c == '#' || (c == '-' && i + 1 < n && sql[i + 1] == '-' && (i + 2 >= n || sql[i + 2] == ' ' || sql[i + 2] == '\t' || sql[i + 2] == '\r' || sql[i + 2] == '\n'))) {
+                int e = sql.IndexOf('\n', i); int end = e < 0 ? n : e + 1;
+                buf.Append(sql, i, end - i); i = end; continue;
+            }
+            if (c == '\'' || c == '"' || c == '`') {
+                int j = i + 1;
+                while (j < n) {
+                    if (sql[j] == '\\' && c != '`' && j + 1 < n) { j += 2; continue; }
+                    if (sql[j] == c) { if (j + 1 < n && sql[j + 1] == c) { j += 2; continue; } j++; break; }
+                    j++;
+                }
+                if (j > n) j = n;
+                buf.Append(sql, i, j - i); i = j; lineStart = false; continue;
+            }
+            if (string.CompareOrdinal(sql, i, delim, 0, delim.Length) == 0) {
+                string st = buf.ToString().Trim(); if (st.Length > 0 && !Blank(st)) list.Add(st);
+                buf.Clear(); i += delim.Length; lineStart = true; continue;
+            }
+            buf.Append(c); if (!char.IsWhiteSpace(c)) lineStart = false; i++;
+        }
+        string last = buf.ToString().Trim(); if (last.Length > 0 && !Blank(last)) list.Add(last);
+        return list;
+    }
+    // Nothing but whitespace and comments. /*! ... */ is not a comment: the server runs it.
+    public static bool Blank(string s) {
+        int i = 0, n = s.Length;
+        while (i < n) {
+            char c = s[i];
+            if (char.IsWhiteSpace(c)) { i++; continue; }
+            if (c == '/' && i + 2 < n && s[i + 1] == '*' && s[i + 2] != '!') { int e = s.IndexOf("*/", i + 2, StringComparison.Ordinal); if (e < 0) return true; i = e + 2; continue; }
+            if (c == '#' || (c == '-' && i + 1 < n && s[i + 1] == '-')) { int e = s.IndexOf('\n', i); if (e < 0) return true; i = e + 1; continue; }
+            return false;
+        }
+        return true;
+    }
+}
+// Collects a process's error output line by line on a thread of its own, so it can be read when a
+// statement is known to have failed without blocking while none is coming.
+public sealed class NobsLineSink {
+    readonly Queue<string> q = new Queue<string>();
+    readonly object gate = new object();
+    long seen;
+    public NobsLineSink(TextReader r) {
+        var t = new System.Threading.Thread(() => {
+            try { string l; while ((l = r.ReadLine()) != null) lock (gate) { q.Enqueue(l); seen++; } }
+            catch (IOException) { } catch (ObjectDisposedException) { }
+        });
+        t.IsBackground = true; t.Start();
+    }
+    // What has arrived: waits up to firstMs for a first line, then until nothing more has come for
+    // quietMs.
+    public string Drain(int quietMs, int firstMs) {
+        var until = DateTime.UtcNow.AddMilliseconds(firstMs);
+        while (true) { lock (gate) { if (q.Count > 0) break; } if (DateTime.UtcNow >= until) break; System.Threading.Thread.Sleep(10); }
+        long last = -1;
+        while (quietMs > 0) { long now; lock (gate) now = seen; if (now == last) break; last = now; System.Threading.Thread.Sleep(quietMs); }
+        lock (gate) {
+            var sb = new StringBuilder();
+            while (q.Count > 0) { if (sb.Length > 0) sb.Append('\n'); sb.Append(q.Dequeue()); }
+            return sb.ToString();
         }
     }
 }
@@ -2668,7 +3053,7 @@ function Api-ConnSetPrimary { param($data)
     $name=[string]$data.name
     $list = Load-Conns | ForEach-Object {
         $pass = if($_.pass){ [string]$_.pass } else { '' }
-        [pscustomobject]@{name=$_.name;host=$_.host;port=$_.port;user=$_.user;ssl=$_.ssl;sslCa=[string]$_.sslCa;pass=$pass;primary=($name -ne '' -and $_.name -eq $name);accent=[string]$_.accent;env=[string]$_.env;readonly=[bool]$_.readonly}
+        [pscustomobject]@{name=$_.name;host=$_.host;port=$_.port;user=$_.user;ssl=$_.ssl;sslCa=[string]$_.sslCa;sshHost=[string]$_.sshHost;sshPort=[string]$_.sshPort;sshUser=[string]$_.sshUser;sshKey=[string]$_.sshKey;pass=$pass;primary=($name -ne '' -and $_.name -eq $name);accent=[string]$_.accent;env=[string]$_.env;readonly=[bool]$_.readonly}
     }
     Save-Conns @($list); '{"ok":true}'
 }
@@ -3048,7 +3433,7 @@ function Api-ConnList {
     # decrypt, so this never needs to touch the actual DPAPI-protected secret just to report
     # whether one exists. Lets the connection dropdown show which saved connections will prompt
     # for a password on connect versus which already have one stored on this machine.
-    $items = Load-Conns | ForEach-Object { $pr = if($_.primary){'true'}else{'false'}; $ro = if($_.readonly){'true'}else{'false'}; $hp = if($_.pass){'true'}else{'false'}; '{"name":'+(J-Str $_.name)+',"host":'+(J-Str $_.host)+',"port":'+(J-Str $_.port)+',"user":'+(J-Str $_.user)+',"ssl":'+(J-Str $_.ssl)+',"sslCa":'+(J-Str ([string]$_.sslCa))+',"primary":'+$pr+',"accent":'+(J-Str ([string]$_.accent))+',"env":'+(J-Str ([string]$_.env))+',"readonly":'+$ro+',"hasPassword":'+$hp+'}' }
+    $items = Load-Conns | ForEach-Object { $pr = if($_.primary){'true'}else{'false'}; $ro = if($_.readonly){'true'}else{'false'}; $hp = if($_.pass){'true'}else{'false'}; '{"name":'+(J-Str $_.name)+',"host":'+(J-Str $_.host)+',"port":'+(J-Str $_.port)+',"user":'+(J-Str $_.user)+',"ssl":'+(J-Str $_.ssl)+',"sslCa":'+(J-Str ([string]$_.sslCa))+',"sshHost":'+(J-Str ([string]$_.sshHost))+',"sshPort":'+(J-Str ([string]$_.sshPort))+',"sshUser":'+(J-Str ([string]$_.sshUser))+',"sshKey":'+(J-Str ([string]$_.sshKey))+',"primary":'+$pr+',"accent":'+(J-Str ([string]$_.accent))+',"env":'+(J-Str ([string]$_.env))+',"readonly":'+$ro+',"hasPassword":'+$hp+'}' }
     '{"ok":true,"items":['+($items -join ',')+']}'
 }
 # Look up a saved connection by name (host/port/user/ssl/password/readonly) - used by the
@@ -3064,7 +3449,7 @@ function Resolve-SavedConn { param($name)
     # so between servers in different zones every copied TIMESTAMP moved by the difference (Zurich
     # to UTC: 12:00 UTC arrived as 14:00 UTC), and equal values showed as different. utc runs
     # both sessions in UTC (see New-Cnf), so the text means the same instant everywhere.
-    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; sslCa=[string]$c.sslCa; password=$pass; readonly=[bool]$c.readonly; utc=$true }
+    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; sslCa=[string]$c.sslCa; password=$pass; readonly=[bool]$c.readonly; utc=$true; sshHost=[string]$c.sshHost; sshPort=[string]$c.sshPort; sshUser=[string]$c.sshUser; sshKey=[string]$c.sshKey }
 }
 # Returns an ordered map of table -> ordered list of columns {name,type,null,default,extra} for
 # every table in the given schema, via one information_schema query (cheap, single round trip).
@@ -3793,7 +4178,7 @@ function Api-ConnGet { param($data)
     if(-not $c){ return '{"ok":false}' }
     $pass=''
     if($c.pass){ try { $sec=ConvertTo-SecureString $c.pass; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec); $pass=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($b); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } catch {} }
-    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"sslCa":'+(J-Str ([string]$c.sslCa))+',"password":'+(J-Str $pass)+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
+    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"sslCa":'+(J-Str ([string]$c.sslCa))+',"sshHost":'+(J-Str ([string]$c.sshHost))+',"sshPort":'+(J-Str ([string]$c.sshPort))+',"sshUser":'+(J-Str ([string]$c.sshUser))+',"sshKey":'+(J-Str ([string]$c.sshKey))+',"password":'+(J-Str $pass)+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
 }
 function Api-ConnSave { param($data)
     $name=[string]$data.name; if(-not $name){ return '{"ok":false,"error":"name required"}' }
@@ -3816,7 +4201,7 @@ function Api-ConnSave { param($data)
     if($data.PSObject.Properties['env']){ $env=[string]$data.env } elseif($prevObj){ $env=[string]$prevObj.env } else { $env='' }
     if($data.PSObject.Properties['readonly']){ $ro=[bool]$data.readonly } elseif($prevObj -and $prevObj.readonly){ $ro=$true } else { $ro=$false }
     $list=@($before | Where-Object { $_.name -ne $name })
-    $list+=[pscustomobject]@{name=$name;host=$c.host;port=$c.port;user=$c.user;ssl=$c.ssl;sslCa=[string]$c.sslCa;pass=$enc;primary=$prevPrimary;accent=$accent;env=$env;readonly=$ro}
+    $list+=[pscustomobject]@{name=$name;host=$c.host;port=$c.port;user=$c.user;ssl=$c.ssl;sslCa=[string]$c.sslCa;sshHost=[string]$c.sshHost;sshPort=[string]$c.sshPort;sshUser=[string]$c.sshUser;sshKey=[string]$c.sshKey;pass=$enc;primary=$prevPrimary;accent=$accent;env=$env;readonly=$ro}
     Save-Conns $list
     '{"ok":true}'
 }
@@ -3979,6 +4364,17 @@ body.schemas-folded #schemas{display:none} #objects{flex:1;overflow:auto}
 .tabpane.edfolded-results [id^="ew_"]{flex:1 1 auto !important;height:auto !important}
  .hl,.editor{position:absolute;inset:0;margin:0;padding:8px;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:13px;line-height:1.4;white-space:pre;overflow:auto;border:0;tab-size:4}
  .hl{pointer-events:none;z-index:1;color:var(--fg)} .editor{z-index:2;color:transparent;background:transparent;caret-color:var(--fg);resize:none;outline:none}
+ .hl.fm{z-index:0;color:transparent} .fm mark{background:var(--hit);color:transparent;border-radius:2px} .fm mark.on{background:var(--accent);opacity:.45}
+ .findbar{position:absolute;top:4px;right:20px;z-index:5;display:flex;flex-direction:column;gap:4px;padding:5px 6px;background:var(--panel);border:1px solid var(--bd);border-radius:4px;box-shadow:0 3px 10px rgba(0,0,0,.25);font-size:12px} .findbar .frow{display:flex;gap:4px;align-items:center} .findbar input:not([type]){width:190px} .findbar label{display:inline-flex;align-items:center;gap:2px;color:var(--muted);cursor:pointer} .findbar .frn{min-width:64px;text-align:right}
+ .txdirty{color:#d9822b;font-weight:600} .tab.txopen{box-shadow:inset 0 -2px 0 #d9822b}
+ #sshBtn.on{border-color:var(--accent);color:var(--accent)}
+ /* A query bar is fitted to everything it can show, not to what it shows at the moment (fitBar):
+    the result buttons, the grid-edit buttons and Commit/Rollback keep their room while hidden, and
+    the texts that change as you work have a width of their own. */
+ .fitmax [data-reserve]{display:inline-flex!important}
+ .pill.cnt{min-width:8em;justify-content:center;font-variant-numeric:tabular-nums}
+ [id^="pager_"]{width:26ch;overflow:hidden;white-space:nowrap;justify-content:flex-end} [id^="pager_"]>span{overflow:hidden;text-overflow:ellipsis}
+ .stk{display:inline-grid} .stk>span{grid-area:1/1} .stk>.off{visibility:hidden}
  .c-str{color:var(--str)} .c-kw{color:var(--kw);font-weight:600} .c-com{color:var(--com);font-style:italic} .c-num{color:var(--num)}
  .toolbar{padding:4px 8px;background:var(--panel);border-bottom:1px solid var(--bd2);display:flex;gap:9px;align-items:center;flex-wrap:wrap}
  .tbsep{width:1px;align-self:stretch;background:var(--bd);margin:2px 8px}
@@ -4232,6 +4628,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
   <span class="fld">Host <input id="host" class="h" value="127.0.0.1" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">Port <input id="port" class="s" value="3306" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">User <input id="user" class="s" style="width:80px" value="root" autocomplete="off" name="mwt_user" data-lpignore="true" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">Pass <input id="pass" class="p" type="password" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" name="mwt_secret" data-lpignore="true" data-form-type="other" onkeydown="if(event.key==='Enter')connect()"></span>
   <select id="ssl" onchange="sslCaToggle()"><option value="default">default</option><option value="disabled">disabled</option><option value="required">required</option><option value="verify">verify</option><option value="verify-ca">verify-ca</option></select>
   <span class="fld" id="sslcaWrap" style="display:none">CA <input id="sslca" class="s" style="width:150px" placeholder="CA certificate (.pem)" title="The CA certificate that signed this server's certificate. Needed for &quot;verify&quot; against a server using a private or self-signed certificate - which is what MariaDB and MySQL generate by default, and which no system trust store accepts. Leave empty to verify against the system trust store instead." onkeydown="if(event.key==='Enter')connect()"><button class="sm" title="Browse for the CA certificate file" onclick="browse({title:'Select CA certificate',filter:'*.pem',mode:'file',onPick:pp=>$('sslca').value=pp})">...</button></span>
+  <span class="fld"><button class="sm" id="sshBtn" onclick="editSsh()" title="Configure SSH tunnel">SSH</button><input type="hidden" id="sshhost"><input type="hidden" id="sshport"><input type="hidden" id="sshuser"><input type="hidden" id="sshkey"></span>
   <button class="primary" title="Connect to the server with the details above" onclick="connect()">Connect</button><button class="sm" title="Disconnect and lock the UI" onclick="disconnectAsk()">Disconnect</button>
   <span style="flex:1"></span>
  </div>
@@ -4487,7 +4884,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  </div>
  <div class="row" style="justify-content:flex-end;margin-top:14px"><button onclick="hide('mAbout')">Close</button></div></div></div>
 <div class="modal floating" id="mShortcuts"><div class="box" style="width:900px;max-width:94vw;top:70px;left:170px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mShortcuts')" title="Drag to move"><h3 style="margin:0">Keyboard shortcuts &amp; tips</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mShortcuts')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
- <div class="sccols"><div class="scsec"><div class="sch">EDITOR</div><table style="border-collapse:collapse;font-size:13px;width:100%"><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>F5</kbd></td><td style="padding:3px 0;color:var(--muted)">Run the whole query</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">Run the selected text (or all, if nothing is selected)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + Space</kbd></td><td style="padding:3px 0;color:var(--muted)">Autocomplete</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Tab</kbd></td><td style="padding:3px 0;color:var(--muted)">Indent (in the editor)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + D</kbd></td><td style="padding:3px 0;color:var(--muted)">Duplicate the current line (or every line touched by the selection) below</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + /</kbd></td><td style="padding:3px 0;color:var(--muted)">Toggle "-- " comment on the current line or selection</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Alt + &uarr; / &darr;</kbd></td><td style="padding:3px 0;color:var(--muted)">Move the current line (or selection) up or down</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + Shift + K</kbd></td><td style="padding:3px 0;color:var(--muted)">Delete the current line (or every line touched by the selection)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + L</kbd></td><td style="padding:3px 0;color:var(--muted)">Focus the editor and select all</td></tr></table></div><div class="scsec"><div class="sch">RESULTS</div><table style="border-collapse:collapse;font-size:13px;width:100%"><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + Click</kbd></td><td style="padding:3px 0;color:var(--muted)">On a cell: pick it, or drop it. On a row's checkbox: the same for the row</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Shift + Click</kbd></td><td style="padding:3px 0;color:var(--muted)">On a cell: the block back to the last one picked. On a checkbox: the run of rows</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + A</kbd></td><td style="padding:3px 0;color:var(--muted)">In the results: pick every row shown, or clear the selection</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + C</kbd></td><td style="padding:3px 0;color:var(--muted)">Copy what is picked - the cells, or the rows if no cell is</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Esc</kbd></td><td style="padding:3px 0;color:var(--muted)">In the results: let the picked cells go</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + F</kbd></td><td style="padding:3px 0;color:var(--muted)">Search the results (from the grid)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Enter / Shift + Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">In the search box: the next / previous matching cell</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Esc</kbd></td><td style="padding:3px 0;color:var(--muted)">In the search box: clear it</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>&larr; &uarr; &darr; &rarr;</kbd></td><td style="padding:3px 0;color:var(--muted)">Move from cell to cell in an editable grid</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Tab / Shift + Tab</kbd></td><td style="padding:3px 0;color:var(--muted)">The next / previous cell, wrapping at the row ends</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Enter or F2</kbd></td><td style="padding:3px 0;color:var(--muted)">Edit the cell the keyboard is on</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">In a cell holding several lines: keep the edit</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Esc</kbd></td><td style="padding:3px 0;color:var(--muted)">While editing a cell: discard it. Otherwise: leave the cell</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + S</kbd></td><td style="padding:3px 0;color:var(--muted)">Apply pending grid edits (save changes)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Double-click a cell</kbd></td><td style="padding:3px 0;color:var(--muted)">Open the value in the cell editor (a read-only result: the viewer)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Drag column edge</kbd></td><td style="padding:3px 0;color:var(--muted)">Resize a results column</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Double-click column edge</kbd></td><td style="padding:3px 0;color:var(--muted)">Auto-fit a results column</td></tr></table></div><div class="scsec"><div class="sch">TABS</div><table style="border-collapse:collapse;font-size:13px;width:100%"><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + T</kbd></td><td style="padding:3px 0;color:var(--muted)">New query tab</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + W</kbd></td><td style="padding:3px 0;color:var(--muted)">Close current tab</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Middle-click a tab</kbd></td><td style="padding:3px 0;color:var(--muted)">Close it</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Drag a tab</kbd></td><td style="padding:3px 0;color:var(--muted)">Reorder the tabs</td></tr></table></div><div class="scsec"><div class="sch">CONNECTION AND SIDEBAR</div><table style="border-collapse:collapse;font-size:13px;width:100%"><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">Connect (when focused in Host / Port / User / Pass)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Alt + &darr;, F4, Space</kbd></td><td style="padding:3px 0;color:var(--muted)">Open the connections list (when it has the focus)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Type a name</kbd></td><td style="padding:3px 0;color:var(--muted)">In the open connections list: narrow it. Backspace undoes, Esc clears</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>&darr;</kbd></td><td style="padding:3px 0;color:var(--muted)">From a filter box: step into the list below it</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Shift + click a group</kbd></td><td style="padding:3px 0;color:var(--muted)">In the objects list: fold or unfold every group</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Drag sidebar divider</kbd></td><td style="padding:3px 0;color:var(--muted)">Resize the schema/objects sidebar</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Double-click sidebar divider</kbd></td><td style="padding:3px 0;color:var(--muted)">Reset the sidebar width</td></tr></table></div><div class="scsec"><div class="sch">WINDOWS AND DIAGRAMS</div><table style="border-collapse:collapse;font-size:13px;width:100%"><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Esc</kbd></td><td style="padding:3px 0;color:var(--muted)">Close the dialog in front</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Double-click / Shift + double-click</kbd></td><td style="padding:3px 0;color:var(--muted)">In the ER diagram: zoom in / out</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Drag</kbd></td><td style="padding:3px 0;color:var(--muted)">In the ER diagram: pan it, or move one table</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Right-click a table</kbd></td><td style="padding:3px 0;color:var(--muted)">In the ER diagram: show only it and its relations</td></tr></table></div></div>
+ <div class="sccols"><div class="scsec"><div class="sch">EDITOR</div><table style="border-collapse:collapse;font-size:13px;width:100%"><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>F5</kbd></td><td style="padding:3px 0;color:var(--muted)">Run the whole query</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">Run the selected text (or all, if nothing is selected)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + Space</kbd></td><td style="padding:3px 0;color:var(--muted)">Autocomplete</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Tab</kbd></td><td style="padding:3px 0;color:var(--muted)">Indent (in the editor)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + D</kbd></td><td style="padding:3px 0;color:var(--muted)">Duplicate the current line (or every line touched by the selection) below</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + /</kbd></td><td style="padding:3px 0;color:var(--muted)">Toggle "-- " comment on the current line or selection</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Alt + &uarr; / &darr;</kbd></td><td style="padding:3px 0;color:var(--muted)">Move the current line (or selection) up or down</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + Shift + K</kbd></td><td style="padding:3px 0;color:var(--muted)">Delete the current line (or every line touched by the selection)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + L</kbd></td><td style="padding:3px 0;color:var(--muted)">Focus the editor and select all</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + F</kbd></td><td style="padding:3px 0;color:var(--muted)">Find in the editor</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + H</kbd></td><td style="padding:3px 0;color:var(--muted)">Find and replace in the editor</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>F3 / Shift + F3</kbd></td><td style="padding:3px 0;color:var(--muted)">Next / previous match</td></tr></table></div><div class="scsec"><div class="sch">RESULTS</div><table style="border-collapse:collapse;font-size:13px;width:100%"><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + Click</kbd></td><td style="padding:3px 0;color:var(--muted)">On a cell: pick it, or drop it. On a row's checkbox: the same for the row</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Shift + Click</kbd></td><td style="padding:3px 0;color:var(--muted)">On a cell: the block back to the last one picked. On a checkbox: the run of rows</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + A</kbd></td><td style="padding:3px 0;color:var(--muted)">In the results: pick every row shown, or clear the selection</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + C</kbd></td><td style="padding:3px 0;color:var(--muted)">Copy what is picked - the cells, or the rows if no cell is</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Esc</kbd></td><td style="padding:3px 0;color:var(--muted)">In the results: let the picked cells go</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + F</kbd></td><td style="padding:3px 0;color:var(--muted)">Search the results (from the grid)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Enter / Shift + Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">In the search box: the next / previous matching cell</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Esc</kbd></td><td style="padding:3px 0;color:var(--muted)">In the search box: clear it</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>&larr; &uarr; &darr; &rarr;</kbd></td><td style="padding:3px 0;color:var(--muted)">Move from cell to cell in an editable grid</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Tab / Shift + Tab</kbd></td><td style="padding:3px 0;color:var(--muted)">The next / previous cell, wrapping at the row ends</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Enter or F2</kbd></td><td style="padding:3px 0;color:var(--muted)">Edit the cell the keyboard is on</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">In a cell holding several lines: keep the edit</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Esc</kbd></td><td style="padding:3px 0;color:var(--muted)">While editing a cell: discard it. Otherwise: leave the cell</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + S</kbd></td><td style="padding:3px 0;color:var(--muted)">Apply pending grid edits (save changes)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Double-click a cell</kbd></td><td style="padding:3px 0;color:var(--muted)">Open the value in the cell editor (a read-only result: the viewer)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Drag column edge</kbd></td><td style="padding:3px 0;color:var(--muted)">Resize a results column</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Double-click column edge</kbd></td><td style="padding:3px 0;color:var(--muted)">Auto-fit a results column</td></tr></table></div><div class="scsec"><div class="sch">TABS</div><table style="border-collapse:collapse;font-size:13px;width:100%"><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + T</kbd></td><td style="padding:3px 0;color:var(--muted)">New query tab</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Ctrl + W</kbd></td><td style="padding:3px 0;color:var(--muted)">Close current tab</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Middle-click a tab</kbd></td><td style="padding:3px 0;color:var(--muted)">Close it</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Drag a tab</kbd></td><td style="padding:3px 0;color:var(--muted)">Reorder the tabs</td></tr></table></div><div class="scsec"><div class="sch">CONNECTION AND SIDEBAR</div><table style="border-collapse:collapse;font-size:13px;width:100%"><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">Connect (when focused in Host / Port / User / Pass)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Alt + &darr;, F4, Space</kbd></td><td style="padding:3px 0;color:var(--muted)">Open the connections list (when it has the focus)</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Type a name</kbd></td><td style="padding:3px 0;color:var(--muted)">In the open connections list: narrow it. Backspace undoes, Esc clears</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>&darr;</kbd></td><td style="padding:3px 0;color:var(--muted)">From a filter box: step into the list below it</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Shift + click a group</kbd></td><td style="padding:3px 0;color:var(--muted)">In the objects list: fold or unfold every group</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Drag sidebar divider</kbd></td><td style="padding:3px 0;color:var(--muted)">Resize the schema/objects sidebar</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Double-click sidebar divider</kbd></td><td style="padding:3px 0;color:var(--muted)">Reset the sidebar width</td></tr></table></div><div class="scsec"><div class="sch">WINDOWS AND DIAGRAMS</div><table style="border-collapse:collapse;font-size:13px;width:100%"><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Esc</kbd></td><td style="padding:3px 0;color:var(--muted)">Close the dialog in front</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Double-click / Shift + double-click</kbd></td><td style="padding:3px 0;color:var(--muted)">In the ER diagram: zoom in / out</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Drag</kbd></td><td style="padding:3px 0;color:var(--muted)">In the ER diagram: pan it, or move one table</td></tr><tr><td style="padding:3px 12px 3px 0;white-space:nowrap;vertical-align:top"><kbd>Right-click a table</kbd></td><td style="padding:3px 0;color:var(--muted)">In the ER diagram: show only it and its relations</td></tr></table></div></div>
  <div class="row" style="justify-content:flex-end;margin-top:14px"><button onclick="hide('mShortcuts')">Close</button></div></div></div>
 <div class="modal floating" id="mInput"><div class="box" style="width:460px;max-width:92vw;display:flex;flex-direction:column;overflow:hidden;top:90px;left:200px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mInput')" title="Drag to move"><h3 id="inpTitle" style="margin:0">Input</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mInput')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
  <div id="inpFields" style="flex:1 1 auto;min-height:0;overflow:auto"></div>
@@ -4614,7 +5011,28 @@ function accSet(n,c){window._connMeta=window._connMeta||{};const cur=window._con
 function hexA(hex,a){hex=(hex||'').replace('#','');if(hex.length===3)hex=hex.split('').map(c=>c+c).join('');const v=parseInt(hex,16);if(isNaN(v)||hex.length!==6)return '';return 'rgba('+((v>>16)&255)+','+((v>>8)&255)+','+(v&255)+','+a+')';}
 function applyAccent(color){const bar=$('bar');if(!bar)return;if(!color){bar.style.borderTop='';bar.style.borderBottom='';bar.style.boxShadow='';return;}bar.style.borderTop='2px solid '+color;bar.style.borderBottom='';bar.style.boxShadow='';}
 window.curAccent='';
-function getConn(){return {host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value,sslCa:$('sslca').value};}
+function getConn(){return {host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value,sslCa:$('sslca').value,
+ sshHost:$('sshhost').value,sshPort:$('sshport').value,sshUser:$('sshuser').value,sshKey:$('sshkey').value};}
+// ---- SSH tunnel ----
+// The tunnel's settings ride with the connection form in hidden fields, so everything that reads
+// the form through getConn() carries them. Signing in to SSH is the OpenSSH client's own: an agent,
+// the key given here, or ~/.ssh/config. It never asks for a password.
+function sshOf(c){c=c||{};return {sshHost:String(c.sshHost||'').trim(),sshPort:String(c.sshPort||'').trim(),sshUser:String(c.sshUser||'').trim(),sshKey:String(c.sshKey||'').trim()};}
+function sshSet(c){const v=sshOf(c);$('sshhost').value=v.sshHost;$('sshport').value=v.sshPort;$('sshuser').value=v.sshUser;$('sshkey').value=v.sshKey;sshPaint();}
+function sshPaint(){const b=$('sshBtn');if(!b)return;const h=$('sshhost').value.trim();b.textContent=h?'SSH: '+h:'SSH';b.classList.toggle('on',!!h);
+ b.title=h?'SSH tunnel: '+h+' (click to change)':'Configure SSH tunnel';}
+// grouped: behind a "Use SSH tunnel" checkbox, for the Save and Edit dialogs, where four
+// fields most connections never use would otherwise sit in the middle of the form.
+function sshFields(c,grouped){c=sshOf(c);const f=[
+ {key:'sshHost',label:'SSH host (or a host alias from ~/.ssh/config)',value:c.sshHost,placeholder:'bastion.example.com'},
+ {key:'sshPort',label:'SSH port',value:c.sshPort,placeholder:'22'},
+ {key:'sshUser',label:'SSH user',value:c.sshUser},
+ {key:'sshKey',label:'Private key file (optional - defaults to the SSH agent and ~/.ssh; key-based authentication only)',type:'file',browseTitle:'Select private key file',placeholder:'e.g. C:\\Users\\me\\.ssh\\id_ed25519',value:c.sshKey}];
+ if(!grouped)return f;
+ return [{key:'useSsh',label:'Use SSH tunnel',type:'checkbox',value:!!c.sshHost,reveals:'ssh'},...f.map(x=>({...x,group:'ssh'}))];}
+// What a dialog says about SSH: nothing at all when its box is not ticked.
+function sshRes(res){return res.useSsh===false?{}:res;}
+async function editSsh(){const res=await inputBox({title:'SSH Tunnel',okText:'OK',fields:sshFields(getConn())});if(!res)return;sshSet(res);}
 // The CA only does anything for "verify" - the other modes check nothing - so it only appears for
 // that one, rather than sitting there inviting someone to fill in a box that will be ignored.
 function sslCaToggle(){const w=$('sslcaWrap');if(w)w.style.display=(/^verify(-ca)?$/.test($('ssl').value))?'inline-flex':'none';}
@@ -4660,7 +5078,9 @@ function hideDead(){const d=$('deadOverlay');if(d)d.style.display='none';}
 // lists such as a schema's tables or its column names for autocomplete stopped at 1000 in both.
 // Only the grid passes pageSize; for everyone else the remaining rows are read here.
 async function api(path,p,signal){
+ if(p&&p.session)txWatch(path,p);
  const r=await apiCall(path,p,signal);
+ if(p&&p.session&&r&&r.ok===false&&TX_LOST.test(r.error||''))txLost(p.session);
  if(path!=='/api/query'||!p||p.pageSize!=null||!r||!r.ok||!r.hasMore||!r.cursorId)return r;
  // The desktop backend does not repeat cursorId in a fetch answer; the id stays the same.
  const rows=r.rows,cid=r.cursorId;let cur=r;
@@ -5217,7 +5637,7 @@ async function downloadMysqlTools(){
  }catch(e){$('cfgLog').textContent='Failed: '+e;}}
 let _inpResolve=null;
 function inputBox(opts){return new Promise(res=>{_inpResolve=res;$('inpTitle').textContent=opts.title||'Input';const box=$('inpFields');box.innerHTML='';
- (opts.fields||[]).forEach(f=>{const w=document.createElement('div');w.style.margin='6px 0';if(f.type==='checkbox'){w.style.display='flex';w.style.alignItems='center';w.style.gap='8px';const cbx=document.createElement('input');cbx.id='inp_'+f.key;cbx.type='checkbox';cbx.checked=!!f.value;const clb=document.createElement('label');clb.textContent=f.label||f.key;clb.style.fontSize='13px';clb.htmlFor=cbx.id;clb.style.cursor='pointer';cbx.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();inpCancel();}};w.appendChild(cbx);w.appendChild(clb);box.appendChild(w);return;}const lb=document.createElement('label');lb.textContent=f.label||f.key;lb.style.display='block';lb.style.fontSize='12px';lb.style.marginBottom='2px';lb.style.color='var(--muted)';
+ (opts.fields||[]).forEach(f=>{const w=document.createElement('div');w.style.margin='6px 0';if(f.group)w.dataset.group=f.group;if(f.type==='checkbox'){w.style.display='flex';w.style.alignItems='center';w.style.gap='8px';const cbx=document.createElement('input');cbx.id='inp_'+f.key;cbx.type='checkbox';cbx.checked=!!f.value;if(f.reveals){cbx.dataset.reveals=f.reveals;cbx.onchange=()=>box.querySelectorAll('[data-group="'+f.reveals+'"]').forEach(x=>{x.style.display=cbx.checked?'':'none';});}const clb=document.createElement('label');clb.textContent=f.label||f.key;clb.style.fontSize='13px';clb.htmlFor=cbx.id;clb.style.cursor='pointer';cbx.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();inpCancel();}};w.appendChild(cbx);w.appendChild(clb);box.appendChild(w);return;}const lb=document.createElement('label');lb.textContent=f.label||f.key;lb.style.display='block';lb.style.fontSize='12px';lb.style.marginBottom='2px';lb.style.color='var(--muted)';
   if(f.type==='select'){const sel=document.createElement('select');sel.id='inp_'+f.key;sel.style.width='100%';(f.options||[]).forEach(o=>{const opt=document.createElement('option');if(o&&typeof o==='object'){opt.value=o.value;opt.textContent=o.label;}else{opt.value=o;opt.textContent=o;}sel.appendChild(opt);});if(f.value!=null)sel.value=f.value;sel.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();inpCancel();}};w.appendChild(lb);w.appendChild(sel);box.appendChild(w);return;}
   // Masked by default with a small reveal toggle, rather than plain text - screen shares and
   // bug-report recordings are exactly the situations where a visible saved password becomes a
@@ -5253,6 +5673,7 @@ function inputBox(opts){return new Promise(res=>{_inpResolve=res;$('inpTitle').t
    w.style.cssText+=';display:flex;flex-direction:column;flex:1;min-height:0';lb.style.flex='none';inp.style.flex='1';inp.style.minHeight='0';
   }if(f.value!=null)inp.value=f.value;if(f.placeholder)inp.placeholder=f.placeholder;if(f.maxlength)inp.maxLength=f.maxlength;
   inp.onkeydown=e=>{if(e.key==='Enter'&&!isTa){e.preventDefault();inpOk();}else if(e.key==='Escape'){e.preventDefault();inpCancel();}};w.appendChild(lb);w.appendChild(inp);box.appendChild(w);});
+ box.querySelectorAll('input[data-reveals]').forEach(c=>c.onchange());
  // A textarea field (e.g. editing a saved query's SQL) already resizes both ways like any browser
  // textarea, but the dialog's normal 460px width cramps that - widen it so there's real room to
  // drag into, matching the cell-edit modal's more generous default size.
@@ -5286,7 +5707,80 @@ const KW=RESERVED;
 function hl(code){let re=/(\/\*[\s\S]*?\*\/|--[^\n]*)|('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`]|``)*`)|(\b\d+(?:\.\d+)?\b)|([A-Za-z_][A-Za-z0-9_]*)|([\s\S])/g;let out='',m;
  while((m=re.exec(code))){if(m[1])out+='<span class="c-com">'+esc(m[1])+'</span>';else if(m[2])out+='<span class="c-str">'+esc(m[2])+'</span>';else if(m[3])out+='<span class="c-num">'+esc(m[3])+'</span>';else if(m[4])out+=(KW.has(m[4].toLowerCase())?'<span class="c-kw">'+esc(m[4])+'</span>':esc(m[4]));else out+=esc(m[5]);}
  return out;}
-function syncHl(id){const ta=$('ed_'+id),pre=$('hl_'+id);if(!ta||!pre)return;pre.innerHTML=hl(ta.value)+'\n';pre.scrollTop=ta.scrollTop;pre.scrollLeft=ta.scrollLeft;}
+function syncHl(id){const ta=$('ed_'+id),pre=$('hl_'+id);if(!ta||!pre)return;pre.innerHTML=hl(ta.value)+'\n';pre.scrollTop=ta.scrollTop;pre.scrollLeft=ta.scrollLeft;
+ const fm=$('fm_'+id);if(fm&&fm.style.display!=='none'){if(fm._v!==ta.value)findPaint(id);fm.scrollTop=ta.scrollTop;fm.scrollLeft=ta.scrollLeft;}}
+// ---- find and replace in the editor ----
+// The matches are drawn in a layer of their own under the highlighted text, so the editor keeps its
+// caret and its undo while the find box has the keyboard. Replacing goes through insertText for the
+// same reason: Ctrl+Z takes a replacement back like anything typed.
+const FIND_MAX=5000;let _findCur={};
+function findRe(id){const q=$('frq_'+id)?$('frq_'+id).value:'';if(!q)return false;
+ const src=$('frx_'+id).checked?q:q.replace(/[.*+?^$|(){}[\]\\]/g,'\\$&');
+ try{return new RegExp(src,'gm'+($('frc_'+id).checked?'':'i'));}catch(e){return null;}}
+// Where the pattern is found, as [start, end] pairs. null for a pattern that is not a regex.
+function findMatches(id){const re=findRe(id);if(re===null)return null;if(!re)return [];const v=$('ed_'+id).value,out=[];let m;
+ while(out.length<FIND_MAX&&(m=re.exec(v))){if(m[0]==='')re.lastIndex++;else out.push([m.index,m.index+m[0].length]);}
+ return out;}
+function findPaint(id){const ta=$('ed_'+id),fm=$('fm_'+id);if(!ta||!fm)return;const v=ta.value;fm._v=v;
+ const ms=findMatches(id),cur=_findCur[id];let out='',at=0;
+ (ms||[]).forEach((m,i)=>{out+=esc(v.slice(at,m[0]))+'<mark'+(i===cur?' class="on"':'')+'>'+esc(v.slice(m[0],m[1]))+'</mark>';at=m[1];});
+ fm.innerHTML=out+esc(v.slice(at))+'\n';fm.scrollTop=ta.scrollTop;fm.scrollLeft=ta.scrollLeft;
+ const n=$('frn_'+id);if(n){const q=$('frq_'+id).value;
+  n.textContent=!q?'':ms===null?'not a regex':!ms.length?'no results':((cur!=null?cur+1:'?')+' of '+ms.length+(ms.length>=FIND_MAX?'+':''));}}
+function findOpen(id,withReplace){const ew=$('ew_'+id),ta=$('ed_'+id);if(!ew||!ta)return;let bar=$('fr_'+id);
+ if(!bar){const fm=document.createElement('pre');fm.className='hl fm';fm.id='fm_'+id;ew.insertBefore(fm,ew.firstChild);
+  bar=document.createElement('div');bar.className='findbar';bar.id='fr_'+id;const a="'"+id+"'";
+  bar.innerHTML='<div class="frow"><input id="frq_'+id+'" placeholder="Find" spellcheck="false" autocomplete="off"><label title="Match case"><input type="checkbox" id="frc_'+id+'">Aa</label><label title="Regular expression"><input type="checkbox" id="frx_'+id+'">.*</label><span class="muted frn" id="frn_'+id+'"></span>'+
+   '<button class="sm" title="Previous match (Shift+Enter, Shift+F3)" onclick="findStep('+a+',-1)">&uarr;</button><button class="sm" title="Next match (Enter, F3)" onclick="findStep('+a+',1)">&darr;</button><button class="sm" title="Close (Esc)" onclick="findClose('+a+')">&times;</button></div>'+
+   '<div class="frow" id="frr_'+id+'"><input id="frw_'+id+'" placeholder="Replace" spellcheck="false" autocomplete="off"><button class="sm" title="Replace this match (Enter)" onclick="findReplace('+a+')">Replace</button><button class="sm" title="Replace every match (Ctrl+Enter)" onclick="findReplaceAll('+a+')">All</button></div>';
+  ew.appendChild(bar);
+  const q=$('frq_'+id),w=$('frw_'+id);
+  const common=e=>{const mod=e.ctrlKey||e.metaKey,k=e.key.toLowerCase();
+   if(e.key==='Escape'){e.preventDefault();findClose(id);}
+   else if(e.key==='F3'){e.preventDefault();findStep(id,e.shiftKey?-1:1);}
+   else if(mod&&!e.altKey&&(k==='f'||k==='h')){e.preventDefault();findOpen(id,k==='h');}};
+  q.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();findStep(id,e.shiftKey?-1:1);}else common(e);});
+  w.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();if(e.ctrlKey||e.metaKey)findReplaceAll(id);else findReplace(id);}else common(e);});
+  q.addEventListener('input',()=>{_findCur[id]=null;findStep(id,0);});
+  $('frc_'+id).onchange=$('frx_'+id).onchange=()=>{_findCur[id]=null;findStep(id,0);};}
+ $('fm_'+id).style.display='';bar.style.display='';$('frr_'+id).style.display=withReplace?'':'none';
+ const q=$('frq_'+id),sel=ta.value.slice(ta.selectionStart,ta.selectionEnd);
+ if(sel&&!/[\r\n]/.test(sel)){q.value=sel;_findCur[id]=null;}
+ findStep(id,0);const f=(withReplace&&q.value)?$('frw_'+id):q;f.focus();f.select();}
+function findClose(id){const bar=$('fr_'+id),fm=$('fm_'+id),ta=$('ed_'+id);if(bar)bar.style.display='none';if(fm){fm.style.display='none';fm.innerHTML='';fm._v=null;}
+ _findCur[id]=null;if(ta)ta.focus();}
+// dir 1 / -1 moves to the next / previous match; 0 takes the first match from where the selection
+// starts, so the pattern can be typed and the editor follows it.
+function findStep(id,dir){const ta=$('ed_'+id),ms=findMatches(id);if(!ta)return;
+ if(!ms||!ms.length){_findCur[id]=null;findPaint(id);return;}
+ const s=ta.selectionStart,e=ta.selectionEnd,cur=_findCur[id];let i;
+ if(cur!=null&&ms[cur]&&ms[cur][0]===s&&ms[cur][1]===e&&dir)i=(cur+dir+ms.length)%ms.length;
+ else if(dir<0){i=-1;for(let k=ms.length-1;k>=0;k--)if(ms[k][0]<s){i=k;break;}if(i<0)i=ms.length-1;}
+ else{i=ms.findIndex(m=>dir?m[0]>s||(m[0]===s&&e===s):m[0]>=s);if(i<0)i=0;}
+ _findCur[id]=i;ta.setSelectionRange(ms[i][0],ms[i][1]);findScrollTo(ta,ms[i][0]);syncHl(id);findPaint(id);}
+function findScrollTo(ta,pos){const cs=getComputedStyle(ta),lh=parseFloat(cs.lineHeight)||18,v=ta.value.slice(0,pos);
+ const line=v.split('\n').length-1,col=pos-v.lastIndexOf('\n')-1,y=(parseFloat(cs.paddingTop)||0)+line*lh;
+ if(y<ta.scrollTop||y+lh>ta.scrollTop+ta.clientHeight)ta.scrollTop=Math.max(0,y-ta.clientHeight/2);
+ const c=findScrollTo.c||(findScrollTo.c=document.createElement('canvas').getContext('2d'));c.font=cs.fontSize+' '+cs.fontFamily;
+ const x=(parseFloat(cs.paddingLeft)||0)+col*(c.measureText('M').width||8);
+ if(x<ta.scrollLeft||x>ta.scrollLeft+ta.clientWidth-40)ta.scrollLeft=Math.max(0,x-ta.clientWidth/2);}
+// Puts text in place of [s, e) the way typing would, so it can be undone.
+function edReplaceRange(id,s,e,text){const ta=$('ed_'+id),before=ta.value;ta.focus();ta.setSelectionRange(s,e);let ok=false;
+ try{ok=text===''?document.execCommand('delete'):document.execCommand('insertText',false,text);}catch(_){}
+ if(!ok||ta.value===before&&e>s)ta.setRangeText(text,s,e,'end');
+ acHide();syncHl(id);markEdited(id);}
+function findReplace(id){const ta=$('ed_'+id),re=findRe(id),ms=findMatches(id);if(!re||!ms||!ms.length)return;
+ const s=ta.selectionStart,e=ta.selectionEnd;if(!ms.some(m=>m[0]===s&&m[1]===e)){findStep(id,1);return;}
+ const w=$('frw_'+id).value,v=ta.value;
+ // A regex replacement may use $1 and the rest; it is worked out where the match is, so ^ and
+ // lookbehinds see what is around it.
+ let text=w;if($('frx_'+id).checked){const y=new RegExp(re.source,re.flags.replace('g','')+'y');y.lastIndex=s;const r=v.replace(y,w);text=r.slice(s,r.length-(v.length-e));}
+ edReplaceRange(id,s,e,text);_findCur[id]=null;$('frw_'+id).focus();findStep(id,0);}
+function findReplaceAll(id){const ta=$('ed_'+id),re=findRe(id);if(!re)return;const w=$('frw_'+id).value,v=ta.value;
+ const n=(v.match(re)||[]).length;if(!n){toast('Nothing to replace.',true);return;}
+ re.lastIndex=0;const nv=v.replace(re,$('frx_'+id).checked?w:()=>w);
+ edReplaceRange(id,0,v.length,nv);_findCur[id]=null;$('frw_'+id).focus();findPaint(id);
+ toast('Replaced '+n+' match'+(n===1?'':'es')+'.');}
 
 // connection profiles
 // The box's tooltip: what the picked connection is, one labelled line each - the tags inside
@@ -5407,7 +5901,10 @@ function barWraps(row){let lo=Infinity,hi=-Infinity;
 // what is in it only ever tightens. Running a query hides the result and edit buttons until the
 // answer comes, and a bar that loosened on that showed its labels for the length of the run, then
 // went back to icons - the labels flashed on every click.
-function fitBar(row,loosen){if(!row||!row.offsetParent)return;const was=row.className;if(loosen){row.classList.remove('fitb','tight','fit1','fit2','fit3');row.querySelectorAll('.icoonly').forEach(b=>b.classList.remove('icoonly'));}
+function fitBar(row,loosen){if(!row||!row.offsetParent)return;
+ // Nothing is drawn between here and the end, so the reserved parts are shown only to be measured.
+ row.classList.add('fitmax');try{fitBarCore(row,loosen);}finally{row.classList.remove('fitmax');}}
+function fitBarCore(row,loosen){const was=row.className;if(loosen){row.classList.remove('fitb','tight','fit1','fit2','fit3');row.querySelectorAll('.icoonly').forEach(b=>b.classList.remove('icoonly'));}
  // The rungs, in the order a bar gives things up: the brand, then the labels of the buttons that
  // need them least, then the everyday ones, then the rest along with tighter spacing.
  if(barWraps(row)){
@@ -5443,19 +5940,18 @@ function fitBar(row,loosen){if(!row||!row.offsetParent)return;const was=row.clas
 // off again, and _fitting stops the observer answering the icons this puts in.
 const _barRO=typeof ResizeObserver!=='undefined'?new ResizeObserver(es=>es.forEach(e=>refit(e.target,true))):null;
 const _barMO=typeof MutationObserver!=='undefined'?new MutationObserver(ms=>ms.forEach(m=>{const n=m.target.nodeType===1?m.target:m.target.parentElement;const row=n&&n.closest('.fitbar');if(row)refit(row);})):null;
-// A bar only tightens while its content changes, so a change that removed something for good
-// (a result closed, an edit applied) would leave it in icons until the window was resized. Once it
-// has been quiet for a second, it tries the labels again - by then nothing is mid-flight, so this
-// cannot put the labels back for the length of a query.
-function refitSoon(row){clearTimeout(row._settle);row._settle=setTimeout(()=>{row._settle=0;refit(row,true);},1000);}
-function refit(row,loosen){if(!row||row._fitting)return;if(!loosen)refitSoon(row);row._fitting=true;try{decorateIcons(row);const p=row.querySelector('[id^="pager_"]');if(p&&p.title!==p.textContent)p.title=p.textContent;fitBar(row,loosen);}finally{row._fitting=false;}}
+// Every fit starts again from the labels. A bar used to only tighten while its content changed and
+// loosen a second later, so a count or a label growing by a character shrank the buttons and then
+// put them back. The bar is now fitted to the fullest it can be (fitBar), which does not change as
+// you work, so starting from the labels gives the same answer until the width itself changes.
+function refit(row){if(!row||row._fitting)return;const loosen=true;row._fitting=true;try{decorateIcons(row);const p=row.querySelector('[id^="pager_"]');if(p&&p.title!==p.textContent)p.title=p.textContent;fitBar(row,loosen);}finally{row._fitting=false;}}
 function watchBar(row){if(!row||row.classList.contains('fitbar'))return;row.classList.add('fitbar');decorateIcons(row);
  if(_barRO)_barRO.observe(row);if(_barMO)_barMO.observe(row,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:['style']});refit(row,true);}
 // Connecting and disconnecting show and hide the top bar's action buttons through the body's class.
 function watchTopBar(){watchBar($('barTop'));wireConnList();if(_barRO)new ResizeObserver(syncConnTags).observe($('connTags'));if(_barMO)new MutationObserver(()=>refit($('barTop'),true)).observe(document.body,{attributes:true,attributeFilter:['class']});}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',watchTopBar);else watchTopBar();
 function connMenu(e){e.stopPropagation();if(!$('connlist').value){toast('Select a saved connection first.',true);return;}const b=e.currentTarget.getBoundingClientRect();const isP=($('connlist').value===window._primaryConn);const items=[['Edit\u2026',()=>editConn()],['Clone\u2026',()=>cloneConn()],[(isP?'Unset primary':'Set as primary'),()=>setPrimary()],['Clear password',()=>forgetPassword()]];if(!document.body.classList.contains('disconnected')){items.push('-');items.push(['Connect\u2026',()=>toggleConnForm()]);}items.push('-');items.push(['Delete\u2026',()=>delConn()]);menu(b.left,b.bottom+2,items);}
-async function forgetPassword(){const n=$('connlist').value;if(!n){toast('Select a connection first.',true);return;}if(!(await ask('Remove the saved password for "'+n+'"? You will type it on next connect.')))return;const g=await api('/api/conn-get',{name:n});if(!g.ok){toast('Could not load connection.',true);return;}const r=await api('/api/conn-save',{name:n,conn:{host:g.conn.host,port:g.conn.port,user:g.conn.user,ssl:g.conn.ssl,sslCa:g.conn.sslCa,password:''},savepw:false});if(r.ok){log('Removed saved password for '+n+'.');if(window._connPw)window._connPw[n]=false;if($('connlist').value===n)setPass('');}else toast(r.error||'Failed',true);}
+async function forgetPassword(){const n=$('connlist').value;if(!n){toast('Select a connection first.',true);return;}if(!(await ask('Remove the saved password for "'+n+'"? You will type it on next connect.')))return;const g=await api('/api/conn-get',{name:n});if(!g.ok){toast('Could not load connection.',true);return;}const r=await api('/api/conn-save',{name:n,conn:{host:g.conn.host,port:g.conn.port,user:g.conn.user,ssl:g.conn.ssl,sslCa:g.conn.sslCa,password:'',...sshOf(g.conn)},savepw:false});if(r.ok){log('Removed saved password for '+n+'.');if(window._connPw)window._connPw[n]=false;if($('connlist').value===n)setPass('');}else toast(r.error||'Failed',true);}
 async function setPrimary(){const n=$('connlist').value;if(!n){toast('Select a connection first.',true);return;}const target=(n===window._primaryConn)?'':n;const r=await api('/api/conn-primary',{name:target});if(!r.ok){toast(r.error||'Failed',true);return;}await refreshConns();$('connlist').value=n;updatePrimeBtn();log(target?('Primary connection set: '+n+' (opens on startup)'):'Primary connection cleared.');}
 async function refreshConns(){const r=await api('/api/conn-list');const sel=$('connlist');sel.innerHTML='<option value="" disabled hidden>Connections</option>';const n=(r.ok&&r.items)?r.items.length:0;window._primaryConn='';window._connMeta={};window._connPw={};if(r.ok)r.items.forEach(c=>{if(c.primary)window._primaryConn=c.name;window._connPw[c.name]=!!c.hasPassword;window._connMeta[c.name]={accent:c.accent||'',env:c.env||'',readonly:!!c.readonly};const o=document.createElement('option');o.value=c.name;
   // Just the name: the environment and READ-ONLY are the tag beside it, in the box and in its
@@ -5466,7 +5962,7 @@ async function refreshConns(){const r=await api('/api/conn-list');const sel=$('c
 // hides it by default at that point - see the CSS comment above body:not(.disconnected) for
 // the reasoning. Purely a visibility toggle; doesn't touch any saved connection data.
 function toggleConnForm(){document.body.classList.toggle('show-connform');}
-function newConn(){$('connlist').value='';$('host').value='127.0.0.1';$('port').value='3306';$('user').value='';$('pass').value='';$('ssl').value='default';$('sslca').value='';sslCaToggle();window.curAccent='';applyAccent('');window.readOnly=false;window.curEnv='';const ec=$('envChip');if(ec)ec.style.display='none';const pwc=$('pwChip');if(pwc)pwc.style.display='none';document.body.classList.add('show-connform');document.body.classList.remove('ro');connTitle();$('user').focus();log('New connection - enter details and Save.');}
+function newConn(){$('connlist').value='';$('host').value='127.0.0.1';$('port').value='3306';$('user').value='';$('pass').value='';$('ssl').value='default';$('sslca').value='';sslCaToggle();sshSet({});window.curAccent='';applyAccent('');window.readOnly=false;window.curEnv='';const ec=$('envChip');if(ec)ec.style.display='none';const pwc=$('pwChip');if(pwc)pwc.style.display='none';document.body.classList.add('show-connform');document.body.classList.remove('ro');connTitle();$('user').focus();log('New connection - enter details and Save.');}
 function setPass(pw){const el=$('pass');if(el)el.value=pw;}
 async function pickConnGuarded(){
   if (anyPending() && !(await ask('You have unsaved grid edits open. Switching connections will leave them orphaned. Switch anyway?'))) return;
@@ -5490,6 +5986,7 @@ async function pickConn() {
         $('ssl').value = r.conn.ssl;
         $('sslca').value = r.conn.sslCa || '';
         sslCaToggle();
+        sshSet(r.conn);
         const _pw = r.conn.password || '';
         setPass(_pw);
         window._connMeta = window._connMeta || {};
@@ -5537,16 +6034,17 @@ async function saveConn(){
   {key:'password',label:'Password',type:'password',value:$('pass').value},
   {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify (CA and host name)'},{value:'verify-ca',label:'verify-ca (CA only - for auto-generated server certificates)'}],value:$('ssl').value},
   {key:'sslCa',label:'CA certificate - only used by SSL "verify"; leave empty to use the system trust store',type:'file',filter:'*.pem',browseTitle:'Select CA certificate',placeholder:'e.g. C:\\certs\\server-ca.pem',value:$('sslca').value},
+  ...sshFields(getConn(),true),
   {key:'color',label:'Accent color (tell servers apart at a glance)',type:'color',value:n0?(accMap()[n0]||'#3b82f6'):'#3b82f6'},
   {key:'env',label:'Environment label (e.g. Production, Dev) - optional',value:m0.env||'',maxlength:40},
   {key:'ro',label:'Read-only / safe mode (block all writes)',type:'checkbox',value:!!m0.readonly},
   {key:'savepw',label:'Save password (unchecked = type it each time)',type:'checkbox',value:n0?!!$('pass').value:true}
  ]});
  if(!res||!res.name.trim())return;const n=res.name.trim();
- const r=await api('/api/conn-save',{name:n,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});
+ const r=await api('/api/conn-save',{name:n,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});
  if(!r.ok){toast(r.error,true);return;}
  window.curAccent=res.color;applyAccent(res.color);log('Saved connection: '+n);await refreshConns();$('connlist').value=n;applyEnv(n);
- $('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';sslCaToggle();setPass(res.password);
+ $('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';sslCaToggle();sshSet(sshRes(res));setPass(res.password);
  const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';
 }
 // Edits a saved connection entirely within its own dialog - host/port/user/password/ssl are
@@ -5565,22 +6063,23 @@ async function editConn(){const n0=$('connlist').value;if(!n0){toast('Select a s
   {key:'password',label:'Password',type:'password',value:g.conn.password||''},
   {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify (CA and host name)'},{value:'verify-ca',label:'verify-ca (CA only - for auto-generated server certificates)'}],value:g.conn.ssl},
   {key:'sslCa',label:'CA certificate - only used by SSL "verify"; leave empty to use the system trust store',type:'file',filter:'*.pem',browseTitle:'Select CA certificate',placeholder:'e.g. C:\\certs\\server-ca.pem',value:g.conn.sslCa||''},
+  ...sshFields(g.conn,true),
   {key:'color',label:'Accent color',type:'color',value:accMap()[n0]||'#3b82f6'},
   {key:'env',label:'Environment label (optional)',value:m0.env||'',maxlength:40},
   {key:'ro',label:'Read-only / safe mode (block all writes)',type:'checkbox',value:!!m0.readonly},
   {key:'savepw',label:'Save password (uncheck to remove the saved password)',type:'checkbox',value:!!(g.ok&&g.conn.password)}
  ]});
  if(!res||!res.name.trim())return;const nn=res.name.trim();
- const r=await api('/api/conn-save',{name:nn,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});if(!r.ok){toast(r.error,true);return;}
+ const r=await api('/api/conn-save',{name:nn,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});if(!r.ok){toast(r.error,true);return;}
  if(nn!==n0){await api('/api/conn-delete',{name:n0});}
  window.curAccent=res.color;applyAccent(res.color);await refreshConns();$('connlist').value=nn;applyEnv(nn);
  // If this connection is the one currently loaded into the (largely internal, now rarely
  // shown) inline form, keep it in sync with what was just saved - otherwise a subsequent
  // Connect click would silently use stale values from before the edit.
- if($('connlist').value===nn){$('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';sslCaToggle();setPass(res.password);const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';}
+ if($('connlist').value===nn){$('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';sslCaToggle();sshSet(sshRes(res));setPass(res.password);const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';}
  log('Updated connection: '+nn);}
 async function cloneConn(){const n0=$('connlist').value;
- if(n0){const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('sslca').value=g.conn.sslCa||'';sslCaToggle();$('pass').value=g.conn.password;}}
+ if(n0){const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('sslca').value=g.conn.sslCa||'';sslCaToggle();sshSet(g.conn);$('pass').value=g.conn.password;}}
  const base=n0||($('user').value+'@'+$('host').value);
  const res=await inputBox({title:'Clone connection',okText:'Clone',fields:[{key:'name',label:'New connection name',value:base+' (copy)',maxlength:60}]});
  if(!res||!res.name.trim())return;const nn=res.name.trim();
@@ -5651,12 +6150,12 @@ function clearObjectsPanel(){$('objects').innerHTML='';$('objdb').textContent=''
 // The pill's x and the Disconnect button. Disconnecting keeps every tab, so it only asks when
 // something would be cut short - a query still running, or grid edits not applied yet - and stops
 // the running queries rather than leave them going on a connection nobody is looking at.
-async function disconnectAsk(){const running=tabs.filter(t=>t.runningReqId),dirty=tabs.filter(t=>pendingCount(t)>0);
- if(running.length||dirty.length){const what=[];if(running.length)what.push(running.length+(running.length>1?' queries':' query')+' still running');if(dirty.length)what.push(dirty.length+' tab(s) with grid edits not applied yet');
-  if(!(await ask('Disconnect with '+what.join(' and ')+'? The edits stay in their tabs; the running queries are stopped.')))return;
+async function disconnectAsk(){const running=tabs.filter(t=>t.runningReqId),dirty=tabs.filter(t=>pendingCount(t)>0),open=tabs.filter(t=>t.txDirty);
+ if(running.length||dirty.length||open.length){const what=[];if(running.length)what.push(running.length+(running.length>1?' queries':' query')+' still running');if(dirty.length)what.push(dirty.length+' tab(s) with grid edits not applied yet');if(open.length)what.push(open.length+' tab(s) with a transaction not committed');
+  if(!(await ask('Disconnect with '+what.join(' and ')+'? The edits stay in their tabs; the running queries are stopped'+(open.length?'; what was not committed is rolled back':'')+'.')))return;
   await Promise.all(running.map(t=>cancelQuery(t.id)));}
  disconnect();}
-function disconnect(){window.mariadb=false;document.body.classList.add('disconnected');window._activeConn=null;window._activeReadOnly=false;$('schemas').innerHTML='';clearObjectsPanel();applyAccent('');const _cs=$('connStatus');if(_cs){_cs.textContent='';_cs.className='chip off dotonly';_cs.title='Not connected';}window.curAccent='';window.readOnly=false;window.curEnv='';
+function disconnect(){tabs.forEach(t=>{if(t.txOn||t.txSession){txClose(t);t.txOn=false;txPaint(t.id);}});window.mariadb=false;document.body.classList.add('disconnected');window._activeConn=null;window._activeReadOnly=false;$('schemas').innerHTML='';clearObjectsPanel();applyAccent('');const _cs=$('connStatus');if(_cs){_cs.textContent='';_cs.className='chip off dotonly';_cs.title='Not connected';}window.curAccent='';window.readOnly=false;window.curEnv='';
  // Re-preview the still-selected connection's env chip rather than hard-hiding it, same as the
  // password icon (never touched here) already does - "Not connected" shouldn't also erase what
  // you were just looking at in the dropdown.
@@ -5892,7 +6391,20 @@ function renderObjects(){if(allDbs){renderAllDbs();return;}const box=$('objects'
   fil.forEach(n=>{const d=document.createElement('div');d.className='item';d.title=n;if(type==='table'&&objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
    d.onclick=()=>{[...box.querySelectorAll('.item')].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');objOpen(db,type,n);};
    d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,type,n);};box.appendChild(d);});});}
-async function buildColHints(db){try{const r=await api('/api/query',{sql:"SELECT DISTINCT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(db)});window.acColumns=(r.ok?r.rows.map(x=>x[0]):[]);}catch(e){window.acColumns=[];}}
+// The columns of the schema, table by table: every name for plain suggestions, and each table's own
+// for a name typed after its alias. Other schemas are read the first time a query reaches into one.
+async function buildColHints(db){acTableCols={};acPend={};const d=await acLoadSchema(db);
+ const all=new Set();Object.values(d||{}).forEach(x=>x.cols.forEach(c=>all.add(c)));window.acColumns=[...all];}
+let acTableCols={},acPend={};
+async function acLoadSchema(db){const k=String(db||'').toLowerCase(),by={};
+ try{const r=await api('/api/query',{sql:"SELECT TABLE_NAME,COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(db)+" ORDER BY TABLE_NAME,ORDINAL_POSITION"});
+  if(r&&r.ok)r.rows.forEach(x=>{const t=String(x[0]).toLowerCase();(by[t]=by[t]||{name:x[0],cols:[]}).cols.push(x[1]);});}catch(e){}
+ acTableCols[k]=by;return by;}
+// A schema's tables and columns if they are here; if not, they are fetched and retry is called when
+// they arrive.
+function acSchemaCols(db,retry){const k=String(db||'').toLowerCase();if(!k)return null;if(acTableCols[k])return acTableCols[k];
+ if(!acPend[k]){acPend[k]=acLoadSchema(db).then(()=>{delete acPend[k];if(retry)retry();});}return null;}
+function acColsFor(db,tbl,retry){const d=acSchemaCols(db,retry);if(!d)return null;const e=d[String(tbl).toLowerCase()];return e?e.cols:[];}
 // Cache keys are scoped to the active connection so a different server can't show stale schemas.
 // --- Caching: sizes/overview are cached in the browser, keyed per connection (host:port:user).
 function connKey(){try{return ($('host').value||'')+':'+($('port').value||'')+':'+($('user').value||'');}catch(e){return 'default';}}
@@ -6365,16 +6877,18 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   '<div class="toolbar"><span style="display:inline-grid"><button class="primary" id="runbtn_'+id+'" style="grid-area:1/1" title="Run the query (F5)" onclick="runTab(\''+id+'\')">Run Query</button><button class="warn" id="cancelbtn_'+id+'" style="grid-area:1/1;visibility:hidden" title="Cancel the running query" onclick="cancelQuery(\''+id+'\')">Cancel</button></span><button title="Run the selected text (Ctrl+Enter) - or, if nothing is selected, whichever statement the cursor is currently inside" onclick="runSel(\''+id+'\')" data-ic="runsel">Run Query Selection</button><button title="Prepend EXPLAIN to the current statement and run it" onclick="explainTab(\''+id+'\')" data-ic="explain">Explain</button><button title="Reformat the query for readability (safe - only changes whitespace/line breaks, never the query itself)" onclick="formatTabSql(\''+id+'\')" data-ic="format">Format</button>'+
   '<span class="tbsep"></span>'+
   lastBtn+selBtn+applyBtn+
+  '<label title="Off: everything this tab runs stays in one transaction, on a connection of its own, until you Commit or Roll back" style="display:inline-flex;align-items:center;gap:5px;margin-left:10px;font-size:12px;color:var(--muted)"><input type="checkbox" id="txac_'+id+'" checked onchange="txToggle(\''+id+'\',!this.checked)"><span> Auto-commit</span></label>'+
+  '<span id="txbar_'+id+'" style="display:none;gap:6px;align-items:center;margin-left:6px"><button class="sm" id="txcommit_'+id+'" title="Make this tab\'s changes permanent, including grid edits not applied yet" onclick="txEnd(\''+id+'\',\'commit\')">Commit</button><button class="sm warn" title="Undo everything this tab has not committed, including grid edits not applied yet" onclick="txEnd(\''+id+'\',\'rollback\')">Rollback</button></span>'+
   '<label title="If a statement fails, keep running the rest of the script instead of stopping at the first error - useful for bulk, mostly-independent statements like seed data or batch table creation. Every failure is reported, not just the first. Only applies to a script that does NOT end in a SELECT." style="display:inline-flex;align-items:center;gap:5px;margin-left:10px;font-size:12px;color:var(--muted)"><input type="checkbox" id="coe_'+id+'"><span class="coetxt"> Continue on error</span></label>'+
   '<span class="tbsep"></span>'+
-  '<span id="resultActions_'+id+'" style="display:none;gap:9px;align-items:center" class="tbgroup">'+
-  '<button title="Copy the grid to the clipboard, as CSV or Markdown, all rows or just the selected (checked) ones (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="event.stopPropagation();toggleCopyMenu(\''+id+'\',this)" data-ic="copy" data-fit="2">Copy \u25BE</button>'+'<button class="sm" id="wrapbtn_'+id+'" title="Toggle text wrapping in the grid" onclick="toggleWrap(\''+id+'\')" data-ic="wrap" data-fit="2">Wrap: Off</button>'+'<button class="sm" id="colsbtn_'+id+'" title="Show or hide columns" onclick="event.stopPropagation();toggleColPicker(\''+id+'\',this)" data-ic="columns" data-fit="2">Columns</button>'+'<input type="search" id="gsearch_'+id+'" placeholder="Search" title="Show only the rows holding this text in any column, and mark the cells that hold it (Ctrl+F from the grid; Enter / Shift+Enter: next / previous match; Esc clears). Searches the rows loaded so far, and says how many match in every result of a script." oninput="setGridSearch(\''+id+'\',this.value)" onkeydown="gsearchKey(event,\''+id+'\',this)" class="gsearch" style="width:170px;font-size:12px">'+'<button class="sm" id="clrflt_'+id+'" style="display:none" title="Clear the column filters and the search" onclick="clearGridFilters(\''+id+'\')" data-ic="clearf" data-fit="2">Clear filters</button>'+
+  '<span id="resultActions_'+id+'"'+(tab.ddl?'':' data-reserve')+' style="display:none;gap:9px;align-items:center" class="tbgroup">'+
+  '<button title="Copy the grid to the clipboard, as CSV or Markdown, all rows or just the selected (checked) ones (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="event.stopPropagation();toggleCopyMenu(\''+id+'\',this)" data-ic="copy" data-fit="2">Copy \u25BE</button>'+'<button class="sm" id="wrapbtn_'+id+'" title="Toggle text wrapping in the grid" onclick="toggleWrap(\''+id+'\')" data-ic="wrap" data-fit="2"><span class="stk"><span class="off">Wrap: On</span><span>Wrap: Off</span></span></button>'+'<button class="sm" id="colsbtn_'+id+'" title="Show or hide columns" onclick="event.stopPropagation();toggleColPicker(\''+id+'\',this)" data-ic="columns" data-fit="2">Columns</button>'+'<input type="search" id="gsearch_'+id+'" placeholder="Search" title="Show only the rows holding this text in any column, and mark the cells that hold it (Ctrl+F from the grid; Enter / Shift+Enter: next / previous match; Esc clears). Searches the rows loaded so far, and says how many match in every result of a script." oninput="setGridSearch(\''+id+'\',this.value)" onkeydown="gsearchKey(event,\''+id+'\',this)" class="gsearch" style="width:170px;font-size:12px">'+'<button class="sm" id="clrflt_'+id+'" style="display:none" title="Clear the column filters and the search" onclick="clearGridFilters(\''+id+'\')" data-ic="clearf" data-fit="2">Clear filters</button>'+
   '</span>'+
   '<span style="flex:1 1 auto"></span>'+
-  '<span id="edit_'+id+'" style="display:inline-flex;align-items:center;gap:6px"></span>'+pager+'</div>'+
+  '<span id="edit_'+id+'"'+(tab.ddl?'':' data-reserve')+' style="display:none;align-items:center;gap:6px"></span>'+pager+'</div>'+
   '<div id="rsets_'+id+'" style="display:none;gap:6px;align-items:center;flex-wrap:wrap;padding:4px 8px"></div><div class="result" id="res_'+id+'"></div><div class="status" id="st_'+id+'">Ready.</div>';
  $('panes').appendChild(pane);watchBar(pane.querySelector('.toolbar'));edFoldSync(id);const ta=$('ed_'+id);ta.value=sql||'';
- const ra1=$('resultActions_'+id);if(ra1)ra1.style.display='none';
+ const ra1=$('resultActions_'+id);if(ra1)ra1.style.display='none';updateEditBar(id);
  (function(){const es=$('es_'+id),ew=$('ew_'+id);es.addEventListener('mousedown',e=>{if(e.target!==es)return;e.preventDefault();const sy=e.clientY,sh=ew.offsetHeight,maxH=ew.parentElement.clientHeight-120;
   const mv=ev=>{let h=sh+(ev.clientY-sy);h=Math.max(44,Math.min(h,Math.max(80,maxH)));ew.style.height=h+'px';syncHl(id);};
   const up=()=>{document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up);document.body.style.userSelect='';};
@@ -6391,6 +6905,9 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
    if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();acAccept(id);return;}
    if(e.key==='Escape'){e.preventDefault();acHide();return;}
   }
+  if((e.ctrlKey||e.metaKey)&&!e.altKey&&['f','h'].includes(e.key.toLowerCase())){e.preventDefault();acHide();findOpen(id,e.key.toLowerCase()==='h');return;}
+  if(e.key==='F3'){e.preventDefault();if($('fr_'+id)&&$('fr_'+id).style.display!=='none')findStep(id,e.shiftKey?-1:1);else findOpen(id,false);return;}
+  if(e.key==='Escape'&&$('fr_'+id)&&$('fr_'+id).style.display!=='none'){e.preventDefault();findClose(id);return;}
   if(e.key==='F5'){e.preventDefault();runTab(id);}
   else if(e.ctrlKey&&e.key==='Enter'){e.preventDefault();runSel(id);}
   else if(e.ctrlKey&&e.code==='Space'){e.preventDefault();acUpdate(id,true);}
@@ -6499,7 +7016,8 @@ function uniqueTabTitle(base){
 }
 function refreshTabDirty(id){const t=T(id);const tb=$('tabbtn_'+id);if(!tb)return;const lbl=tb.querySelector('.tablabel');if(!lbl)return;
  const n=pendingCount(t);lbl.textContent=(n>0?'\u25CF ':'')+(t?t.title:'');lbl.title=n>0?(n+' unsaved change'+(n===1?'':'s')):'';}
-async function closeTabAsk(id){const t=T(id);const n=pendingCount(t);if(n>0){if(!(await ask('This tab has '+n+' unsaved change'+(n===1?'':'s')+'. Close and discard?')))return;}closeTab(id);}
+async function closeTabAsk(id){const t=T(id);const n=pendingCount(t);if(n>0){if(!(await ask('This tab has '+n+' unsaved change'+(n===1?'':'s')+'. Close and discard?')))return;}
+ if(t&&t.txDirty){if(!(await ask('This tab has a transaction that is not committed. Close it and roll the changes back?')))return;}closeTab(id);}
 function reorderTab(srcId,targetId){
   const srcIdx=tabs.findIndex(t=>t.id===srcId),tgtIdx=tabs.findIndex(t=>t.id===targetId);
   if(srcIdx<0||tgtIdx<0)return;
@@ -6539,7 +7057,7 @@ const MODAL_CLOSE_OVERRIDES={mCompare:cmpCloseAndCancel,mCompareRows:cmprCloseAn
 // exactly the bug Escape already had before this existed.
 function modalClose(id){const fn=MODAL_CLOSE_OVERRIDES[id];if(fn)fn();else hide(id);}
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){const open=[...document.querySelectorAll('.modal.show')].filter(m=>!window._floatingMinimized[m.id]);if(open.length){modalClose(open[open.length-1].id);}}});
-function closeTab(id){const t=T(id);if(t&&t.runningReqId){cancelQuery(id);}closeCursorFor(t);const i=tabs.findIndex(t=>t.id===id);if(i<0)return;tabs.splice(i,1);$('tabbtn_'+id).remove();$('pane_'+id).remove();if(activeTab===id&&tabs.length)activate(tabs[tabs.length-1].id);if(tabs.length===0){activeTab=null;}saveSession();toggleOverview();}
+function closeTab(id){const t=T(id);if(t&&t.runningReqId){cancelQuery(id);}closeCursorFor(t);txClose(t);const i=tabs.findIndex(t=>t.id===id);if(i<0)return;tabs.splice(i,1);$('tabbtn_'+id).remove();$('pane_'+id).remove();if(activeTab===id&&tabs.length)activate(tabs[tabs.length-1].id);if(tabs.length===0){activeTab=null;}saveSession();toggleOverview();}
 // Each saved connection remembers its own open tabs (keyed by connection name; ad-hoc/unsaved
 // connections are keyed by host+user+port so different credentials don't collide).
 function sessionKeyFor(){const cn=$('connlist')?$('connlist').value:'';if(cn)return 'conn:'+cn;return 'adhoc:'+($('user')?$('user').value:'')+'@'+($('host')?$('host').value:'')+':'+($('port')?$('port').value:'');}
@@ -6719,11 +7237,11 @@ async function runScriptResults(id,sql,reqId,seq){
  const stmts=splitStmts(sql).filter(s=>!isCommentOnly(s));
  const writes=stmts.some(s=>!/^(select|show|describe|desc|explain|with|table|values|use)\b/i.test(sqlHead(s)));
  if(writes&&roBlock()){st.className='status';st.textContent='Read-only mode: statement blocked.';return;}
- const r=await api('/api/script-results',{sql,db:dbOf(t),requestId:reqId,maxRows:PAGE_BATCH},t.abortCtrl.signal);
+ const r=await api('/api/script-results',{sql,db:dbOf(t),requestId:reqId,maxRows:PAGE_BATCH,session:sessOf(t)},t.abortCtrl.signal);
  if(r.aborted){if(!stale()){st.className='status';st.textContent='Query cancelled.';}return;}
  if(stale())return;
  t.table=null;t.pk=null;t.pending=null;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;t.exact=false;
- {const eb=$('edit_'+id);eb.innerHTML='';delete eb.dataset.sig;}
+ {const eb=$('edit_'+id);eb.style.display='none';}
  const selb=$('selbtn_'+id);if(selb)selb.innerHTML='';
  t.resultSets=r.results||[];
  if(t.resultSets.length){showResultSet(id,0);}
@@ -6812,7 +7330,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
       // statement - but extending the CLI's own "$$" convention this far tested cleanly, while
       // still being implausible to ever collide with real SQL content.
       const leadingSql=stmts.slice(0,-1).map(s=>'DELIMITER $$$$$$$$\n'+s+'\n$$$$$$$$\nDELIMITER ;').join('\n');
-      const scriptR=await api('/api/script',{sql:leadingSql,db:dbOf(t)},t.abortCtrl.signal);
+      const scriptR=await api('/api/script',{sql:leadingSql,db:dbOf(t),session:sessOf(t)},t.abortCtrl.signal);
       if(scriptR.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
       if(stale())return;
       if(!scriptR.ok){st.className='status err';st.textContent=scriptR.error;$('res_'+id).innerHTML='';log('ERROR: '+scriptR.error);return;}
@@ -6825,7 +7343,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     const bind=t.ddl?null:parseSingleEditableTable(lastStmt,tableDb);
     const exact=bind?await exactTextQuery(_q,lastStmt,bind):null;
     if(stale())return;
-    const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,requestId:reqId,pageSize:PAGE_BATCH,browse:true,exactText:exact&&exact.cols.length?exact.cols:undefined},t.abortCtrl.signal);
+    const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,requestId:reqId,pageSize:PAGE_BATCH,browse:true,exactText:exact&&exact.cols.length?exact.cols:undefined,session:sessOf(t)},t.abortCtrl.signal);
     if(r.aborted){if(!stale()){st.className='status';st.textContent='Query cancelled.';}return;}
     if(stale())return;
     if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log(logErr(r.error));await schemaGoneNote(id,r.error);return;}
@@ -6837,7 +7355,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     // selection) happens to match whatever sig was last cached gets wrongly treated as "already
     // showing this" and the bar - now genuinely empty from the innerHTML='' below - never gets
     // rebuilt at all, even though this new table has a PK and should show +Row/Apply/etc.
-    {const eb=$('edit_'+id);eb.innerHTML='';delete eb.dataset.sig;}
+    {const eb=$('edit_'+id);eb.style.display='none';}
     t.cursorId=r.cursorId||null;t.hasMore=!!r.hasMore;t.cursorReqId=t.cursorId?reqId:null;
     if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';return;}
     const ra=$('resultActions_'+id);if(ra)ra.style.display='inline-flex';
@@ -6873,7 +7391,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
   } else {
     if(roBlock()){st.className='status';st.textContent='Read-only mode: statement blocked.';return;}
     const continueOnError=!!($('coe_'+id)&&$('coe_'+id).checked);
-    const r=await api('/api/script',{sql,db:dbOf(t),requestId:reqId,continueOnError},t.abortCtrl.signal);
+    const r=await api('/api/script',{sql,db:dbOf(t),requestId:reqId,continueOnError,session:sessOf(t)},t.abortCtrl.signal);
     if(r.aborted){if(T(id)){st.className='status';st.textContent='Cancelled.';}return;}
     if(stale())return;
     if(r.failures){
@@ -6930,6 +7448,43 @@ async function cancelQuery(id){const t=T(id);if(!t)return;if(t.abortCtrl){try{t.
 // the server. Called before a tab starts a new run (replacing whatever cursor the previous run
 // left open) and from closeTab/closeAll/closeOthers, since a tab can have an open cursor waiting
 // on "fetch next" independently of whether a query is actively "running" (t.runningReqId).
+// ---- manual transactions ----
+// With auto-commit off, a tab runs everything on a connection of its own, in a transaction that
+// stays open until Commit or Rollback. The tab keeps track of whether it has sent anything that
+// changes data, so closing it or disconnecting can say so before the changes are rolled back.
+const TX_LOST=/holding this tab's transaction was lost/;
+function sessOf(t){return t&&t.txOn?t.txSession:undefined;}
+// Whether SQL only reads. Only for telling the user there is something to commit; the server is
+// what decides.
+function txReadsOnly(sql){return !String(sql||'').replace(/\/\*[\s\S]*?\*\/|--[^\n]*|#[^\n]*/g,' ').split(';').some(x=>{
+ const w=(x.trim().match(/^[A-Za-z]+/)||[''])[0].toUpperCase();return w&&!['SELECT','SHOW','DESCRIBE','DESC','EXPLAIN','USE','HELP','SET'].includes(w);});}
+function txWatch(path,p){if(!/^\/api\/(query|script|script-results)$/.test(path)||txReadsOnly(p.sql))return;
+ const t=tabs.find(x=>x.txSession===p.session);if(t&&!t.txDirty){t.txDirty=true;txPaint(t.id);}}
+function txLost(session){const t=tabs.find(x=>x.txSession===session);if(t){t.txDirty=false;txPaint(t.id);}}
+function txToggle(id,manual){const t=T(id);if(!t)return;
+ if(manual){t.txOn=true;t.txSession=t.txSession||('tx_'+id+'_'+Date.now().toString(36));}
+ else{if(t.txDirty){toast('Commit or roll back the open transaction first.',true);txPaint(id);return;}t.txOn=false;txClose(t);}
+ txPaint(id);}
+// Commit saves the grid's pending edits first - Apply and then Commit in one click - and commits
+// nothing if they cannot be saved: the transaction stays open, with the reason on screen. Rollback
+// throws the pending edits away with everything else. Either way a result on screen is read
+// again, since what it showed may just have been undone.
+async function txEnd(id,action){const t=T(id);if(!t||!t.txOn)return;
+ if(action==='commit'&&pendingCount(t)>0){if(!(await applyChanges(id)))return;}
+ if(action==='rollback'&&pendingCount(t)>0)revertChanges(id);
+ closeCursorFor(t);
+ const m=action==='commit'?'Committed.':'Rolled back.';
+ if(t.txSession){const r=await api('/api/session-end',{session:t.txSession,action});
+  if(!r.ok){toast(r.error||'That did not work.',true);if(r.lost){t.txDirty=false;txPaint(id);}return;}}
+ t.txDirty=false;txPaint(id);log(m+' ('+t.title+')');toast(m);
+ if(t.table)await openRun(id);else if(t.curRun&&t.cols&&t.cols.length&&txReadsOnly(t.curRun))await runSql(id,t.curRun);
+ const st=$('st_'+id);if(st){st.className='status';st.textContent=m;}}
+// Lets the tab's connection go. The server rolls back whatever was not committed.
+function txClose(t){if(t&&t.txSession){api('/api/session-end',{session:t.txSession,action:'close'});t.txSession=null;}if(t)t.txDirty=false;}
+function txPaint(id){const t=T(id),cb=$('txac_'+id),bar=$('txbar_'+id),cm=$('txcommit_'+id);const on=!!(t&&t.txOn),dirty=!!(t&&(t.txDirty||(t.txOn&&pendingCount(t)>0)));
+ if(cb)cb.checked=!on;if(bar){bar.toggleAttribute('data-reserve',on);bar.style.display=on?'inline-flex':'none';}
+ if(cm){cm.classList.toggle('go',dirty);cm.title=dirty?'There are changes not committed yet - make them permanent':'Make this tab\'s changes permanent, including grid edits not applied yet';}
+ const tb=$('tabbtn_'+id);if(tb)tb.classList.toggle('txopen',!!(t&&t.txDirty));}
 function closeCursorFor(t){if(!t||!t.cursorId)return;const cid=t.cursorId;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;
  try{api('/api/close-cursor',{cursorId:cid});}catch(e){}}
 // fetchNextBatch(): pulls the next page of rows from the SAME still-open server-side cursor (not
@@ -7135,6 +7690,8 @@ function openCopyMenu(id,btn){
  if(_n)h+='<div class="cpitem" onclick="copySelCsv(\''+id+'\');closeCopyMenu();">CSV ('+_sel+')</div>';
  h+='<div class="cpitem" onclick="copyMd(\''+id+'\');closeCopyMenu();">Markdown (all rows)</div>';
  if(_n)h+='<div class="cpitem" onclick="copyMdSel(\''+id+'\');closeCopyMenu();">Markdown ('+_sel+')</div>';
+ h+='<div class="cpitem" onclick="copyJson(\''+id+'\');closeCopyMenu();">JSON (all rows)</div>';
+ if(_n)h+='<div class="cpitem" onclick="copyJson(\''+id+'\',true);closeCopyMenu();">JSON ('+_sel+')</div>';
  p.innerHTML=h;
  p.style.display='block';p.style.visibility='hidden';p.style.left='0';p.style.top='0';
  const r=btn.getBoundingClientRect();const w=p.offsetWidth||200,hgt=p.offsetHeight||0;
@@ -7239,7 +7796,12 @@ function renderGrid(id){const t=T(id);const ed=!!t.pk;if(!t.filters)t.filters={}
     selAll(id,!all);
     toast(all?'Selection cleared.':('Selected '+view.length+' row'+(view.length===1?'':'s')+'.'));
     return;}
-   if(e.ctrlKey&&!e.shiftKey&&!e.altKey&&(e.key==='f'||e.key==='F')){const q=$('gsearch_'+id);if(q&&q.offsetParent){e.preventDefault();q.focus();q.select();return;}}gridKeyNav(id,e);});wrap.addEventListener('mousedown',e=>{const td=e.target.closest('td.editable');if(td){const tr=td.closest('tr[data-r]');if(tr){const ri=+tr.getAttribute('data-r');const t2=T(id);const off=(!!t2.pk)?2:1;const ci=[...tr.children].indexOf(td)-off;if(ci>=0)gridSetFocus(id,ri,ci,false);}}});
+   if(e.ctrlKey&&!e.shiftKey&&!e.altKey&&(e.key==='f'||e.key==='F')){const q=$('gsearch_'+id);if(q&&q.offsetParent){e.preventDefault();q.focus();q.select();return;}}
+   // A key typed into the results starts an edit, as in a spreadsheet: into the focused cell, or
+   // into every picked cell at once when some are picked.
+   if(e.key.length===1&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&!e.isComposing){const tg=e.target;
+    if(!(tg&&(tg.tagName==='INPUT'||tg.tagName==='TEXTAREA'||tg.tagName==='SELECT'))&&typeIntoCells(id,e.key)){e.preventDefault();return;}}
+   gridKeyNav(id,e);});wrap.addEventListener('mousedown',e=>{const td=e.target.closest('td.editable');if(td){const tr=td.closest('tr[data-r]');if(tr){const ri=+tr.getAttribute('data-r');const t2=T(id);const off=(!!t2.pk)?2:1;const ci=[...tr.children].indexOf(td)-off;if(ci>=0)gridSetFocus(id,ri,ci,false);}}});
   let _vraf=null;wrap.addEventListener('scroll',()=>{if(_vraf)return;_vraf=requestAnimationFrame(()=>{_vraf=null;renderBody(id);maybePrefetchNextBatch(id,wrap);});});
   wrap.dataset.kbWired='1';}}
 // Silently tops up a tab's loaded rows once the user scrolls near the bottom of the grid's own
@@ -7276,7 +7838,7 @@ function setFoldCaret(el,dir,toEdge,title){
  el.className='edfold'+(vert?' vert':'')+(toEdge?' toedge '+dir:'');
  el.innerHTML={up:'&#9652;',down:'&#9662;',left:'&#9666;',right:'&#9656;'}[dir];
  el.title=title;}
-function toggleWrap(id){const t=T(id);t.wrap=!t.wrap;const wrap=$('res_'+id);if(wrap)wrap.classList.toggle('wraptext',t.wrap);const btn=$('wrapbtn_'+id);if(btn){(btn.querySelector('.lbl')||btn).textContent='Wrap: '+(t.wrap?'On':'Off');btn.classList.toggle('ison',!!t.wrap);}}
+function toggleWrap(id){const t=T(id);t.wrap=!t.wrap;const wrap=$('res_'+id);if(wrap)wrap.classList.toggle('wraptext',t.wrap);const btn=$('wrapbtn_'+id);if(btn){const k=btn.querySelectorAll('.stk>span');if(k.length===2){k[0].classList.toggle('off',!t.wrap);k[1].classList.toggle('off',!!t.wrap);}btn.classList.toggle('ison',!!t.wrap);}}
 // The filter row's sticky "top" offset needs to sit at exactly the main header row's actual
 // height, or a gap opens up between them that the first scrolled-past data row peeks through -
 // a thin sliver of ghosted text right where the filter row should meet the header row. Rather
@@ -7392,13 +7954,18 @@ function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=
 // down and recreated them dozens of times a second during plain scrolling, which is what read as
 // a flicker. Skip the rebuild entirely when the two values this bar's markup actually depends on
 // haven't changed since the last time it was built.
-function updateEditBar(id){const t=T(id);const el=$('edit_'+id);if(!el)return;if(!t.pk){if(el.innerHTML){el.innerHTML='';delete el.dataset.sig;}return;}
+// The buttons are kept, hidden, for a result that cannot be edited: the bar keeps their room
+// (see fitBar), so an editable result coming or going moves nothing.
+function updateEditBar(id){const t=T(id);const el=$('edit_'+id);if(!el)return;
+ if(!(t&&t.pk&&t.pending)){el.style.display='none';if(!el.innerHTML){el.innerHTML=editBarHtml(id,0,false);el.dataset.sig='0:false';}return;}
+ el.style.display='inline-flex';if(t.txOn)txPaint(id);
  const n=Object.keys(t.pending.upd).length+t.pending.del.size+t.pending.ins.length;
  const hasSel=t.selected&&t.selected.size>0;
  const sig=n+':'+hasSel;
  if(el.dataset.sig===sig)return;
  el.dataset.sig=sig;
- el.innerHTML='<button class="write" onclick="addRow(\''+id+'\')" data-ic="plus">Add row</button><button class="warn write" '+(hasSel?'':'disabled')+' title="Mark all checked rows for deletion (applied on Apply)" onclick="deleteSel(\''+id+'\')" data-ic="trash">Delete selected</button><span class="tbsep"></span><button class="go write" '+(n?'':'disabled')+' onclick="applyChanges(\''+id+'\')">Apply</button><button '+(n?'':'disabled')+' onclick="revertChanges(\''+id+'\')" data-ic="undo" data-fit="3">Revert</button><span class="pill'+(n?'':' quiet')+'">'+n+' pending</span>';}
+ el.innerHTML=editBarHtml(id,n,hasSel);}
+function editBarHtml(id,n,hasSel){return '<button class="write" onclick="addRow(\''+id+'\')" data-ic="plus">Add row</button><button class="warn write" '+(hasSel?'':'disabled')+' title="Mark all checked rows for deletion (applied on Apply)" onclick="deleteSel(\''+id+'\')" data-ic="trash">Delete selected</button><span class="tbsep"></span><button class="go write" '+(n?'':'disabled')+' onclick="applyChanges(\''+id+'\')">Apply</button><button '+(n?'':'disabled')+' onclick="revertChanges(\''+id+'\')" data-ic="undo" data-fit="3">Revert</button><span class="pill cnt'+(n?'':' quiet')+'">'+n+' pending</span>';}
 // MySQL's own DATE/DATETIME/TIME text format <-> what a native <input type="date"/"datetime-
 // local"/"time"> needs. Deliberately conservative: anything the native widget can't faithfully
 // round-trip - a zero-date ('0000-00-00'), a zero month/day, a TIME past the widget's 00:00:00-
@@ -7816,6 +8383,29 @@ async function editCell(td,id,ri,ci){clearTimeout(clickTimer);const t=T(id);t._f
 // The cell window for a result that cannot be edited: the whole value, to read and copy.
 function viewCell(id,ri,ci){const t=T(id);if(!t||!t.rows[ri])return;const v=t.rows[ri][ci];viewText('Cell - '+t.cols[ci]+(v===null?'  (NULL)':''),v===null?'':v,{readonly:true});}
 function setUpd(id,ri,ci,v){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}if(v===null&&t.pk&&t.pk.indexOf(t.cols[ci])>=0){toast('Column "'+t.cols[ci]+'" is part of the primary key and cannot be set to NULL.',true);return;}const key=ri+':'+ci;if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;renderGrid(id);}
+// The same for a set of cells given one value, with one rebuild at the end. A key column is never
+// given NULL; it is left as it was, and the user is told.
+function setUpdMany(id,keys,v){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}
+ let n=0,kept=0;
+ keys.forEach(key=>{const p=key.split(':'),ri=+p[0],ci=+p[1];if(!t.rows[ri])return;
+  if(v===null&&t.pk&&t.pk.indexOf(t.cols[ci])>=0){kept++;return;}
+  if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;n++;});
+ renderGrid(id);
+ if(kept)toast(kept+' primary-key cell'+(kept===1?' was':'s were')+' left as they were - a key cannot be NULL.',true);
+ else if(n>1)toast('Set '+n+' cells.');}
+// Typing with cells picked: the editor opens on the focused cell (or else the anchor) holding the
+// key that was typed, and what is entered there goes into every picked cell still on screen. With
+// nothing picked it is the focused cell alone.
+function typeIntoCells(id,ch){const t=T(id);if(!(t&&t.pk&&t.pending))return false;
+ const f=gridFocus[id],view=new Set(viewIndices(id));
+ let keys=t.cellSel&&t.cellSel.size?[...t.cellSel].filter(k=>view.has(+k.split(':')[0])):[];
+ let host=null;
+ if(keys.length){const fk=f?f.ri+':'+f.ci:null;host=(fk&&keys.includes(fk))?fk:(t._cellAnchor&&keys.includes(t._cellAnchor))?t._cellAnchor:keys[0];}
+ else if(f){host=f.ri+':'+f.ci;keys=[host];}
+ else return false;
+ const p=host.split(':'),ri=+p[0],ci=+p[1],td=gridCellEl(id,ri,ci);
+ if(!td||td.querySelector('input,textarea'))return false;
+ inlineEdit(td,id,ri,ci,{initial:ch,keys});return true;}
 let clickTimer=null;
 let gridFocus={}; // per-tab: {ri, ci} of the currently keyboard-focused cell
 function gridCellEl(id,ri,ci){const t=T(id);const wrap=$('res_'+id);if(!wrap||!t)return null;const off=(!!t.pk)?2:1;
@@ -7970,7 +8560,11 @@ function cellRevert(td,id,ri,ci){const t=T(id);const key=ri+':'+ci;const pend=t.
  td.className='editable'+(pend?' dirty':'');td.title=String(clip(val,300));td.innerHTML=cellHtml(val,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci]);}
 function insCellRevert(td,id,ii,col){const t=T(id);const v=t.pending.ins[ii][col];const ci=t.cols.indexOf(col);
  td.className='editable';td.title=(v===undefined?'undefined':String(v));td.innerHTML=cellHtml(v===undefined?null:v,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci]);}
-async function inlineEdit(td,id,ri,ci){const t=T(id);const key=ri+':'+ci;const cur=(key in t.pending.upd)?t.pending.upd[key]:t.rows[ri][ci];
+// With opts ({initial, keys}) the edit was started by typing: the box opens at once holding what was
+// typed - waiting for the column type would lose the keys that follow - and is written to every
+// cell in keys.
+async function inlineEdit(td,id,ri,ci,opts){const t=T(id);const key=ri+':'+ci;const cur=opts?opts.initial:(key in t.pending.upd)?t.pending.upd[key]:t.rows[ri][ci];
+ if(!opts){
  // Enum/boolean columns always go through editCell's dropdown - a plain inline text input would
  // let you type a value the column can't actually hold, which the double-click path already avoids.
  const started=Date.now();const colType=await getColType(id,t.cols[ci]);
@@ -7978,7 +8572,8 @@ async function inlineEdit(td,id,ri,ci){const t=T(id);const key=ri+':'+ci;const c
  // click that already put a box here, wins: a box made now would sit behind the window and take
  // the focus from it.
  if(!td.isConnected||td.querySelector('input,textarea')||(t._fullEditAt||0)>=started)return;
- if(colType&&(/^enum\(/i.test(colType)||/^tinyint\(1\)/i.test(colType))){editCell(td,id,ri,ci);return;}
+ if(colType&&(/^enum\(/i.test(colType)||/^tinyint\(1\)/i.test(colType))){editCell(td,id,ri,ci);return;}}
+ else if(td.querySelector('input,textarea'))return;
  // A value with embedded newlines used to jump straight to the big modal on a single click, which
  // read as "one click opened the double-click editor" - it's a plain multi-line <textarea> inline
  // instead now, sized to roughly fit the existing line count; the big modal is still one
@@ -7987,8 +8582,9 @@ async function inlineEdit(td,id,ri,ci){const t=T(id);const key=ri+':'+ci;const c
  // No inp.select() here on purpose - auto-selecting the whole value made entering edit mode look
  // like a big blue highlight box instead of just dropping into the text, so the cursor is placed
  // at the end of the existing value instead (still lets you type to replace via Home+shift, etc).
- td.classList.add('cellEditing');td.innerHTML=(isMulti?'':td.innerHTML)+'<div class="celled'+(isMulti?'':' over')+'">'+(isMulti?'<textarea rows="'+Math.min(8,Math.max(2,String(cur).split(/\r\n|\r|\n/).length))+'"></textarea>':'<input>')+'<button tabindex="-1" title="Set NULL">&empty;</button></div>';const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('button');inp.value=(cur===null?'':cur);inp.focus();const vlen=inp.value.length;inp.setSelectionRange(vlen,vlen);let done=false,dirty=false;
- const set=v=>{done=true;setUpd(id,ri,ci,v);};
+ td.classList.add('cellEditing');td.innerHTML=(isMulti?'':td.innerHTML)+'<div class="celled'+(isMulti?'':' over')+'">'+(isMulti?'<textarea rows="'+Math.min(8,Math.max(2,String(cur).split(/\r\n|\r|\n/).length))+'"></textarea>':'<input>')+'<button tabindex="-1" title="Set NULL">&empty;</button></div>';const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('button');inp.value=(cur===null?'':cur);inp.focus();const vlen=inp.value.length;inp.setSelectionRange(vlen,vlen);let done=false,dirty=!!opts;
+ if(opts&&opts.keys.length>1)inp.title='Writes to all '+opts.keys.length+' picked cells';
+ const set=v=>{done=true;if(opts)setUpdMany(id,opts.keys,v);else setUpd(id,ri,ci,v);};
  inp.addEventListener('input',()=>dirty=true);
  nb.addEventListener('mousedown',e=>{e.preventDefault();set(null);});
  // A plain Enter commits for a single-line input, but inserts a newline (as it always does in a
@@ -8020,7 +8616,7 @@ function cellMenu(e,id,ri,ci){e.preventDefault();const t=T(id);const key=ri+':'+
   (t.cellSel&&t.cellSel.size)?['Copy '+t.cellSel.size+' picked cell'+(t.cellSel.size===1?'':'s'),()=>{const n=t.cellSel.size;copyText(pickedCellsText(id),'Copied '+n+' cell'+(n===1?'':'s')+'.');}]:null,asHex&&['Copy value as hex',()=>{clipWrite(cur===null?'':String(cur));log('Copied cell value as hex.');}],['Copy row',()=>copyRow(id,ri)],sel&&['Copy '+(nsel===1?'the selected row':nsel+' selected rows'),()=>copySelRows(id)],editable&&fits(clip1)&&['Paste row here (overwrite)',()=>pasteRowInto(id,ri)],editable&&clipN&&nsel>1&&clipN.length===nsel&&clipN.every(fits)&&['Paste '+nsel+' rows over the '+nsel+' selected rows',()=>pasteRowsOver(id)],editable&&clipN&&clipN.every(fits)&&['Paste '+rows(clipN.length)+' as new',()=>pasteRowsAsNew(id)],['Copy column: '+t.cols[ci],()=>copyColumn(id,ci)],['Edit full row (form)...',()=>rowForm(id,ri)],'-'];if(t.table){const col=t.cols[ci];items.push(['Quick filter',qfSub(id,col,cur)]);if(t.filterClauses&&t.filterClauses.length)items.push(['Clear filter ('+t.filterClauses.length+')',()=>clearFilters(id)]);
   const fkd=(t.fkDetails||[]).find(f=>f[0]===col);
   if(fkd&&cur!=null){items.push(['Go to referenced row ('+fkd[1]+'.'+fkd[2]+')',()=>goToFkRow(t.db,fkd[1],fkd[2],cur)]);}
-  items.push('-');}items.push(['Export to CSV (all rows)...',()=>csvGrid(id)],sel&&['Export to CSV ('+nsel+' selected)...',()=>csvSel(id)],['Export to INSERTs (all rows)...',()=>insGrid(id)],sel&&['Export to INSERTs ('+nsel+' selected)...',()=>insSel(id)],'-',editable&&['Set NULL',()=>setUpd(id,ri,ci,null)],editable&&['Set empty',()=>setUpd(id,ri,ci,'')]);menu(e.clientX,e.clientY,items);}
+  items.push('-');}items.push(['Export to CSV (all rows)...',()=>csvGrid(id)],sel&&['Export to CSV ('+nsel+' selected)...',()=>csvSel(id)],['Export to INSERTs (all rows)...',()=>insGrid(id)],sel&&['Export to INSERTs ('+nsel+' selected)...',()=>insSel(id)],['Export to Excel (all rows)...',()=>exportRowsAs(id,'xlsx')],sel&&['Export to Excel ('+nsel+' selected)...',()=>exportRowsAs(id,'xlsx',true)],['Export to JSON (all rows)...',()=>exportRowsAs(id,'json')],sel&&['Export to JSON ('+nsel+' selected)...',()=>exportRowsAs(id,'json',true)],['Export to Markdown (all rows)...',()=>exportRowsAs(id,'md')],'-',editable&&['Set NULL',()=>setUpd(id,ri,ci,null)],editable&&['Set empty',()=>setUpd(id,ri,ci,'')]);menu(e.clientX,e.clientY,items);}
 // The condition goes in as the tab's filter: openRun() rebuilds the query from the table and its
 // filters, so a WHERE written into the tab's SQL was dropped and the whole table came up. The
 // value is written for the column's type, so an empty binary key (0x) and a text key that looks
@@ -8266,8 +8862,10 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
  // Foreign keys are NOT disabled here: they were, which let an edit point a row at a
  // parent that does not exist and silently break referential integrity the schema was
  // written to guarantee.
- const r=await api('/api/script',{sql:S.join('\n'),transaction:true});
- if(r.ok){log('Applied '+changes+' change(s).');toast('Applied '+changes+' change(s).','ok');invalidateTableCache(t.db,t.table);openRun(id).then(()=>refreshTabDirty(id));}else{log('APPLY error: '+r.error);toast(/Result consisted of more than one row/.test(String(r.error))?ONE_ROW_REFUSED:'Apply failed: '+r.error,true);}}
+ const r=await api('/api/script',{sql:S.join('\n'),transaction:true,session:sessOf(t)});
+ // true once saved, so Commit (txEnd) can tell whether to go on; it waits for the grid to show what
+ // was saved, since until then the reload is still reading on the tab's connection.
+ if(r.ok){log('Applied '+changes+' change(s).');toast('Applied '+changes+' change(s).','ok');invalidateTableCache(t.db,t.table);await openRun(id);refreshTabDirty(id);return true;}else{log('APPLY error: '+r.error);toast(/Result consisted of more than one row/.test(String(r.error))?ONE_ROW_REFUSED:'Apply failed: '+r.error,true);return false;}}
 
 function ddlFailureNote(err, sql){
  const e = String(err || "");
@@ -8365,6 +8963,56 @@ function bMD(cols,rows){
   rows.forEach(r=>{h+='| '+r.map(esc).join(' | ')+' |\n';});
   return h;
 }
+// A result as JSON: an array with an object per row, keyed by column name. Values stay the text the
+// grid holds and NULL is null, so nothing is rounded on the way out. A name that comes twice keeps
+// both, the second with its position after it.
+function bJSON(cols,rows){return JSON.stringify(rows.map(r=>{const o={};cols.forEach((c,i)=>{const k=(c in o)?c+'_'+(i+1):c;o[k]=r[i]===undefined?null:r[i];});return o;}),null,2);}
+// A result as an Excel workbook, written here rather than with a library: one sheet of inline
+// strings and numbers, in a zip that is stored rather than compressed. A value goes in as a number
+// only when Excel keeps it exactly - no leading zero, at most 15 digits - so an id or a code comes
+// out as it went in.
+function xlsxCell(ref,v,st){if(v===null||v===undefined)return '';const s=String(v);
+ if(/^-?(0|[1-9]\d*)(\.\d+)?$/.test(s)&&s.replace(/[-.]/g,'').length<=15)return '<c r="'+ref+'"'+st+'><v>'+s+'</v></c>';
+ const x=s.slice(0,32767).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F￾￿]/g,'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+ return '<c r="'+ref+'" t="inlineStr"'+st+'><is><t xml:space="preserve">'+x+'</t></is></c>';}
+function xlsxCol(i){let s='';i++;while(i>0){const m=(i-1)%26;s=String.fromCharCode(65+m)+s;i=Math.floor((i-1)/26);}return s;}
+function bXLSX(cols,rows){const X='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n',NS='http://schemas.openxmlformats.org/',R=NS+'officeDocument/2006/relationships/';
+ const row=(vals,r,st)=>'<row r="'+r+'">'+vals.map((v,i)=>xlsxCell(xlsxCol(i)+r,v,st)).join('')+'</row>';
+ const sheet=X+'<worksheet xmlns="'+NS+'spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetData>'+
+  row(cols,1,' s="1"')+rows.map((r,k)=>row(r,k+2,'')).join('')+'</sheetData></worksheet>';
+ const ct='application/vnd.openxmlformats-officedocument.spreadsheetml.';
+ return zipStore([
+  ['[Content_Types].xml',X+'<Types xmlns="'+NS+'package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="'+ct+'sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="'+ct+'worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="'+ct+'styles+xml"/></Types>'],
+  ['_rels/.rels',X+'<Relationships xmlns="'+NS+'package/2006/relationships"><Relationship Id="rId1" Type="'+R+'officeDocument" Target="xl/workbook.xml"/></Relationships>'],
+  ['xl/workbook.xml',X+'<workbook xmlns="'+NS+'spreadsheetml/2006/main" xmlns:r="'+NS+'officeDocument/2006/relationships"><sheets><sheet name="Result" sheetId="1" r:id="rId1"/></sheets></workbook>'],
+  ['xl/_rels/workbook.xml.rels',X+'<Relationships xmlns="'+NS+'package/2006/relationships"><Relationship Id="rId1" Type="'+R+'worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="'+R+'styles" Target="styles.xml"/></Relationships>'],
+  ['xl/styles.xml',X+'<styleSheet xmlns="'+NS+'spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs></styleSheet>'],
+  ['xl/worksheets/sheet1.xml',sheet]]);}
+function crc32(b){let t=crc32.t;if(!t){t=crc32.t=new Uint32Array(256);for(let n=0;n<256;n++){let c=n;for(let k=0;k<8;k++)c=c&1?0xEDB88320^(c>>>1):c>>>1;t[n]=c>>>0;}}
+ let c=0xFFFFFFFF;for(let i=0;i<b.length;i++)c=t[(c^b[i])&255]^(c>>>8);return (c^0xFFFFFFFF)>>>0;}
+// A zip with every file stored as it is: [name, text or bytes] in, the archive's bytes out.
+function zipStore(files){const enc=new TextEncoder(),parts=[],cen=[];let off=0;
+ const hdr=n=>{const b=new Uint8Array(n);return [b,new DataView(b.buffer)];};
+ files.forEach(([name,body])=>{const nm=enc.encode(name),data=typeof body==='string'?enc.encode(body):body,crc=crc32(data);
+  const [l,lv]=hdr(30);lv.setUint32(0,0x04034b50,true);lv.setUint16(4,20,true);lv.setUint16(6,0x0800,true);lv.setUint16(12,0x21,true);lv.setUint32(14,crc,true);lv.setUint32(18,data.length,true);lv.setUint32(22,data.length,true);lv.setUint16(26,nm.length,true);
+  const [c,cv]=hdr(46);cv.setUint32(0,0x02014b50,true);cv.setUint16(4,20,true);cv.setUint16(6,20,true);cv.setUint16(8,0x0800,true);cv.setUint16(14,0x21,true);cv.setUint32(16,crc,true);cv.setUint32(20,data.length,true);cv.setUint32(24,data.length,true);cv.setUint16(28,nm.length,true);cv.setUint32(42,off,true);
+  parts.push(l,nm,data);cen.push(c,nm);off+=30+nm.length+data.length;});
+ const cenSize=cen.reduce((a,b)=>a+b.length,0),[e,ev]=hdr(22);ev.setUint32(0,0x06054b50,true);ev.setUint16(8,files.length,true);ev.setUint16(10,files.length,true);ev.setUint32(12,cenSize,true);ev.setUint32(16,off,true);
+ const all=[...parts,...cen,e],out=new Uint8Array(all.reduce((a,b)=>a+b.length,0));let at=0;all.forEach(b=>{out.set(b,at);at+=b.length;});return out;}
+// Exports with no streaming path in the backend. A table tab gives every row of the table, read the
+// way the CSV export reads one; a query gives the rows the grid holds; selOnly the ticked rows.
+async function exportRowsAs(id,fmt,selOnly){const t=T(id);if(!t||!t.cols)return;let cols=t.cols,rows;
+ if(selOnly){rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}}
+ else if(t.table){const info=await tableColumnsInfo(t.db,t.table);if(!info){toast('Could not read the columns of '+t.db+'.'+t.table+'.',true);return;}
+  const q=await api('/api/query',{sql:'SELECT '+info.map(c=>qid(c.name)).join(',')+' FROM '+qid(t.db)+'.'+qid(t.table),db:t.db});if(!q.ok){toast(q.error,true);return;}cols=q.columns;rows=q.rows;}
+ else rows=t.rows;
+ const base=(t.table||'result')+(selOnly?'_selected':'');
+ if(fmt==='json')await dl(bJSON(cols,rows),base+'.json');
+ else if(fmt==='md')await dl(bMD(cols,rows),base+'.md');
+ else await dlBinary(new Blob([bXLSX(cols,rows)],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}),base+'.xlsx');
+ log('Exported '+rows.length+' row(s) to '+({json:'JSON',md:'Markdown',xlsx:'Excel'})[fmt]+'.');}
+function copyJson(id,selOnly){const t=T(id);if(!t.cols)return;const rows=selOnly?selRows(id):t.rows;if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}
+ copyText(bJSON(t.cols,rows),'Copied '+rows.length+(selOnly?' selected':'')+' row(s) (JSON).');}
 function selRows(id){const t=T(id);return viewIndices(id).filter(ri=>t.selected&&t.selected.has(ri)).map(ri=>t.rows[ri]);}
 function copyGrid(id){const t=T(id);if(!t.cols)return;copyText(bTSV(t.cols,t.rows),'Copied '+t.rows.length+' rows (TSV).').then(st=>{if(st!=='failed')tsvShapeHint(t.rows,'the text NULL');});}
 function tsvGrid(id){const t=T(id);if(!t.cols)return;dl(bTSV(t.cols,t.rows),'result.tsv');}
@@ -8425,7 +9073,15 @@ function codeBlockStartHeight(text){const lines=String(text||'').split('\n').len
 // block past the visible window - without both, an unbounded resize:both could be dragged to an
 // enormous size and made the whole window unresponsive while it repainted.
 function codeBlockStyle(text){return "display:block;background:var(--log);color:var(--logfg);font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;line-height:1.5;padding:6px 8px;border-radius:4px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;overflow:auto;resize:both;max-width:100%;max-height:calc(100vh - 40px);height:"+codeBlockStartHeight(text);}
-function openHistory(){const box=$('histList');const h=hist();box.innerHTML=h.length?'':'<div class="muted">No history yet.</div>';h.forEach(sql=>{const d=document.createElement('div');d.className='item';d.style.cssText='border-bottom:1px solid var(--bd2);padding:6px 4px';const code=document.createElement('code');code.style.cssText=codeBlockStyle(sql);code.textContent=sql;d.appendChild(code);d.onclick=()=>{hide('mHist');openTab('history',sql,curSchema,false,null);};box.appendChild(d);});show('mHist');}
+function openHistory(){const box=$('histList');const h=hist();box.innerHTML=h.length?'':'<div class="muted">No history yet.</div>';h.forEach(sql=>{const d=document.createElement('div');d.className='item';d.style.cssText='border-bottom:1px solid var(--bd2);padding:6px 4px';const code=document.createElement('code');code.style.cssText=codeBlockStyle(sql);code.textContent=sql;const bar=document.createElement('div');bar.style.cssText='display:flex;justify-content:flex-end;margin-bottom:4px';const sv=document.createElement('button');sv.className='sm';sv.textContent='Save to library';sv.title='Keep this query in the library under a name';sv.onclick=e=>{e.stopPropagation();histSaveToLib(sql);};bar.appendChild(sv);d.appendChild(bar);d.appendChild(code);d.onclick=()=>{hide('mHist');openTab('history',sql,curSchema,false,null);};box.appendChild(d);});show('mHist');}
+// A query from the history, kept in the library: asked for a name, with the SQL there to trim
+// before it is saved. The history keeps no schema, so it is saved against the current one.
+async function histSaveToLib(sql){const res=await inputBox({title:'Save to library',okText:'Save',fields:[{key:'name',label:'Name',value:''},{key:'sql',label:'SQL',type:'textarea',value:sql}]});
+ if(!res)return;const name=(res.name||'').trim(),q=res.sql||'';
+ if(!name){toast('Enter a name for the query.',true);return;}if(!q.trim()){toast('The query is empty.',true);return;}
+ await libLoad();if(libAll().some(x=>x.name===name)&&!(await ask('A saved query named "'+name+'" already exists. Replace it?')))return;
+ const r=await api('/api/lib-save',{name:name,sql:q,schema:curSchema||'',ts:Date.now()});if(!r.ok){toast(r.error||'Save failed',true);return;}
+ await libLoad();libRender();toast('Saved "'+name+'" to the library.');log('Saved query "'+name+'" to library.');}
 async function clearHistory(){if(await ask('Clear query history?')){localStorage.removeItem('history');openHistory();}}
 let _libCache=[];
 function libAll(){return _libCache.slice();}
@@ -9805,7 +10461,7 @@ function impAppend(paths){const cur=$('impFiles').value.trim();const add=paths.f
 function impAddFiles(){browse({title:'Select SQL files',filter:'*.sql',mode:'files',onPick:ps=>{impAppend(ps);log('Added '+ps.length+' file(s).');}});}
 function impAddFolder(){browse({title:'Select a folder (imports all .sql inside)',mode:'folder',onPick:async folder=>{const r=await api('/api/browse',{path:folder,filter:'*.sql',dirsOnly:false});if(r.ok){const ps=r.files.map(f=>f.path);impAppend(ps);log('Added '+ps.length+' .sql file(s) from '+folder);}else toast(r.error,true);}});}
 // ---- close tabs ----
-async function closeAll(){const dirty=tabs.filter(t=>pendingCount(t)>0);if(dirty.length){if(!(await ask(dirty.length+' tab(s) have unsaved changes. Close all and discard them?')))return;}
+async function closeAll(){const dirty=tabs.filter(t=>pendingCount(t)>0||t.txDirty);if(dirty.length){if(!(await ask(dirty.length+' tab(s) have unsaved changes. Close all and discard them?')))return;}
  await Promise.all(tabs.filter(t=>t.runningReqId).map(t=>cancelQuery(t.id)));
  tabs.forEach(t=>closeCursorFor(t));
  [...tabs].forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=[];activeTab=null;saveSession();toggleOverview();markRunSchema(null);}
@@ -9899,15 +10555,51 @@ function caretXY(ta){const div=document.createElement('div');const cs=getCompute
  div.style.position='absolute';div.style.visibility='hidden';div.style.whiteSpace='pre';div.style.border='1px solid transparent';
  const before=ta.value.slice(0,ta.selectionStart);div.textContent=before;const span=document.createElement('span');span.textContent='\u200b';div.appendChild(span);
  document.body.appendChild(div);const r=ta.getBoundingClientRect();const x=r.left+span.offsetLeft-ta.scrollLeft;const y=r.top+span.offsetTop-ta.scrollTop;const lh=parseFloat(cs.lineHeight)||16;document.body.removeChild(div);return {x,y,lh};}
-function acSuggest(word){const w=word.toLowerCase();const out=[],seen=new Set();
- const push=arr=>{(arr||[]).forEach(v=>{if(!v)return;const lv=String(v).toLowerCase();if(!seen.has(lv)&&lv.startsWith(w)){seen.add(lv);out.push(String(v));}});};
- if(objData){push(objData.r.tables);push(objData.r.views);push(objData.r.procedures);push(objData.r.functions);}
- push(window.acColumns||[]);push(window.allSchemas||[]);push(AC_KW);
- return out.slice(0,12);}
+// What the statement around the caret says about what may come next: the tables it names, with
+// their aliases, whether a table name is due (after FROM, JOIN and the like), and a qualifier typed
+// before a dot - "a." or "db.t." - with what has been typed after it.
+function acContext(text,pos){
+ const ID='(?:\x60(?:[^\x60]|\x60\x60)+\x60|[A-Za-z_][A-Za-z0-9_$]*)',unq=s=>s&&s[0]==='\x60'?s.slice(1,-1).replace(/\x60\x60/g,'\x60'):s;
+ const NOALIAS=new Set(['where','join','left','right','inner','outer','cross','natural','straight_join','on','using','set','group','order','limit','having','union','values','value','select','for','lock','partition','window','into','as','use','force','ignore','and','or','key','index']);
+ const st=text.lastIndexOf(';',pos-1)+1;let en=text.indexOf(';',pos);if(en<0)en=text.length;
+ const stmt=text.slice(st,en),before=text.slice(st,pos),refs=[],seen=new Set();
+ const add=(a,b,al)=>{const r=b?{db:unq(a),table:unq(b)}:{db:null,table:unq(a)};if(al&&!NOALIAS.has(al.toLowerCase()))r.alias=unq(al);
+  const k=(r.db||'')+'.'+r.table+'.'+(r.alias||'');if(!seen.has(k.toLowerCase())){seen.add(k.toLowerCase());refs.push(r);}};
+ const one='('+ID+')(?:\\s*\\.\\s*('+ID+'))?(?:\\s+(?:AS\\s+)?('+ID+'))?';
+ const re=new RegExp('\\b(?:FROM|JOIN|UPDATE|INTO|TABLE)\\s+'+one,'gi');let m;
+ while((m=re.exec(stmt)))add(m[1],m[2],m[3]);
+ // "FROM a x, b y": the tables after the commas of a FROM list.
+ const fr=/\bFROM\b([\s\S]*?)(?=\b(?:WHERE|GROUP|ORDER|LIMIT|HAVING|UNION|WINDOW|FOR)\b|$)/gi;let f;
+ while((f=fr.exec(stmt))){const lead=new RegExp('^\\s*,\\s*'+one,'i');let depth=0,last=0;const body=f[1];
+  for(let i=0;i<=body.length;i++){const ch=body[i];if(ch==='(')depth++;else if(ch===')')depth--;
+   else if((ch===','&&depth===0)||i===body.length){if(last>0){const p=body.slice(last-1,i).match(lead);if(p)add(p[1],p[2],p[3]);}last=i+1;}}}
+ const q=before.match(new RegExp('(?:('+ID+')\\s*\\.\\s*)?('+ID+')\\s*\\.\\s*([A-Za-z0-9_$]*)$'));
+ const afterTable=/\b(?:FROM|JOIN|UPDATE|INTO|TABLE)\s+[A-Za-z0-9_$]*$/i.test(before);
+ return {refs,afterTable,qual:q?[q[1]?unq(q[1]):null,unq(q[2])]:null,word:q?q[3]:((before.match(/[A-Za-z_][A-Za-z0-9_]*$/)||[''])[0])};}
+function acQ(v){return /^[A-Za-z_][A-Za-z0-9_$]*$/.test(v)?v:'\x60'+String(v).replace(/\x60/g,'\x60\x60')+'\x60';}
+// Suggestions for the word at the caret. After "alias." only that table's columns; after "schema."
+// its tables. Otherwise the columns of the tables the statement uses come first, then the rest.
+function acSuggest(word,ctx,retry){const w=word.toLowerCase();const out=[],seen=new Set();
+ const push=(arr,quote)=>{(arr||[]).forEach(v=>{if(!v)return;v=String(v);const lv=v.toLowerCase();if(!seen.has(lv)&&lv.startsWith(w)){seen.add(lv);out.push(quote?acQ(v):v);}});};
+ if(ctx&&ctx.qual){const [q1,q2]=ctx.qual,lq=q2.toLowerCase();
+  if(q1)push(acColsFor(q1,q2,retry),1);
+  else{const ref=ctx.refs.find(r=>r.alias&&r.alias.toLowerCase()===lq)||ctx.refs.find(r=>r.table.toLowerCase()===lq);
+   if(ref)push(acColsFor(ref.db||curSchema,ref.table,retry),1);
+   else if((window.allSchemas||[]).some(x=>String(x).toLowerCase()===lq)){const d=acSchemaCols(q2,retry);if(d)push(Object.values(d).map(x=>x.name),1);}
+   else push(acColsFor(curSchema,q2,retry),1);}
+  return out.slice(0,50);}
+ const tables=()=>{if(objData){push(objData.r.tables,1);push(objData.r.views,1);}};
+ if(ctx&&ctx.afterTable){tables();push(window.allSchemas||[],1);}
+ else if(ctx){ctx.refs.forEach(r=>push(acColsFor(r.db||curSchema,r.table,retry),1));push(ctx.refs.map(r=>r.alias).filter(Boolean));tables();}
+ else tables();
+ if(objData){push(objData.r.procedures,1);push(objData.r.functions,1);}
+ push(window.acColumns||[],1);push(window.allSchemas||[],1);push(AC_KW);
+ return out.slice(0,20);}
 // --- Autocomplete: suggest table/column/keyword names as you type in the editor.
 function acUpdate(id,force){const ta=$('ed_'+id);const pos=ta.selectionStart;const before=ta.value.slice(0,pos);const m=before.match(/[A-Za-z_][A-Za-z0-9_]*$/);
- if(!m||(!force&&m[0].length<2)){acHide();return;}
- const sug=acSuggest(m[0]);if(!sug.length){acHide();return;}
+ const ctx=acContext(ta.value,pos);
+ if(!ctx.qual&&(!m||(!force&&m[0].length<2))){acHide();return;}
+ const sug=acSuggest(ctx.qual?ctx.word:m[0],ctx,()=>{if(document.activeElement===ta&&ta.selectionStart===pos)acUpdate(id,force);});if(!sug.length){acHide();return;}
  acItems=sug;acIdx=0;acTa=ta;acRender();const c=caretXY(ta);const box=$('acx');box.style.left=Math.min(c.x,innerWidth-180)+'px';box.style.top=(c.y+c.lh+2)+'px';box.style.display='block';}
 function acRender(){const box=$('acx');box.innerHTML='';acItems.forEach((v,i)=>{const d=document.createElement('div');d.className='ai'+(i===acIdx?' on':'');d.textContent=v;d.addEventListener('mousedown',e=>{e.preventDefault();acIdx=i;acAccept(activeTab);});box.appendChild(d);});}
 function acMove(dir){acIdx=(acIdx+dir+acItems.length)%acItems.length;acRender();const on=$('acx').querySelector('.ai.on');if(on)on.scrollIntoView({block:'nearest'});}
@@ -10148,7 +10840,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','AppVersion','ReleasesRepo','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload','BrowseCharsets') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','TxSessions','TxLost','Tunnels','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','AppVersion','ReleasesRepo','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload','BrowseCharsets') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }
@@ -10212,7 +10904,8 @@ $RequestHandler = {
                 '/api/ddl'     { Send-Json $client (Api-Ddl $conn $data.db $data.type $data.name) }
                 '/api/pk'      { Send-Json $client (Api-Pk $conn $data.db $data.table) }
                 '/api/fk'      { Send-Json $client (Api-Fk $conn $data.db $data.table) }
-                '/api/query'   { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId $data.pageSize $data.exactText) }
+                '/api/query'   { if ($data.session) { Send-Json $client (Api-TxRun $conn $data 'query') } else { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId $data.pageSize $data.exactText) } }
+                '/api/session-end' { Send-Json $client (Api-SessionEnd $conn $data) }
                 '/api/fetch-cursor-batch' { Send-Json $client (Api-FetchCursorBatch $data) }
                 '/api/close-cursor' { Send-Json $client (Api-CloseCursor $data) }
                 '/api/cancel-query' { Send-Json $client (Api-CancelQuery $data) }
@@ -10221,8 +10914,8 @@ $RequestHandler = {
                 '/api/schema-erd' { Send-Json $client (Api-SchemaErd $conn $data.db) }
                 '/api/process-list' { Send-Json $client (Api-ProcessList $conn) }
                 '/api/kill-process' { Send-Json $client (Api-KillProcess $conn $data) }
-                '/api/script'  { Send-Json $client (Api-Script $conn $data) }
-                '/api/script-results' { Send-Json $client (Api-ScriptResults $conn $data) }
+                '/api/script'  { if ($data.session) { Send-Json $client (Api-TxRun $conn $data 'script') } else { Send-Json $client (Api-Script $conn $data) } }
+                '/api/script-results' { if ($data.session) { Send-Json $client (Api-TxRun $conn $data 'script-results') } else { Send-Json $client (Api-ScriptResults $conn $data) } }
                 '/api/rowop'   { Send-Json $client (Api-RowOp $conn $data) }
                 '/api/export'  { Send-Json $client (Api-Export $conn $data) }
                 '/api/import'  { Send-Json $client (Api-Import $conn $data) }
@@ -10336,6 +11029,10 @@ while ($run) {
     elseif (((Get-Date) - $SharedState.LastPing).TotalSeconds -gt 21600) { $run = $false }
 }
 
+# Tabs still holding a transaction: their mysql.exe is ended, and the server rolls back.
+foreach ($k in @($script:TxSessions.Keys)) { $ts = $null; if ($script:TxSessions.TryRemove($k, [ref]$ts)) { Stop-TxSession $ts } }
+# And the SSH tunnels, which would otherwise outlive the app.
+foreach ($k in @($script:Tunnels.Keys)) { $tt = $null; if ($script:Tunnels.TryRemove($k, [ref]$tt)) { try { if (-not $tt.Process.HasExited) { $tt.Process.Kill() } } catch {} } }
 # Drain any in-flight requests before shutting down.
 foreach ($item in $InFlight) {
     try { $item.handle.AsyncWaitHandle.WaitOne(2000) | Out-Null; $item.ps.EndInvoke($item.handle) } catch {}

@@ -46,18 +46,27 @@ Requires Windows PowerShell 5.1 or later.
 - Connections with saved profiles, a per-connection accent colour and
   environment label, and a **read-only / safe mode** to protect production
   servers.
+- SSH tunnels through the system's OpenSSH client (key or agent authentication;
+  host aliases and ProxyJump from ~/.ssh/config work too).
 - Browse schemas, tables, views, procedures, functions, triggers and events,
   with quick filtering and search across all schemas.
-- Tabbed SQL editor with syntax highlighting, autocomplete, query formatting,
-  and run-whole-script or run-selection. A procedure call, or a script with
+- Tabbed SQL editor with syntax highlighting, autocomplete that knows the tables
+  and aliases of the statement, find and replace (Ctrl+F / Ctrl+H), query
+  formatting, and run-whole-script or run-selection. A procedure call, or a script with
   several SELECTs, shows each result in a tab of its own.
 - Result grids with per-column filtering and sorting, column resize and
   show/hide, and a row-detail form view for wide tables.
 - Inline and full-row editing staged as pending changes and applied in a single
-  transaction; add and delete rows.
-- Export tables or query results to CSV or INSERT statements; CSV import.
+  transaction; add and delete rows. Typing with several cells picked writes the
+  value into all of them.
+- Manual transactions: with Auto-commit off a tab keeps one transaction open
+  across its runs until Commit or Rollback. Commit also saves grid edits
+  not applied yet; Rollback discards them.
+- Export tables or query results to CSV, INSERT statements, Excel, JSON or
+  Markdown; CSV import.
 - Table designer, DDL view and edit, users and privileges, table maintenance,
-  ER diagrams, server process list, and a reusable query library.
+  ER diagrams, server process list, and a reusable query library
+  (a query can be saved to it straight from the history).
 
 ## Keeping data exact
 

@@ -1067,6 +1067,58 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
             Remove-Item $cnf -Force -ErrorAction SilentlyContinue
         }
     }
+
+    # --- a tab with auto-commit off keeps its transaction between runs --------------------------
+    # Each run is its own HTTP request, and the transaction has to outlive every one of them until
+    # Commit or Rollback - while nobody else sees what it has not committed.
+    Api '/api/script' @{ conn = $conn; db = 'nobs_test'; sql = 'DROP TABLE IF EXISTS tx_tab; CREATE TABLE tx_tab (id INT PRIMARY KEY, v VARCHAR(10)); INSERT INTO tx_tab VALUES (1,''a'')' } | Out-Null
+    # The block above redefines Sql and Scalar around a file it has deleted; this one reads through
+    # the API, which is the other connection the checks need.
+    function Peek($q) { $r = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; sql = $q }; if ($r.ok -and $r.rows.Count) { return [string]$r.rows[0][0] }; return "($($r.error))" }
+    $sess = 'tx_live_' + [Guid]::NewGuid().ToString('N')
+    try {
+        $w = Api '/api/script' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = "UPDATE tx_tab SET v='b' WHERE id=1; INSERT INTO tx_tab VALUES (2,'c')" }
+        Check ($w.ok -eq $true) 'a script runs in the tab''s transaction' ($w | ConvertTo-Json -Compress)
+        $inside = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = 'SELECT id, v FROM tx_tab ORDER BY id' }
+        Check (($inside.rows | ForEach-Object { $_ -join ':' }) -join ',' -eq '1:b,2:c') 'the next run sees what the tab has not committed' ($inside | ConvertTo-Json -Compress)
+        $other = Peek 'SELECT GROUP_CONCAT(v ORDER BY id) FROM tx_tab'
+        Check ($other -eq 'a') 'another connection does not see it' "saw '$other'"
+        $bad = Api '/api/script' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = "INSERT INTO tx_tab VALUES (3,'d'); INSERT INTO tx_tab VALUES (1,'dup'); INSERT INTO tx_tab VALUES (4,'e')" }
+        Check ((-not $bad.ok) -and $bad.error -match 'Statement 2 of 3 failed') 'a script stops at its first error and says which statement' ($bad | ConvertTo-Json -Compress)
+        $after = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = 'SELECT GROUP_CONCAT(id ORDER BY id) FROM tx_tab' }
+        Check ([string]$after.rows[0][0] -eq '1,2,3') 'the transaction is still open after the error, with the statement before it' ($after | ConvertTo-Json -Compress)
+        $grid = Api '/api/script' @{ conn = $conn; db = 'nobs_test'; session = $sess; transaction = $true; sql = "UPDATE tx_tab SET v='g' WHERE id=2 LIMIT 1;`nINSERT INTO tx_tab VALUES (1,'dup');" }
+        $g = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = 'SELECT v FROM tx_tab WHERE id=2' }
+        Check ((-not $grid.ok) -and [string]$g.rows[0][0] -eq 'c') 'a failed grid save is undone on its own, not the whole transaction' "$($grid.error) / v=$($g.rows[0][0])"
+        $rb = Api '/api/session-end' @{ conn = $conn; session = $sess; action = 'rollback' }
+        Check ($rb.ok -eq $true -and (Peek 'SELECT COUNT(*) FROM tx_tab') -eq '1') 'Rollback throws it all away' ($rb | ConvertTo-Json -Compress)
+        Api '/api/script' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = "UPDATE tx_tab SET v='z' WHERE id=1" } | Out-Null
+        $cm = Api '/api/session-end' @{ conn = $conn; session = $sess; action = 'commit' }
+        Check ($cm.ok -eq $true -and (Peek 'SELECT v FROM tx_tab WHERE id=1') -eq 'z') 'Commit makes it permanent' ($cm | ConvertTo-Json -Compress)
+        Api '/api/script' @{ conn = $conn; db = 'nobs_test'; session = $sess; sql = "UPDATE tx_tab SET v='lost' WHERE id=1" } | Out-Null
+        Api '/api/session-end' @{ conn = $conn; session = $sess; action = 'close' } | Out-Null
+        Start-Sleep -Milliseconds 500
+        Check ((Peek 'SELECT v FROM tx_tab WHERE id=1') -eq 'z') 'closing the tab rolls back what it had not committed'
+    } finally {
+        Api '/api/session-end' @{ conn = $conn; session = $sess; action = 'close' } | Out-Null
+        Api '/api/script' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.tx_tab' } | Out-Null
+    }
+
+    # --- an SSH tunnel that cannot be opened says why -------------------------------------------
+    # There is no SSH server to tunnel through here; what can be pinned is that a tunnel which does
+    # not come up gives ssh's own reason instead of a bare connection failure, and that "verify",
+    # which cannot check a host name through a tunnel, is refused with the way out.
+    function Said($c) {
+        $body = @{ token = $token; conn = $c } | ConvertTo-Json -Depth 5 -Compress
+        try { return (Invoke-WebRequest -Uri "$base/api/connect" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 90 -UseBasicParsing).Content }
+        catch { return [string]$_.ErrorDetails.Message }
+    }
+    $viaNothing = $conn.Clone(); $viaNothing.sshHost = '127.0.0.1'; $viaNothing.sshPort = '1'; $viaNothing.sshUser = 'nobody'
+    $said = Said $viaNothing
+    Check ($said -match 'Could not establish SSH tunnel to 127\.0\.0\.1: .*(?i:refused)') 'an SSH tunnel that cannot open says why' $said
+    $verify = $conn.Clone(); $verify.sshHost = 'bastion.invalid'; $verify.ssl = 'verify'
+    $said = Said $verify
+    Check ($said -match 'verify-ca') 'SSL "verify" through a tunnel is refused, naming verify-ca' $said
 }
 finally {
     if ($token -and $base) {

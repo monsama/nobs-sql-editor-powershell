@@ -159,6 +159,11 @@ jobs:
         shell: pwsh
         run: ./tests/GridSave.Tests.ps1 ./NOBSSQL.ps1
 
+      # Autocomplete context, and the JSON and Excel exports of a result.
+      - name: Run editor tools tests
+        shell: pwsh
+        run: ./tests/EditorTools.Tests.ps1 ./NOBSSQL.ps1
+
       # Fitting a column to its contents measures the values, not the rows that happen to be drawn.
       - name: Run column fit tests
         shell: pwsh

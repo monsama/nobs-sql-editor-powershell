@@ -21,6 +21,7 @@ pwsh -NoProfile -File tests/ToolChoice.Tests.ps1         ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UpdateCheck.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/TableBinding.Tests.ps1       ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/GridSave.Tests.ps1           ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/EditorTools.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/Live.Tests.ps1               ./NOBSSQL.ps1
 ```
 
@@ -45,6 +46,7 @@ All but the last need nothing set up. `Live` needs a database. CI runs all of th
 | `UpdateCheck` | the new-version notice: shown when newer, quiet when hidden, switched off or offline | `node` on PATH |
 | `TableBinding` | which database and table a result grid saves to (after a leading `USE`, or with another schema selected), and control characters shown in text | `node` on PATH |
 | `GridSave` | how saving grid edits finds each row: a guard before every change, FLOAT and TIMESTAMP keys, a missing key column | `node` on PATH |
+| `EditorTools` | autocomplete's reading of the statement (tables, aliases, qualifiers), and the JSON and Excel exports | `node` on PATH |
 | `ToolChoice` | which client tools a MariaDB or a MySQL server gets, the options file written for them, reading MySQL's download page and a tool's version, release version comparison, the options file for Compare's UTC sessions, the column definitions schema sync writes, and that every script-level value a request reads reaches the request threads | nothing |
 | `Live` | the running server, against a real database | `NOBS_TEST_DSN` |
 
@@ -53,7 +55,7 @@ cannot lift their subject out with the PowerShell AST. They extract it by brace-
 under `node`, which the `windows-latest` CI image already ships. If `node` is missing they **fail**
 rather than skipping.
 
-`ConnSslCa`, `TableDesigner`, `DdlRecreate`, `UpdateCheck`, `TableBinding` and `GridSave` embed the very same test files the Tauri edition
+`ConnSslCa`, `TableDesigner`, `DdlRecreate`, `UpdateCheck`, `TableBinding`, `GridSave` and `EditorTools` embed the very same test files the Tauri edition
 runs (`tests/ui/*.test.mjs` in nobs-sql-editor), pointed at this file through `NOBS_UI_SOURCE`.
 They are generated from those files - regenerate rather than edit them by hand.
 

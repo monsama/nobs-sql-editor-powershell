@@ -1,15 +1,14 @@
 # NOBS SQL Editor - PowerShell edition
 
-A MySQL / MariaDB client that runs as a **single PowerShell script**. It starts
-a tiny local HTTP server (127.0.0.1 only, no admin rights), shells out to the
-`mysql` / `mysqldump` command-line tools, and opens its UI in your default
-browser.
+A MySQL and MariaDB client in a single PowerShell script. It starts a small web
+server that listens only on 127.0.0.1, opens the interface in your browser, and runs
+your queries through the `mysql` / `mysqldump` command-line tools. No installation and
+no admin rights needed.
 
-This is the same application as
-[nobs-sql-editor](https://github.com/monsama/nobs-sql-editor), which packages
-the same UI as a native desktop app using [Tauri](https://tauri.app). Use this
-edition when you want zero installation, or a machine where you cannot install
-software.
+It is the same application as
+[nobs-sql-editor](https://github.com/monsama/nobs-sql-editor), which ships the same
+interface as a native desktop app built with [Tauri](https://tauri.app). Use this
+edition on machines where you can't, or would rather not, install anything.
 
 ## Running
 

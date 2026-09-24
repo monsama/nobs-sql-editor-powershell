@@ -31,7 +31,7 @@ function extractFunction(src, name) {
 
 const src = readFileSync(process.argv[2], 'utf8');
 const NAMES = ['strLit', 'lit', 'newUser', 'dropUser', 'grantUser', 'revokeUser', 'lockUser',
-  'uRef', 'uName', 'uKey', 'authPlugins', 'identifiedBy', 'acctExpiry', 'acctSettingFields', 'acctSettingSql', 'logNoSecrets'];
+  'uRef', 'uName', 'uKey', 'authPlugins', 'identifiedBy', 'acctExpiry', 'acctSettingFields', 'acctSettingSql', 'logNoSecrets', 'srvSince', 'acctHasExpiry', 'acctHasLock'];
 const bundle = NAMES.map(n => extractFunction(src, n)).join('\n');
 
 function harness({ dialog = {}, selected = null } = {}) {

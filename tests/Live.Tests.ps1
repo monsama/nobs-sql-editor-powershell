@@ -10,10 +10,10 @@
 # Load the fixture first (it lives in the sibling nobs-sql-editor repo, which shares this UI):
 #   mysql -u root -p < tests/fixtures/seed.sql
 #
-# Not run in CI: windows-latest has no database, and GitHub's service containers are Linux-only
-# while this app targets Windows. Without NOBS_TEST_DSN this script says so and exits 0 - but it
-# says so LOUDLY, because a test that quietly reports success for work it never did is worse than
-# no test at all.
+# CI starts its servers on the Windows runner itself (nobs-sql-editor's tests/ci scripts): the
+# current MariaDB and MySQL in test.yml, MySQL 5.7, MariaDB 10.2 and MySQL 9.4 in compat.yml.
+# Without NOBS_TEST_DSN this script says so and exits 0 - but it says so LOUDLY, because a test
+# that quietly reports success for work it never did is worse than no test at all.
 
 param([Parameter(Mandatory)][string]$ScriptPath)
 
@@ -97,6 +97,22 @@ try {
         exit 1
     }
 
+    # What the server supports. The compatibility suite (the desktop repo's compat.yml) runs these
+    # against MySQL 5.7 and MariaDB 10.2 as well; a check uses what the server has and leaves out
+    # only what it cannot have. Only a server that says outright it has no TLS counts as without.
+    $verText = Scalar 'SELECT VERSION()'
+    $srvMaria = $verText -match 'MariaDB'
+    $srvVer = [version]($verText -replace '^(\d+\.\d+\.\d+).*$', '$1')
+    function Since([string]$mysql, [string]$maria) { $srvVer -ge [version]$(if ($srvMaria) { $maria } else { $mysql }) }
+    $hasSsl = Sql "SHOW VARIABLES LIKE 'have_ssl'"
+    $caps = @{
+        check = Since '8.0.16' '10.2.1'; invisible = Since '8.0.23' '10.3.3'; cte = Since '8.0.1' '10.2.1'
+        roles = Since '8.0.0' '10.0.5'; lock = Since '5.7.6' '10.4.2'
+        tls = -not ($hasSsl.ok -and $hasSsl.rows.Count -and [string]$hasSsl.rows[0][1] -eq 'DISABLED')
+    }
+    $inv = if ($caps.invisible) { ' INVISIBLE' } else { '' }
+    "  (server $verText; without: $(@($caps.Keys | Where-Object { -not $caps[$_] } | Sort-Object) -join ', '))"
+
     # --- 1. the keepalive ping must require the token ------------------------------------------
     # LastPing drives the idle shutdown. While this was unauthenticated, any page the user had
     # open could hold the server - and the live database connections it owns - open forever.
@@ -138,8 +154,8 @@ try {
         'SHOW TABLES'
         'EXPLAIN SELECT * FROM bulk_rows'
         'SET autocommit = 0'
-        'WITH x AS (SELECT 1 AS n) SELECT * FROM x'
-    )
+        $(if ($caps.cte) { 'WITH x AS (SELECT 1 AS n) SELECT * FROM x' })
+    ) | Where-Object { $_ }
     foreach ($s in $reads) {
         $r = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; ro = $true; sql = $s }
         if (-not $r.ok) { $wrong += $s }
@@ -151,7 +167,7 @@ try {
     Check (-not $ro1.ok) 'read-only refuses /api/rowop server-side' ($ro1 | ConvertTo-Json -Compress)
     $ro2 = Api '/api/script' @{ conn = $conn; ro = $true; db = 'nobs_test'; transaction = $true; sql = "UPDATE nobs_test.ro_canary SET note='hacked' WHERE id=1 LIMIT 1;" }
     Check (-not $ro2.ok) 'read-only refuses a staged grid apply (/api/script)' ($ro2 | ConvertTo-Json -Compress)
-    $intact = Scalar "SELECT CONCAT(COUNT(*),'/',SUM(label LIKE 'untouched%')) FROM ro_canary" 'nobs_test'
+    $intact = Scalar "SELECT CAST(CONCAT(COUNT(*),'/',SUM(label LIKE 'untouched%')) AS CHAR) FROM ro_canary" 'nobs_test'
     Check ($intact -eq '3/3') 'canary is untouched after all of that' "got $intact"
 
     # --- 3. a staged batch is all-or-nothing ---------------------------------------------------
@@ -168,7 +184,8 @@ try {
     # test run (in this repo or the sibling one) may have left something else, and what matters is
     # only that the value does not MOVE while a batch fails.
     $baseDescr = Scalar "SELECT descr FROM txn_child WHERE code='AAA'" 'nobs_test'
-    foreach ($case in $cases) {
+    # MySQL 5.7 reads a CHECK constraint and ignores it.
+    foreach ($case in @($cases | Where-Object { $caps.check -or $_.n -ne 'CHECK' })) {
         $batch = "UPDATE nobs_test.txn_child SET descr='SHOULD-ROLL-BACK' WHERE code='AAA' LIMIT 1;`n" + $case.sql
         $r = Api '/api/script' @{ conn = $conn; db = 'nobs_test'; transaction = $true; sql = $batch }
         $descr = Scalar "SELECT descr FROM txn_child WHERE code='AAA'" 'nobs_test'
@@ -336,7 +353,7 @@ try {
     Api '/api/exec' @{ conn = $conn; sql = 'CREATE TABLE nobs_test.csv_live_rt (id INT PRIMARY KEY, note VARCHAR(32) NULL, tag VARCHAR(32))' } | Out-Null
     $imp = Api '/api/importcsv' @{ conn = $conn; db = 'nobs_test'; table = 'csv_live_rt'; file = $csv1; hasHeader = $true; nullValue = '\N' }
     Check ($imp.ok -eq $true) 'CSV import succeeds' ($imp | ConvertTo-Json -Compress)
-    $shape = Scalar "SELECT CONCAT(SUM(id=1 AND note IS NULL), '/', SUM(id=2 AND note='' AND note IS NOT NULL)) FROM csv_live_rt" 'nobs_test'
+    $shape = Scalar "SELECT CAST(CONCAT(SUM(id=1 AND note IS NULL), '/', SUM(id=2 AND note='' AND note IS NOT NULL)) AS CHAR) FROM csv_live_rt" 'nobs_test'
     Check ($shape -eq '1/1') 'the marker becomes NULL and a blank field stays an empty string' "got $shape (want 1/1)"
 
     # With an empty marker, a blank cell is meant to mean NULL instead.
@@ -378,7 +395,7 @@ try {
     # extra fields and switched foreign key checks off. Generated columns (which the desktop
     # edition's CSV export includes) cannot be given a value, so they are skipped and named.
     foreach ($s in @('DROP TABLE IF EXISTS nobs_test.csv_x_child', 'DROP TABLE IF EXISTS nobs_test.csv_x_parent', 'DROP TABLE IF EXISTS nobs_test.csv_x',
-                     'CREATE TABLE nobs_test.csv_x (id INT PRIMARY KEY, a INT, secret VARCHAR(10) INVISIBLE, g INT GENERATED ALWAYS AS (a * 2) VIRTUAL)',
+                     "CREATE TABLE nobs_test.csv_x (id INT PRIMARY KEY, a INT, secret VARCHAR(10)$inv, g INT GENERATED ALWAYS AS (a * 2) VIRTUAL)",
                      'CREATE TABLE nobs_test.csv_x_parent (id INT PRIMARY KEY)',
                      'CREATE TABLE nobs_test.csv_x_child (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES nobs_test.csv_x_parent (id))')) {
         $sr = Api '/api/exec' @{ conn = $conn; sql = $s }; if (-not $sr.ok) { "  note  setup: $($sr.error)" }
@@ -627,9 +644,9 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     Check ($se.ok -and -not (@($se.log) -match '^FAILED') -and $names -eq "$ss.a_orders.sql,$ss.b_filler.sql,$ss.c_lines.sql,$ss.v_orders.sql,$ss.x_y.sql,$ss.x_y_2.sql") 'a per-table export writes one file per table and view, two for look-alike names' "$names $($se | ConvertTo-Json -Compress)"
     $order = @('a_orders', 'b_filler', 'c_lines', 'x_y', 'x_y_2', 'v_orders') | ForEach-Object { Join-Path $snapDir "$ss.$_.sql" }
     $si = Api '/api/import' @{ conn = $conn; files = $order; targetDb = $st }
-    $shape = Scalar ("SELECT CONCAT((SELECT COUNT(*) FROM $st.a_orders), '/', (SELECT COUNT(*) FROM $st.c_lines), '/', " +
+    $shape = Scalar ("SELECT CAST(CONCAT((SELECT COUNT(*) FROM $st.a_orders), '/', (SELECT COUNT(*) FROM $st.c_lines), '/', " +
                      "(SELECT COUNT(*) FROM $st.a_orders o LEFT JOIN $st.c_lines l ON l.order_id = o.id WHERE l.id IS NULL) + (SELECT COUNT(*) FROM $st.c_lines l LEFT JOIN $st.a_orders o ON o.id = l.order_id WHERE o.id IS NULL), '/', " +
-                     "(SELECT COUNT(*) FROM $st.``x y``) + (SELECT COUNT(*) FROM $st.x_y))")
+                     "(SELECT COUNT(*) FROM $st.``x y``) + (SELECT COUNT(*) FROM $st.x_y)) AS CHAR)")
     $parts = "$shape" -split '/'
     Check ($si.ok -and $parts.Count -eq 4 -and [int]$parts[0] -gt 0 -and $parts[0] -eq $parts[1] -and $parts[2] -eq '0' -and $parts[3] -eq '2') "its files restore to one moment: every order with its line ($shape of $written written)" ($si | ConvertTo-Json -Compress)
     Remove-Item $snapDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -775,7 +792,7 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     $fs = "nobs_live_fk_src_$PID"; $ft = "nobs_live_fk_tgt_$PID"; $fn = "nobs_live_fk_$PID"
     $cn = $fn
     Api '/api/conn-save' @{ name = $fn; conn = $conn; accent = '#3b82f6'; env = 'test'; readonly = $false; savepw = $true } | Out-Null
-    $fdef = '(k FLOAT PRIMARY KEY, a INT, secret VARCHAR(10) INVISIBLE, g INT GENERATED ALWAYS AS (a * 2) STORED)'
+    $fdef = "(k FLOAT PRIMARY KEY, a INT, secret VARCHAR(10)$inv, g INT GENERATED ALWAYS AS (a * 2) STORED)"
     foreach ($s in @("DROP DATABASE IF EXISTS $fs", "DROP DATABASE IF EXISTS $ft", "CREATE DATABASE $fs", "CREATE DATABASE $ft",
                      "CREATE TABLE $fs.t $fdef", "CREATE TABLE $ft.t $fdef",
                      "INSERT INTO $fs.t (k, a, secret) VALUES (1.1, 5, 's1'), (0.3, 6, 's3')",
@@ -1040,7 +1057,7 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
         $cnf = Join-Path $env:TEMP ("livetx-" + [Guid]::NewGuid().ToString('N') + ".cnf")
         # Same plugin-dir the app's own New-Cnf writes - without it this helper cannot authenticate
         # to a MySQL 8 server at all, since caching_sha2_password is a client-side plugin.
-        $body = "[client]`nhost=$($conn.host)`nport=$($conn.port)`nuser=$($conn.user)`npassword=$($conn.password)"
+        $body = "[client]`nhost=$($conn.host)`nport=$($conn.port)`nuser=$($conn.user)`npassword=$($conn.password)`nloose-skip-ssl-verify-server-cert"
         $plugDir = Join-Path (Split-Path -Parent $mysql) 'plugin'
         if (Test-Path $plugDir) { $body += "`nplugin-dir=$($plugDir -replace '\\','\\')" }
         $body | Set-Content -NoNewline -Encoding ascii $cnf
@@ -1159,10 +1176,13 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     }
     try {
         XferClean
-        $setup = Api '/api/script' @{ conn = $conn; sql = (@("CREATE ROLE $role", "GRANT SELECT ON nobs_test.* TO $role",
-            "CREATE USER 'nobs_xfer_plain'@'%' IDENTIFIED BY 'Plain-pw-1'", "GRANT INSERT ON nobs_test.* TO 'nobs_xfer_plain'@'%'",
-            "GRANT $role TO 'nobs_xfer_plain'@'%'", $(if ($isMaria) { "SET DEFAULT ROLE $role FOR 'nobs_xfer_plain'@'%'" } else { "SET DEFAULT ROLE $role TO 'nobs_xfer_plain'@'%'" }),
-            "CREATE USER 'nobs_xfer_cols'@'localhost' IDENTIFIED BY 'Cols-pw-2' WITH MAX_QUERIES_PER_HOUR 100 ACCOUNT LOCK",
+        # A server without roles (MySQL 5.7) still transfers its accounts; ACCOUNT LOCK is MariaDB 10.4's.
+        $roleSql = if ($caps.roles) { @("CREATE ROLE $role", "GRANT SELECT ON nobs_test.* TO $role") } else { @() }
+        $roleGrant = if ($caps.roles) { @("GRANT $role TO 'nobs_xfer_plain'@'%'", $(if ($isMaria) { "SET DEFAULT ROLE $role FOR 'nobs_xfer_plain'@'%'" } else { "SET DEFAULT ROLE $role TO 'nobs_xfer_plain'@'%'" })) } else { @() }
+        $lock = if ($caps.lock) { ' ACCOUNT LOCK' } else { '' }
+        $setup = Api '/api/script' @{ conn = $conn; sql = (@($roleSql) + @(
+            "CREATE USER 'nobs_xfer_plain'@'%' IDENTIFIED BY 'Plain-pw-1'", "GRANT INSERT ON nobs_test.* TO 'nobs_xfer_plain'@'%'") + @($roleGrant) + @(
+            "CREATE USER 'nobs_xfer_cols'@'localhost' IDENTIFIED BY 'Cols-pw-2' WITH MAX_QUERIES_PER_HOUR 100$lock",
             "GRANT SELECT (id) ON nobs_test.ro_canary TO 'nobs_xfer_cols'@'localhost' WITH GRANT OPTION") -join ";`n") }
         Check ($setup.ok) 'transfer: the test accounts are made' ($setup | ConvertTo-Json -Compress)
         $xBefore = XferSnap

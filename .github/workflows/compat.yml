@@ -1,0 +1,95 @@
+name: compat
+
+# The live suite and the GUI scenarios against servers the main suite (test.yml: current MariaDB
+# and MySQL) does not cover: MySQL 5.7, MariaDB 10.2, and MySQL 9.4 with lower_case_table_names=2.
+# The setup scripts, the fixture and the scenarios live in nobs-sql-editor, whose compat.yml runs
+# the same servers against the desktop edition (and PAM, which needs Linux). What these found in
+# this edition, each fixed and checked here:
+#   - MySQL 5.7: MySQL 8.4's mysql.exe asked for utf8mb4 with a collation 5.7 does not know, 5.7
+#     fell back to latin1, and every character latin1 cannot hold came back as "?".
+#   - MariaDB 10.2: Create user offered password expiry the server does not have; Clone copied no
+#     grants from the 'user'@'host' form 10.2 and 5.7 write.
+#   - MySQL 9.4: a VECTOR column came through mysql.exe as raw bytes with its zero bytes as spaces.
+# Checks use what each server has and leave out only what it cannot have ($caps in
+# tests/Live.Tests.ps1, G.caps in the scenarios).
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  # Weekly as well: the old server archives live on the vendors' archive sites, and a moved file
+  # should be noticed before a change needs this. Monday morning, after test.yml's run.
+  schedule:
+    - cron: '47 6 * * 1'
+  workflow_dispatch: {}
+
+jobs:
+  old-and-new-servers:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: mysql57
+            spec: 'mysql57:mysql:5.7.44:3357'
+          - name: maria102
+            spec: 'maria102:mariadb:10.2.7:3102'
+          - name: mysql94-lctn2
+            spec: 'mysql94:mysql:9.4.0:3394:lctn2'
+    name: ${{ matrix.name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out nobs-sql-editor (setup scripts, fixture, scenarios)
+        uses: actions/checkout@v7
+        with:
+          repository: monsama/nobs-sql-editor
+          path: editor
+
+      - name: Cache server downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            C:\nobs-ci\cache
+            C:\nobs-compat\cache
+          key: nobs-compat-${{ matrix.name }}-${{ hashFiles('editor/tests/ci/start-test-servers.ps1', 'editor/tests/ci/start-compat-servers.ps1') }}
+
+      # Current MariaDB and MySQL, for their client tools, where the app looks for them - the tools
+      # a user of this app has, against the server under test.
+      - name: Client tools (and the main suite's servers)
+        shell: pwsh
+        run: ./editor/tests/ci/start-test-servers.ps1
+
+      - name: Start ${{ matrix.name }}
+        shell: pwsh
+        run: ./editor/tests/ci/start-compat-servers.ps1 -Servers '${{ matrix.spec }}'
+
+      - name: Live tests
+        shell: pwsh
+        run: |
+          $env:NOBS_TEST_DSN = $env:NOBS_COMPAT_DSN
+          ./tests/Live.Tests.ps1 ./NOBSSQL.ps1
+
+      - name: Install Node
+        if: ${{ !cancelled() }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: GUI tests
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $env:NOBS_TEST_DSN = $env:NOBS_COMPAT_DSN
+          # Exit 3: the run never reached a scenario (see test.yml), so trying again hides nothing.
+          node editor/tests/gui/run.mjs --app ps --target ./NOBSSQL.ps1
+          if ($LASTEXITCODE -eq 3) {
+            "  the app never started - trying once more (exit 3)"
+            node editor/tests/gui/run.mjs --app ps --target ./NOBSSQL.ps1
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Server log
+        if: ${{ failure() }}
+        shell: pwsh
+        run: Get-ChildItem C:\nobs-compat -Recurse -Filter *.err | ForEach-Object { "== $($_.FullName)"; Get-Content $_.FullName -Tail 60 }

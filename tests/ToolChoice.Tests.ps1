@@ -98,7 +98,12 @@ try {
         $b1 = Get-Content -Raw $f1; $b2 = Get-Content -Raw $f2
         Check ($b1 -match 'ssl-mode=REQUIRED' -and $b1 -notmatch 'plugin-dir') "for MySQL's tool: MySQL's SSL option, no plugin folder" $b1
         Check ($b2 -match '(?m)^ssl\s*$' -and $b2 -match 'plugin-dir') 'for the default client: MariaDB''s option and our plugins' $b2
-        Check ($b1 -notmatch '\[mysql\]|init-command') 'an ordinary connection keeps the server''s time zone' $b1
+        Check ($b1 -notmatch '\[mysql\]|time_zone') 'an ordinary connection keeps the server''s time zone' $b1
+        # MySQL 8's client asks for utf8mb4 with a collation 5.7 does not know, and 5.7 falls back to latin1.
+        Check ($b1 -match '(?m)^loose-init-command=SET NAMES utf8mb4\s*$') 'MySQL''s tool says SET NAMES itself' $b1
+        Check ($b2 -notmatch 'init-command') 'MariaDB''s asks in a way every server knows' $b2
+        # A PAM password goes as typed, so MySQL's client may send it only over TLS (ssl=required here).
+        Check ($b1 -match '(?m)^loose-enable-cleartext-plugin\s*$') 'MySQL''s tool may answer PAM on an encrypted connection' $b1
     } finally { Remove-Item $f1, $f2 -Force -ErrorAction SilentlyContinue }
     # Compare's connections run in UTC, set only for mysql.exe: mysqldump reads the same file and
     # rejects options it does not know.
@@ -106,7 +111,7 @@ try {
     $f3 = New-Cnf $utc -Tool $theirs
     try {
         $b3 = Get-Content -Raw $f3
-        Check ($b3 -match "(?s)\[client\].*ssl-mode=REQUIRED.*\r?\n\[mysql\]\r?\ninit-command=`"SET time_zone='\+00:00'`"") 'a Compare connection sets UTC in the [mysql] group, after the client options' $b3
+        Check ($b3 -match "(?s)\[client\].*ssl-mode=REQUIRED.*\r?\n\[mysql\]\r?\ninit-command=`"SET NAMES utf8mb4; SET time_zone='\+00:00'`"") 'a Compare connection sets UTC in the [mysql] group, after the client options, keeping SET NAMES' $b3
     } finally { Remove-Item $f3 -Force -ErrorAction SilentlyContinue }
     $script:MysqldumpPath = $ours
     $script:DumpIsMariaDB = @{ Path = $ours; Maria = $true }

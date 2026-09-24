@@ -131,6 +131,17 @@ Check ($out[0][2] -ceq 'A B') 'a column that only shares the name keeps its own 
 Check ($out[0][3] -ceq "é${nul}z") 'non-ASCII text too' (Show $out[0][3])
 Check ($out[1][0] -ceq 'a b' -and $null -eq $out[1][3]) 'a row without NULs is unchanged, NULL included'
 Check ($out[2][0] -ceq "c${nul}" -and $out[2][3] -ceq '') 'as is a value that is already right'
+
+# A VECTOR comes as 0x-hex every time and replaces what its bytes were printed as: [0,1] is
+# 00 00 00 00 00 00 80 3F, printed with the zeros as spaces.
+$vm = Get-ExactTextMap @('id', 'e', '__nobs_exact_0') @('e')
+$vrows = New-Object 'System.Collections.Generic.List[string[]]'
+$printed = [NobsXmlRows]::Cell([Text.Encoding]::GetEncoding(28591).GetString([byte[]](32, 32, 32, 32, 32, 32, 0x80, 0x3F)))
+$vrows.Add([string[]]@('1', $printed, '0x000000000000803F'))
+$vrows.Add([string[]]@('2', '12 spaces', '0x000000000000803F'))
+$vout = [NobsXmlRows]::Exact($vrows, $vm.keep, $vm.targets)
+Check ($vout[0][1] -ceq '0x000000000000803F') 'a VECTOR shows as its exact bytes' (Show $vout[0][1])
+Check ($vout[1][1] -ceq '12 spaces') 'but only in place of what those bytes were printed as' (Show $vout[1][1])
 ''
 
 "-- a whole-database dump split into one file per table (the per-table export) --"

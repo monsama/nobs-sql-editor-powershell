@@ -414,13 +414,25 @@ function New-Cnf {
     foreach ($l in (Get-SslLines $conn.ssl $maria $conn.sslCa)) { [void]$sb.AppendLine($l) }
     $pluginDir = Get-PluginDir $Tool
     if ($pluginDir) { [void]$sb.AppendLine("plugin-dir=$((Get-CnfSafe $pluginDir) -replace '\\','\\')") }
+    # MySQL's own client from 8.0 on asks for utf8mb4 as utf8mb4_0900_ai_ci, a collation MySQL 5.7
+    # (and MariaDB) does not have, and such a server quietly falls back to its own default - latin1
+    # on a stock 5.7 - so every character latin1 cannot hold came back as "?", in the grid and in a
+    # data-only dump alike. SET NAMES on connecting takes the server's own collation, on any server.
+    # "loose-" because 5.7's mysqldump has no init-command (and asks in a way 5.7 understands).
+    $names = if ($maria -eq $false) { "SET NAMES $(if ($browseCs) { $browseCs } else { 'utf8mb4' })" } else { $null }
+    if ($names) { [void]$sb.AppendLine("loose-init-command=$names") }
+    # A PAM or LDAP account wants its password as typed. MySQL's client sends it only when told to,
+    # and it is told only on a connection that is encrypted. (MariaDB's sends it when asked, and
+    # answers PAM's dialog plugin as well.)
+    if ($maria -eq $false -and $conn.ssl -in 'required', 'verify', 'verify-ca') { [void]$sb.AppendLine('loose-enable-cleartext-plugin') }
     # Only mysql.exe reads [mysql]; mysqldump shares this file and would reject the option. It
     # writes TIMESTAMP values in UTC on its own (--tz-utc). Set for Compare's connections.
     # A browsing connection is refused by the SERVER, not only by the gate in front of these
     # endpoints - a write from it would be interpreted in that session's charset and stored as
     # different bytes than the ones on screen. Only one init-command is read, so the time zone
-    # (Compare's connections) and this share the statement when both are wanted.
+    # (Compare's connections), this and the SET NAMES above share the statement when wanted.
     $initParts = @()
+    if ($names -and ($conn.utc -or $browseCs)) { $initParts += $names }
     if ($conn.utc) { $initParts += "SET time_zone='+00:00'" }
     if ($browseCs) { $initParts += 'SET SESSION TRANSACTION READ ONLY' }
     if ($initParts.Count) {
@@ -585,7 +597,7 @@ function SqlValFor { param($x, [bool]$Binary)
 # types - checked against both clients). $null if the table cannot be read.
 function Get-BinaryColumnSet { param($conn,$db,$table)
     Get-ColumnSetOf $conn $db $table @('binary','varbinary','tinyblob','blob','mediumblob','longblob','bit',
-             'geometry','point','linestring','polygon','multipoint','multilinestring','multipolygon','geometrycollection','geomcollection')
+             'geometry','point','linestring','polygon','multipoint','multilinestring','multipolygon','geometrycollection','geomcollection','vector')
 }
 # A FLOAT is read as rounded text (1.1 is stored as 1.10000002384), and that text compared to the
 # column matches nothing - so rows keyed by one could not be fetched or updated by their key. Such
@@ -2101,6 +2113,8 @@ function Api-Export { param($conn,$data)
         $stamp = if($data.stamp){ '_'+(Get-Date -Format 'yyyyMMdd_HHmmss') } else { '' }
         # Flags shared by EVERY mysqldump call in this run (per-table-safe: no database-level flags here).
         $common=@("--defaults-extra-file=$cnf","--default-character-set=$($o.charset)")
+        # The chosen character set replaces the options file's SET NAMES utf8mb4 (see New-Cnf).
+        if (-not (Test-ClientIsMariaDB $dump) -and "$($o.charset)" -match '^\w+$') { $common += "--loose-init-command=SET NAMES $($o.charset)" }
         if($o.singletx){$common+='--single-transaction'}; if($o.quick){$common+='--quick'}; if($o.hexblob){$common+='--hex-blob'}
         if($o.triggers){$common+='--triggers'}else{$common+='--skip-triggers'}
         if($o.diskeys){$common+='--disable-keys'}; if($o.notablespaces){$common+='--no-tablespaces'}; if($o.colstats){$common+='--column-statistics=0'}
@@ -2569,6 +2583,16 @@ public sealed class NobsXmlRows {
             for (int i = 0; i < targets.Length && keep + i < row.Length; i++) {
                 string hex = row[keep + i];
                 if (hex == null) continue;
+                // A VECTOR, asked for as 0x-hex: it replaces what its bytes were shown as, with each
+                // zero byte turned into a space as the client prints it.
+                if (hex.StartsWith("0x")) {
+                    var vb = new byte[(hex.Length - 2) / 2];
+                    for (int k = 0; k < vb.Length; k++) vb[k] = Convert.ToByte(hex.Substring(2 + k * 2, 2), 16);
+                    for (int k = 0; k < vb.Length; k++) if (vb[k] == 0) vb[k] = 0x20;
+                    string was = Cell(Latin1.GetString(vb));
+                    foreach (int j in targets[i]) if (o[j] == was) o[j] = hex;
+                    continue;
+                }
                 var b = new byte[hex.Length / 2];
                 for (int k = 0; k < b.Length; k++) b[k] = Convert.ToByte(hex.Substring(k * 2, 2), 16);
                 string exact = Encoding.UTF8.GetString(b);
@@ -2811,8 +2835,10 @@ public static class NobsDumpDb {
     }
     public static void CopyRenamed(string path, Stream dst, string from, string to) { CopyForClient(path, dst, from, to, false); }
     // As CopyRenamed (from null: nothing renamed), and with skipSandbox the first line is left out
-    // when it is mariadb-dump's "/*M!999999\- enable the sandbox mode */", which MySQL's client
-    // does not know - a MariaDB dump restored with it failed at line 1 ("Unknown command '\-'").
+    // when it is mariadb-dump's "/*M!999999\- enable the sandbox mode */", which neither MySQL's
+    // client nor an older MariaDB one (10.2) knows - a dump restored with it failed at line 1
+    // ("Unknown command '\-'"). The line only asks the client to refuse shell commands, and the
+    // Windows client has none (\!), so it is left out for every client.
     public static void CopyForClient(string path, Stream dst, string from, string to, bool skipSandbox) {
         byte[] sandbox = Encoding.ASCII.GetBytes("/*M!999999\\- enable the sandbox mode */");
         using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16)) {
@@ -2971,11 +2997,12 @@ function Get-DumpPlan { param([string[]]$Names, [string]$Target)
 
 # The warnings mysql printed with --show-warnings, less the ones about the dump's own spelling that
 # change no data: deprecated syntax (1287), the utf8/utf8mb3 and NATIONAL aliases (3719, 3720, 3778),
-# the integer display width (1681), and a value given for a generated column (1906), which the
-# server computes again anyway. A dump sets a non-strict sql_mode, so a value too long for its
-# column was cut with a warning, and the import was logged as a plain OK.
+# the integer display width (1681), a value given for a generated column (1906), which the
+# server computes again anyway, and MySQL 5.7's note that NO_AUTO_CREATE_USER is deprecated (3090),
+# raised by every 5.7 dump's sql_mode. A dump sets a non-strict sql_mode, so a value too long for
+# its column was cut with a warning, and the import was logged as a plain OK.
 function Get-ImportWarnings { param([string]$out)
-    $harmless = '1287','1681','1906','3719','3720','3778'
+    $harmless = '1287','1681','1906','3090','3719','3720','3778'
     foreach ($l in ($out -split "`r?`n")) { $t = $l.Trim(); if ($t -match '^Warning \(Code (\d+)\)' -and $harmless -notcontains $Matches[1]) { $t } }
 }
 # Whether a dump file is a view's: mysqldump heads a view's section "Temporary view structure for
@@ -3020,19 +3047,21 @@ function Api-Import { param($conn,$data)
             # own, separate default (16M) - without a matching bump here, re-importing a dump
             # exported with a larger packet size fails with "MySQL server has gone away".
             $maxPacket = ([string]$data.maxpacket).Trim()
-            $a=@("--defaults-extra-file=$cnf","--show-warnings"); if($data.force){$a+='--force'}; if($binMode){$a+='--binary-mode'}; if($maxPacket){$a+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a+=$target}
+            # Replaces the options file's init-command, so it repeats its SET NAMES (see New-Cnf).
+            $fkNames = $(if (Test-ClientIsMariaDB $mysql) { '' } else { 'SET NAMES utf8mb4; ' }) + 'SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'
+            $a=@("--defaults-extra-file=$cnf","--show-warnings"); if($data.force){$a+='--force'}; if($binMode){$a+='--binary-mode'}; if($maxPacket){$a+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a+="--init-command=$fkNames"}; if($target){$a+=$target}
             $short = [IO.Path]::GetFileName($f)
             Initialize-DumpDb
             $plan = Get-DumpPlan ([NobsDumpDb]::Names($f)) $target
             if ($plan.Kind -eq 'Refuse') { [void]$log.Add("SKIPPED $short : "+$plan.Why); continue }
             $rename = $null
             if ($plan.Kind -eq 'Rename') { $rename = @{ From = $plan.From; To = $target }; [void]$log.Add("$short holds database '$($plan.From)' - restoring it into '$target' instead") }
-            $skipSb = (-not (Test-ClientIsMariaDB $mysql))
+            $skipSb = $true
             $r=Run-Stdin $mysql $a $null $f $jobId -Rename $rename -Warnings -SkipSandbox:$skipSb
             if($job.Cancelled){ [void]$log.Add("CANCELLED"); break }
             $autoRetried = $false
             if ($r.exit -ne 0 -and -not $binMode -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
-                $a2=@("--defaults-extra-file=$cnf","--binary-mode","--show-warnings"); if($data.force){$a2+='--force'}; if($maxPacket){$a2+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a2+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a2+=$target}
+                $a2=@("--defaults-extra-file=$cnf","--binary-mode","--show-warnings"); if($data.force){$a2+='--force'}; if($maxPacket){$a2+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a2+="--init-command=$fkNames"}; if($target){$a2+=$target}
                 $r=Run-Stdin $mysql $a2 $null $f $jobId -Rename $rename -Warnings -SkipSandbox:$skipSb
                 $autoRetried = $true
             }
@@ -3129,7 +3158,7 @@ function Api-ImportCsv { param($conn,$data)
     # binary/BIT column can be filled from its own hex display - it's not meant for an ordinary
     # text column that merely happens to contain a value that LOOKS like hex ("0xFF", a hash, an
     # ID). Only the columns information_schema actually reports as binary/BIT get that treatment.
-    $binTypes=@('binary','varbinary','blob','tinyblob','mediumblob','longblob','bit')
+    $binTypes=@('binary','varbinary','blob','tinyblob','mediumblob','longblob','bit','vector')
     $binCols=@($cr.rows | Where-Object { $binTypes -contains ([string]$_[1]).ToLower() } | ForEach-Object { $_[0] })
     # Read with numbered columns, one more than the header has, so a row's field count shows: a
     # missing field comes back $null (an empty one is ''), and anything in the extra column is a
@@ -5774,7 +5803,7 @@ function lit(v){if(v===null)return 'NULL';const s=String(v);if(/^0x[0-9A-Fa-f]+$
 // Which of a grid's columns hold binary values - the ones shown as 0x... The Tauri build reads that
 // from the result set itself; the PowerShell one asks information_schema, which needs a table.
 // null when neither can tell, and the caller then falls back to lit(), which goes by the value.
-const BIN_COL_TYPE=/^(binary|varbinary|tinyblob|blob|mediumblob|longblob|bit|geometry|point|linestring|polygon|multipoint|multilinestring|multipolygon|geometrycollection|geomcollection)\b/i;
+const BIN_COL_TYPE=/^(binary|varbinary|tinyblob|blob|mediumblob|longblob|bit|geometry|point|linestring|polygon|multipoint|multilinestring|multipolygon|geometrycollection|geomcollection|vector)\b/i;
 async function tableBinCols(db,table,cols){
  try{
   const r=await api('/api/query',{sql:"SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+strLit(db)+" AND TABLE_NAME="+strLit(table)});
@@ -5915,17 +5944,24 @@ function topLevelFromAt(sql){
 // column of the table as hex wherever the value holds a NUL, and the server puts the exact value
 // back (Get-ExactTextMap). q is the SQL to send, ending with lastStmt. Returns the SQL to send and
 // the text columns asked for, or null when that cannot be done - the grid is then not exact.
+// A VECTOR (MySQL 9) is the same story in bytes: MySQL's client prints it as it is rather than as
+// hex, zero bytes as spaces, so it is asked for as 0x-hex every time and put back whole.
 async function exactTextQuery(q,lastStmt,bind){
  const last=String(lastStmt).trim().replace(/;+\s*$/,'');
  if(!q.endsWith(last))return null;
  const at=topLevelFromAt(last);
  if(at<0)return null;
- const cols=await tableTextCols(bind.db,bind.table);
- if(!cols)return null;
- if(!cols.length)return {sql:q,cols:[]};
+ const cols=await tableTextCols(bind.db,bind.table),vec=await tableVectorCols(bind.db,bind.table);
+ if(!cols||!vec)return null;
+ if(!cols.length&&!vec.length)return {sql:q,cols:[]};
  const conv=c=>'CONVERT('+qid(c)+' USING utf8mb4)';
- const extra=cols.map((c,i)=>', IF(LOCATE(0x00, CAST('+conv(c)+' AS BINARY)) > 0, HEX('+conv(c)+'), NULL) AS '+qid('__nobs_exact_'+i)).join('');
- return {sql:q.slice(0,q.length-last.length)+last.slice(0,at)+extra+' '+last.slice(at),cols};
+ const extra=cols.map((c,i)=>', IF(LOCATE(0x00, CAST('+conv(c)+' AS BINARY)) > 0, HEX('+conv(c)+'), NULL) AS '+qid('__nobs_exact_'+i)).join('')
+  +vec.map((c,i)=>', CONCAT(\'0x\', HEX('+qid(c)+')) AS '+qid('__nobs_exact_'+(cols.length+i))).join('');
+ return {sql:q.slice(0,q.length-last.length)+last.slice(0,at)+extra+' '+last.slice(at),cols:cols.concat(vec)};
+}
+async function tableVectorCols(db,table){
+ const r=await api('/api/query',{sql:"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+strLit(db)+" AND TABLE_NAME="+strLit(table)+" AND DATA_TYPE = 'vector' ORDER BY ORDINAL_POSITION"});
+ return r.ok?r.rows.map(x=>x[0]):null;
 }
 async function refuseNulTextExport(db,table){
  const n=await tableNulTextCount(db,table);
@@ -6607,6 +6643,7 @@ async function connect() {window._connFormTouched=true;
   }
   log('  Connected: ' + r.version + ' (' + (r.mariadb ? 'MariaDB' : 'MySQL') + ')');
   window.mariadb = !!r.mariadb;
+  window.serverVersion = r.version || '';
   document.body.classList.remove('disconnected');
   document.body.classList.remove('show-connform');
   // The box to the left already shows a saved connection's name, so the chip beside it is the
@@ -6658,7 +6695,7 @@ async function disconnectAsk(){const running=tabs.filter(t=>t.runningReqId),dirt
   if(!(await ask('Disconnect with '+what.join(' and ')+'? The edits stay in their tabs; the running queries are stopped'+(open.length?'; what was not committed is rolled back':'')+'.')))return;
   await Promise.all(running.map(t=>cancelQuery(t.id)));}
  disconnect();}
-function disconnect(){tabs.forEach(t=>{if(t.txOn||t.txSession){txClose(t);t.txOn=false;txPaint(t.id);}});window.mariadb=false;document.body.classList.add('disconnected');window._activeConn=null;window._activeReadOnly=false;$('schemas').innerHTML='';clearObjectsPanel();applyAccent('');const _cs=$('connStatus');if(_cs){_cs.textContent='';_cs.className='chip off dotonly';_cs.title='Not connected';}window.curAccent='';window.readOnly=false;window.curEnv='';
+function disconnect(){tabs.forEach(t=>{if(t.txOn||t.txSession){txClose(t);t.txOn=false;txPaint(t.id);}});window.mariadb=false;window.serverVersion='';document.body.classList.add('disconnected');window._activeConn=null;window._activeReadOnly=false;$('schemas').innerHTML='';clearObjectsPanel();applyAccent('');const _cs=$('connStatus');if(_cs){_cs.textContent='';_cs.className='chip off dotonly';_cs.title='Not connected';}window.curAccent='';window.readOnly=false;window.curEnv='';
  // Re-preview the still-selected connection's env chip rather than hard-hiding it, same as the
  // password icon (never touched here) already does - "Not connected" shouldn't also erase what
  // you were just looking at in the dropdown.
@@ -10661,7 +10698,7 @@ async function openUsers(){if(!(await usersLoad()))return;$('userFilter').value=
 function usersButtons(){const a=window._selAcct;['uPrivBtn','uRolesBtn','uDropBtn','uAcctBtn'].forEach(id=>{const b=$(id);if(b)b.disabled=!a||(id==='uAcctBtn'&&a.role);});
  const ab=$('uAcctBtn');if(ab)ab.title=a&&a.role?'A role does not sign in, so it has no account settings':'Sign-in method, SSL, expiry and limits; password; lock';}
 function usersNewMenu(e){e.stopPropagation();const b=e.currentTarget.getBoundingClientRect();const a=window._selAcct;
- menu(b.left,b.bottom+2,[['Create user...',()=>newUser()],['Create role...',()=>roleCreate()],a&&!a.role&&'-',a&&!a.role&&['Clone '+uName(a)+'...',()=>acctClone()]]);}
+ menu(b.left,b.bottom+2,[['Create user...',()=>newUser()],_uRoleSupport&&['Create role...',()=>roleCreate()],a&&!a.role&&'-',a&&!a.role&&['Clone '+uName(a)+'...',()=>acctClone()]]);}
 function usersAcctMenu(e){e.stopPropagation();const b=e.currentTarget.getBoundingClientRect();const a=window._selAcct;if(!a||a.role)return;
  menu(b.left,b.bottom+2,[['Settings...',()=>acctEdit()],['Change password...',()=>changePassword()],'-',a.locked?['Unlock - allow sign-in again',()=>lockUser(false)]:['Lock - stop it signing in',()=>lockUser(true)]]);}
 function usersRender(){usersButtons();const box=$('userSel'),q=($('userFilter').value||'').trim().toLowerCase();box.innerHTML='';
@@ -10780,13 +10817,21 @@ async function authPlugins(){const r=await api('/api/query',{sql:"SELECT PLUGIN_
 // with WITH ... BY. No plugin means the server's default.
 function identifiedBy(plugin,pw){if(!plugin)return 'IDENTIFIED BY '+strLit(pw);
  return window.mariadb?'IDENTIFIED VIA '+plugin+' USING PASSWORD('+strLit(pw)+')':'IDENTIFIED WITH '+plugin+' BY '+strLit(pw);}
+// Whether the connected server is at least this version - MySQL's number or MariaDB's. A version
+// that cannot be read counts as new enough, so nothing is taken away on a guess.
+function srvSince(my,ma){const m=String(window.serverVersion||'').match(/^(\d+)\.(\d+)\.(\d+)/);if(!m)return true;
+ const n=m.slice(1).map(Number),w=window.mariadb?ma:my;for(let i=0;i<3;i++)if(n[i]!==w[i])return n[i]>w[i];return true;}
+// Password expiry per account came with MySQL 5.7.4 and MariaDB 10.4.3, locking with 5.7.6 and 10.4.2.
+// Offered on an older server, Create user made the account and then failed on the next statement.
+function acctHasExpiry(){return srvSince([5,7,4],[10,4,3]);}
+function acctHasLock(){return srvSince([5,7,6],[10,4,2]);}
 function acctExpiry(a){return !a||a.lifetime==null?'default':a.lifetime===0?'never':'days';}
 function acctSettingFields(a,group){return [
  // An account that requires a particular certificate (ISSUER, SUBJECT or CIPHER) keeps that as its
  // own choice; it used to show as "SSL not required", one change away from being written so.
  {key:'ssl',label:'Connection security',type:'select',options:[{value:'NONE',label:'SSL not required'},{value:'ANY',label:'SSL required'},{value:'X509',label:'SSL with a client certificate required'},...(a&&a.ssl==='SPECIFIED'?[{value:'SPECIFIED',label:'A specific client certificate required (kept as it is)'}]:[])],value:a&&['X509','ANY','SPECIFIED'].includes(a.ssl)?a.ssl:'NONE',group},
- {key:'exp',label:'Password expiry',type:'select',options:[{value:'default',label:'Server default'},{value:'never',label:'Never expires'},{value:'days',label:'Expires after the days below'}],value:acctExpiry(a),group},
- {key:'days',label:'Days until the password expires',value:a&&a.lifetime>0?String(a.lifetime):'90',group},
+ ...(acctHasExpiry()?[{key:'exp',label:'Password expiry',type:'select',options:[{value:'default',label:'Server default'},{value:'never',label:'Never expires'},{value:'days',label:'Expires after the days below'}],value:acctExpiry(a),group},
+ {key:'days',label:'Days until the password expires',value:a&&a.lifetime>0?String(a.lifetime):'90',group}]:[]),
  {key:'mq',label:'Queries an hour (0 = no limit)',value:String(a?a.mq:0),group},
  {key:'mu',label:'Updates an hour (0 = no limit)',value:String(a?a.mu:0),group},
  {key:'mc',label:'Connections an hour (0 = no limit)',value:String(a?a.mc:0),group},
@@ -10797,7 +10842,7 @@ function acctSettingSql(who,res,a){const out=[],n=k=>Math.max(0,parseInt(res[k],
  const lim=[['MAX_QUERIES_PER_HOUR','mq'],['MAX_UPDATES_PER_HOUR','mu'],['MAX_CONNECTIONS_PER_HOUR','mc'],['MAX_USER_CONNECTIONS','muc']].filter(([,k])=>n(k)!==(a?a[k]:0));
  if(lim.length)out.push('ALTER USER '+who+' WITH '+lim.map(([s,k])=>s+' '+n(k)).join(' ')+';');
  const days=Math.max(1,n('days'));
- if(res.exp!==acctExpiry(a)||(res.exp==='days'&&a&&a.lifetime!==days))
+ if(acctHasExpiry()&&'exp' in res&&(res.exp!==acctExpiry(a)||(res.exp==='days'&&a&&a.lifetime!==days)))
   out.push('ALTER USER '+who+' '+(res.exp==='never'?'PASSWORD EXPIRE NEVER':res.exp==='days'?'PASSWORD EXPIRE INTERVAL '+days+' DAY':'PASSWORD EXPIRE DEFAULT')+';');
  return out;}
 // Statements that carry a password are logged without it.
@@ -10805,7 +10850,7 @@ function logNoSecrets(s){log(s.replace(/(BY|PASSWORD\()\s*'(?:[^'\\]|\\.|'')*'/g
 async function newUser(){const plugins=await authPlugins();
  const res=await inputBox({title:'Create user',okText:'Create',width:'520px',fields:[{key:'user',label:'User name'},{key:'host',label:'Host - % for anywhere',value:'%'},{key:'pw',label:'Password',type:'password'},
   {key:'plugin',label:'Sign-in method',type:'select',options:[{value:'',label:'Server default'},...plugins.map(p=>({value:p,label:p}))],value:''},
-  {key:'more',label:'More settings: connection security, password expiry, limits',type:'checkbox',value:false,reveals:'more'},...acctSettingFields(null,'more')]});
+  {key:'more',label:'More settings: connection security, '+(acctHasExpiry()?'password expiry, ':'')+'limits',type:'checkbox',value:false,reveals:'more'},...acctSettingFields(null,'more')]});
  if(!res||!res.user.trim())return;const u=res.user.trim(),h=res.host.trim()||'%',who=strLit(u)+'@'+strLit(h);
  const s=['CREATE USER '+who+' '+identifiedBy(res.plugin,res.pw)+';',...(res.more?acctSettingSql(who,res,null):[])];
  const r=await api('/api/script',{sql:s.join('\n')});if(!r.ok){toast(r.error,true);return;}
@@ -10816,12 +10861,12 @@ async function acctEdit(){const a=window._selAcct;if(!a){toast('Select an accoun
  const res=await inputBox({title:'Account settings of '+uName(a),okText:'Apply',width:'520px',fields:[
   {key:'plugin',label:'Sign-in method - to change it, give a password as well',type:'select',options:plugins.map(p=>({value:p,label:p})),value:a.plugin},
   {key:'pw',label:'New password - only to change it, or the sign-in method',type:'password',value:''},
-  ...acctSettingFields(a),{key:'locked',label:'Locked - cannot sign in',type:'checkbox',value:a.locked}]});
+  ...acctSettingFields(a),...(acctHasLock()?[{key:'locked',label:'Locked - cannot sign in',type:'checkbox',value:a.locked}]:[])]});
  if(!res)return;const who=uRef(a),out=acctSettingSql(who,res,a);
  // MariaDB's IDENTIFIED BY switches the account to its default plugin, so the plugin is always named there.
  if(res.pw)out.unshift('ALTER USER '+who+' '+identifiedBy(res.plugin!==a.plugin||window.mariadb?res.plugin:'',res.pw)+';');
  else if(res.plugin!==a.plugin){toast('Changing the sign-in method needs the password as well.',true);return;}
- if(res.locked!==a.locked)out.push('ALTER USER '+who+' ACCOUNT '+(res.locked?'LOCK':'UNLOCK')+';');
+ if('locked' in res&&res.locked!==a.locked)out.push('ALTER USER '+who+' ACCOUNT '+(res.locked?'LOCK':'UNLOCK')+';');
  if(!out.length){toast('Nothing to change.');return;}
  const r=await api('/api/script',{sql:out.join('\n')});if(!r.ok){toast(r.error,true);return;}
  logNoSecrets(out.join('\n'));toast('Account settings changed.','ok');await usersReloadKeep();}
@@ -10830,8 +10875,11 @@ async function acctEdit(){const a=window._selAcct;if(!a){toast('Select an accoun
 // A new account like the selected one: its sign-in method, settings, grants and roles, with a name,
 // host and password of its own. The grants are the source's SHOW GRANTS with the new name put in;
 // MariaDB writes the source's password into its GRANT USAGE line, and that part is left out.
-function cloneGrantSql(lines,a,u,h){const bq=s=>'`'+String(s).replace(/`/g,'``')+'`',src=bq(a.u)+'@'+bq(a.h),dst=bq(u)+'@'+bq(h);
- return lines.map(s=>{for(const kw of [' TO ',' FOR ']){const i=s.lastIndexOf(kw+src);if(i>=0){const t=s.slice(0,i)+kw+dst+s.slice(i+kw.length+src.length);
+// The account is written as MySQL 8 and MariaDB 10.3+ write it, `u`@`h`, or as MySQL 5.7 ('u' with
+// \' inside) and MariaDB 10.2 ('u' as it is) do - a clone there used to come out with no grants.
+function cloneGrantSql(lines,a,u,h){const bq=s=>'`'+String(s).replace(/`/g,'``')+'`',dst=bq(u)+'@'+bq(h);
+ const forms=[bq,s=>"'"+String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'")+"'",s=>"'"+s+"'"],srcs=forms.map(f=>f(a.u)+'@'+f(a.h));
+ return lines.map(s=>{for(const src of srcs)for(const kw of [' TO ',' FOR ']){const i=s.lastIndexOf(kw+src);if(i>=0){const t=s.slice(0,i)+kw+dst+s.slice(i+kw.length+src.length);
    return t.replace(/\s+IDENTIFIED\s+(BY\s+PASSWORD\s+'[^']*'|VIA\s+.*?)(?=\s+(WITH|REQUIRE)\b|$)/i,'')+';';}}return null;}).filter(Boolean);}
 // REQUIRE ISSUER/SUBJECT/CIPHER as the account has it. A clone used to get no requirement at all -
 // weaker than the account it was made from - since SHOW GRANTS on MySQL 8 does not carry it.

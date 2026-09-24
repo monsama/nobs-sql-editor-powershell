@@ -957,7 +957,7 @@ function Get-ExactTextMap { param([string[]]$Names, [string[]]$ExactText)
 function Read-CursorRows {
     param($cursorObj, [int]$PageSize)
     try {
-        $rows = $cursorObj.Rows.Page($PageSize)
+        $rows = $cursorObj.Rows.Page($PageSize, 33554432)
         return @{ rows=$rows; hasMore=$cursorObj.Rows.More }
     } catch {
         $cursorObj.ParseError = "Could not read the result from mysql.exe: " + (Get-InnerMessage $_)
@@ -2445,12 +2445,18 @@ public sealed class NobsXmlRows {
         return NextCore();
     }
     // Up to n rows; More says whether another one follows (it is held back for the next call).
-    public List<string[]> Page(int n) {
+    public List<string[]> Page(int n) { return Page(n, long.MaxValue); }
+    // A page that also ends once its rows hold maxChars characters - at least one row, however
+    // large. A table of large BLOBs sent a thousand of them at once, hex-encoded, and the answer
+    // alone ran to gigabytes; the rest arrives as the grid scrolls.
+    public List<string[]> Page(int n, long maxChars) {
         var list = new List<string[]>();
-        while (list.Count < n) {
+        long chars = 0;
+        while (list.Count < n && chars < maxChars) {
             var row = Next();
             if (row == null) { More = false; return list; }
             list.Add(row);
+            foreach (var v in row) if (v != null) chars += v.Length;
         }
         var peek = Next();
         More = peek != null;
@@ -3806,9 +3812,59 @@ function ColDefinition { param($col, $defs)
 }
 # Compares every table in $srcCols/$tgtCols and returns an array of table-diff objects:
 # {name, status, sql:[{stmt,checked,kind}]} - status is one of missing_target/missing_source/diff/same.
-function Compare-TableSets { param($srcConn,$srcDb,$srcCols,$tgtCols,$RequestId)
+# The table's keys and constraints as the server writes them in SHOW CREATE TABLE: kind (pk, index,
+# fk, check), name and line.
+function Get-KeyLines { param([string]$Create)
+    $out = New-Object System.Collections.ArrayList
+    foreach ($raw in ($Create -split "`r?`n")) {
+        $l = $raw.Trim().TrimEnd(',')
+        $kind = $null; $rest = $null
+        if ($l -match '^(?i)PRIMARY KEY') { [void]$out.Add([pscustomobject]@{ kind='pk'; name='PRIMARY'; line=$l }); continue }
+        if ($l -match '^(?i)(UNIQUE KEY|FULLTEXT KEY|SPATIAL KEY|KEY)\s+(.*)$') { $kind = 'index'; $rest = $Matches[2] }
+        elseif ($l -match '^(?i)CONSTRAINT\s+(.*)$') { $rest = $Matches[1]; $kind = if ($l -match '(?i) FOREIGN KEY ') { 'fk' } elseif ($l -match '(?i) CHECK ?\(') { 'check' } else { $null } }
+        if (-not $kind -or -not $rest -or -not $rest.StartsWith('`')) { continue }
+        $sb = New-Object System.Text.StringBuilder; $i = 1; $closed = $false
+        while ($i -lt $rest.Length) { $ch = $rest[$i]; if ($ch -eq '`') { if ($i + 1 -lt $rest.Length -and $rest[$i+1] -eq '`') { [void]$sb.Append('`'); $i += 2; continue }; $closed = $true; break }; [void]$sb.Append($ch); $i++ }
+        if ($closed) { [void]$out.Add([pscustomobject]@{ kind=$kind; name=$sb.ToString(); line=$l }) }
+    }
+    return ,$out
+}
+# The statements that bring the target's keys and constraints to the source's: what is missing is
+# added, what differs is dropped and added again, and what only the target has is offered as a drop,
+# not ticked - as with columns. Foreign keys go last among the additions and are dropped first.
+function Get-KeyDiffs { param([string]$t, [string]$SrcCreate, [string]$TgtCreate)
+    $src = Get-KeyLines $SrcCreate; $tgt = Get-KeyLines $TgtCreate
+    $find = { param($list, $k, $n) foreach ($x in $list) { if ($x.kind -eq $k -and $x.name -ceq $n) { return $x } }; return $null }
+    $drop = { param($k, $n) switch ($k) { 'pk' { 'DROP PRIMARY KEY' } 'index' { 'DROP INDEX ' + (SqlId $n) } 'fk' { 'DROP FOREIGN KEY ' + (SqlId $n) } default { 'DROP CONSTRAINT ' + (SqlId $n) } } }
+    $first = @(); $adds = @(); $fks = @(); $drops = @()
+    foreach ($x in $src) {
+        $y = & $find $tgt $x.kind $x.name
+        if ($null -eq $y) {
+            $st = [pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' ADD '+$x.line+';'); checked=$true; kind='add_key' }
+            if ($x.kind -eq 'fk') { $fks += $st } else { $adds += $st }
+        } elseif ($y.line -cne $x.line) {
+            if ($x.kind -eq 'fk' -or $x.kind -eq 'check') {
+                $first += [pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' '+(& $drop $x.kind $x.name)+';'); checked=$true; kind='modify_key' }
+                $st = [pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' ADD '+$x.line+';'); checked=$true; kind='modify_key' }
+                if ($x.kind -eq 'fk') { $fks += $st } else { $adds += $st }
+            } else {
+                $adds += [pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' '+(& $drop $x.kind $x.name)+', ADD '+$x.line+';'); checked=$true; kind='modify_key' }
+            }
+        }
+    }
+    $only = @($tgt | Where-Object { $null -eq (& $find $src $_.kind $_.name) } | Sort-Object { if ($_.kind -eq 'fk') { 0 } else { 1 } })
+    foreach ($x in $only) { $drops += [pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' '+(& $drop $x.kind $x.name)+';'); checked=$false; kind='drop_key' } }
+    return @($first + $adds + $fks + $drops)
+}
+function Compare-TableSets { param($srcConn,$srcDb,$srcCols,$tgtCols,$RequestId,$tgtConn,$tgtDb)
     $names = @{}
     foreach($k in $srcCols.Keys){ $names[$k]=$true }; foreach($k in $tgtCols.Keys){ $names[$k]=$true }
+    # Keys, foreign keys and CHECK constraints are compared from both sides' CREATE TABLE, fetched
+    # together for every table the two have in common; they were not compared at all, so a table
+    # whose only difference was a missing index or foreign key showed as the same.
+    $common = @($srcCols.Keys | Where-Object { $tgtCols.Contains($_) })
+    $srcDdl = @{}; $tgtDdl = @{}
+    if ($tgtConn -and $common.Count) { $srcDdl = Get-CreateTableSqlBatch $srcConn $srcDb $common $RequestId; $tgtDdl = Get-CreateTableSqlBatch $tgtConn $tgtDb $common $RequestId }
     $out = New-Object System.Collections.ArrayList
     $cancelled = $false
     # Two-phase: classify every table first WITHOUT fetching DDL (fast), collecting the names of
@@ -3861,6 +3917,7 @@ function Compare-TableSets { param($srcConn,$srcDb,$srcCols,$tgtCols,$RequestId)
                 [void]$diffs.Add([pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' DROP COLUMN '+(SqlId $c.name)+';'); checked=$false; kind='drop_column' })
             }
         }
+        if ($srcDdl.ContainsKey($t) -and $tgtDdl.ContainsKey($t)) { foreach ($kd in (Get-KeyDiffs $t $srcDdl[$t] $tgtDdl[$t])) { [void]$diffs.Add($kd) } }
         if($diffs.Count -eq 0){ [void]$out.Add([pscustomobject]@{ name=$t; status='same'; sql=@() }) }
         else { [void]$out.Add([pscustomobject]@{ name=$t; status='diff'; sql=@($diffs) }) }
     }
@@ -4453,7 +4510,7 @@ function Api-CompareSchemas { param($data)
         $srcCols=$srcCols2; $tgtCols=$tgtCols2
     }
     $rid = [string]$data.requestId
-    $cmpResult = Compare-TableSets $src $srcDb $srcCols $tgtCols $rid
+    $cmpResult = Compare-TableSets $src $srcDb $srcCols $tgtCols $rid -tgtConn $tgt -tgtDb $tgtDb
     if($rid){ $null = $script:CancelledCompares.TryRemove($rid, [ref]$null) }
     $tj = New-Object System.Collections.ArrayList
     foreach($t in $cmpResult.tables){
@@ -5791,6 +5848,8 @@ function keyWhere(t,ri,bc,types){
 // Stops the batch - which runs as one transaction - unless where matches exactly one row: none when
 // the row was changed or deleted since it was read, or its key cannot be matched; more when the key
 // is ambiguous. Both servers refuse to put two rows into a variable (error 1172).
+// The same check for several rows at once: the batch stops unless every where matches exactly one.
+function oneRowGuardMany(tbl,wheres){return 'SELECT 1 FROM (SELECT 1 AS x UNION ALL SELECT 2) nobs_guard WHERE '+wheres.map(w=>'(SELECT COUNT(*) FROM '+tbl+' WHERE '+w+') <> 1').join(' OR ')+' INTO @nobs_one_row;';}
 function oneRowGuard(tbl,where){return 'SELECT 1 FROM (SELECT 1 AS x UNION ALL SELECT 2) nobs_guard WHERE (SELECT COUNT(*) FROM '+tbl+' WHERE '+where+') <> 1 INTO @nobs_one_row;';}
 const ONE_ROW_REFUSED='Nothing was saved. A row you changed or deleted no longer matches exactly one row in the table: it may have been changed or deleted since it was loaded, or its key cannot be matched exactly (a FLOAT key shown rounded, or a TIMESTAMP key in the hour the clocks go back). Reload the table and try again.';
 async function tableColTypes(db,table){
@@ -5896,7 +5955,10 @@ let allDbsSeq=0,allDbsTimer=null;
 function setAllDbsBtn(){const b=$('allSchemasBtn');if(!b)return;b.classList.toggle('on',!!allDbs);b.title=allDbs?'Back to '+(objData?objData.db:'the selected schema')+' only':'Search this name across all schemas';}
 function toggleAllDbs(){if(allDbs){leaveAllDbs();renderObjects();return;}allDbs={term:'',items:null};setAllDbsBtn();searchAllSchemas();$('objFilter').focus();}
 function leaveAllDbs(){if(!allDbs)return;allDbs=null;allDbsSeq++;clearTimeout(allDbsTimer);setAllDbsBtn();}
-function objFilterInput(){if(!allDbs){renderObjects();return;}clearTimeout(allDbsTimer);allDbsTimer=setTimeout(searchAllSchemas,300);}
+// A schema with thousands of objects rebuilt its whole list on every key typed; it waits for a pause.
+let objFilterTimer=null;
+function objFilterInput(){if(!allDbs){const r=objData&&objData.r,n=r?['tables','views','procedures','functions','triggers','events'].reduce((a,k)=>a+((r[k]||[]).length),0):0;
+  if(n<2000){renderObjects();return;}clearTimeout(objFilterTimer);objFilterTimer=setTimeout(renderObjects,150);return;}clearTimeout(allDbsTimer);allDbsTimer=setTimeout(searchAllSchemas,300);}
 async function searchAllSchemas(){
   if(!allDbs)return;
   const term=($('objFilter').value||'').trim();const seq=++allDbsSeq;
@@ -6850,9 +6912,14 @@ function renderObjects(){if(allDbs){renderAllDbs();return;}const box=$('objects'
  }
  const groups=[['Tables',r.tables,'table'],['Views',r.views,'view'],['Procedures',r.procedures,'procedure'],['Functions',r.functions,'function'],['Triggers',r.triggers,'trigger'],['Events',r.events,'event']];
  groups.forEach(([label,items,type])=>{if(!tf.has(type))return;const fil=(items||[]).filter(n=>!f||n.toLowerCase().includes(f));if(!fil.length)return;if(!objGroupHdr(box,type,label+' ('+fil.length+(f?'/'+items.length:'')+')',folded.has(type)))return;
-  fil.forEach(n=>{const d=document.createElement('div');d.className='item';d.title=n;if(type==='table'&&objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
+  // At most OBJ_CAP of a kind are drawn; the rest are counted, and the filter finds them. Ten
+  // thousand rows in the sidebar made opening and filtering a large schema hang.
+  const more=fil.length-OBJ_CAP;
+  fil.slice(0,OBJ_CAP).forEach(n=>{const d=document.createElement('div');d.className='item';d.title=n;if(type==='table'&&objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
    d.onclick=()=>{[...box.querySelectorAll('.item')].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');objOpen(db,type,n);};
-   d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,type,n);};box.appendChild(d);});});}
+   d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,type,n);};box.appendChild(d);});
+  if(more>0){const m=document.createElement('div');m.className='muted';m.style.cssText='padding:4px 10px;font-size:11px';m.textContent=fmtCount(more)+' more - type in the filter above to find them';box.appendChild(m);}});}
+const OBJ_CAP=2000;
 // The columns of the schema, table by table: every name for plain suggestions, and each table's own
 // for a name typed after its alias. Other schemas are read the first time a query reaches into one.
 async function buildColHints(db){acTableCols={};acPend={};const d=await acLoadSchema(db);
@@ -9616,9 +9683,20 @@ async function applyChanges(id,preview){if(roBlock())return;const t=T(id);const 
  // updates grouped by row
  const kt=await tableColTypes(t.db,t.table);let noKey=false;
  const byRow={};Object.keys(t.pending.upd).forEach(k=>{const[ri,ci]=k.split(':').map(Number);(byRow[ri]=byRow[ri]||{})[ci]=t.pending.upd[k];});
+ // Every change was checked and made with a statement of its own - two round trips each, so
+ // deleting 10,000 picked rows over a slow link took minutes with the rows locked throughout. The
+ // checks now go 200 to a statement, and so do deletes; each update still has its own values.
+ // Deletes come after the updates, so a row that was both edited and deleted is checked as it is
+ // by then. One change is written exactly as before.
+ const updWh=[],updSql=[],delWh=[];
  Object.keys(byRow).forEach(ri=>{ri=+ri;const sets=Object.keys(byRow[ri]).map(ci=>qid(t.cols[ci])+'='+litAs(byRow[ri][ci],bc?bc[ci]:null));
-   const wh=keyWhere(t,ri,bc,kt);if(wh==null){noKey=true;return;}S.push(oneRowGuard(tbl,wh));S.push('UPDATE '+tbl+' SET '+sets.join(',')+' WHERE '+wh+' LIMIT 1;');});
- t.pending.del.forEach(ri=>{const wh=keyWhere(t,ri,bc,kt);if(wh==null){noKey=true;return;}S.push(oneRowGuard(tbl,wh));S.push('DELETE FROM '+tbl+' WHERE '+wh+' LIMIT 1;');});
+   const wh=keyWhere(t,ri,bc,kt);if(wh==null){noKey=true;return;}updWh.push(wh);updSql.push('UPDATE '+tbl+' SET '+sets.join(',')+' WHERE '+wh+' LIMIT 1;');});
+ t.pending.del.forEach(ri=>{const wh=keyWhere(t,ri,bc,kt);if(wh==null){noKey=true;return;}delWh.push(wh);});
+ const chunks=(a,n)=>{const out=[];for(let i=0;i<a.length;i+=n)out.push(a.slice(i,i+n));return out;};
+ if(updWh.length===1){S.push(oneRowGuard(tbl,updWh[0]));S.push(updSql[0]);}
+ else if(updWh.length){chunks(updWh,200).forEach(c=>S.push(oneRowGuardMany(tbl,c)));S.push(...updSql);}
+ if(delWh.length===1){S.push(oneRowGuard(tbl,delWh[0]));S.push('DELETE FROM '+tbl+' WHERE '+delWh[0]+' LIMIT 1;');}
+ else if(delWh.length){chunks(delWh,200).forEach(c=>{S.push(oneRowGuardMany(tbl,c));S.push('DELETE FROM '+tbl+' WHERE '+c.map(w=>'('+w+')').join(' OR ')+' LIMIT '+c.length+';');});}
  if(noKey){toast('Nothing was saved: the result does not include every key column ('+t.pk.join(', ')+'), so the rows cannot be found exactly. Include the key in the query.',true);return;}
  t.pending.ins.forEach(row=>{const cols=Object.keys(row);if(!cols.length)return;S.push('INSERT INTO '+tbl+' ('+cols.map(qid).join(',')+') VALUES ('+cols.map(c=>litAs(row[c],bc?bc[t.cols.indexOf(c)]:null)).join(',')+');');});
  // A BIT or binary column round-trips as 0x..., and lit() passes that through unquoted. Anything
@@ -9656,7 +9734,8 @@ async function applyChanges(id,preview){if(roBlock())return;const t=T(id);const 
  // above), and if that's the ONLY thing pending, S ends up empty with nothing to tell the user
  // apply didn't silently do something - say so instead of just doing nothing visibly.
  if(!S.length){toast('Nothing to apply - new row(s) with no values are ignored. Fill in a column, or Revert to remove them.',true);return;}
- const changes=S.filter(s=>!s.startsWith('SELECT 1 FROM (SELECT 1 AS x')).length;
+ // Rows, not statements: several deletes go in one statement.
+ const changes=S.filter(s=>!s.startsWith('SELECT 1 FROM (SELECT 1 AS x')&&!s.startsWith('DELETE FROM')).length+delWh.length;
  if(preview){viewText('SQL that Apply would run - '+changes+' change'+(changes===1?'':'s'),S.join('\n'),{readonly:true});return false;}
  log('APPLY:\n'+S.join('\n'));
  // Runs as one transaction, so a failure part-way leaves the table exactly as it was.

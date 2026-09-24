@@ -33,7 +33,7 @@ function extractFunction(src, name) {
 }
 
 const src = readFileSync(process.argv[2], 'utf8');
-const viewIndicesSrc = extractFunction(src, 'viewIndices');
+const viewIndicesSrc = extractFunction(src, 'viewIndices') + '\n' + extractFunction(src, 'viewIndicesFresh');
 const rowHasTextSrc = extractFunction(src, 'rowHasText');
 const stepSrc = extractFunction(src, 'gridSearchStep');
 

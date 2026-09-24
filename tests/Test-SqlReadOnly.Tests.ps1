@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
-$ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($n.Name -eq 'Test-SqlReadOnly' -or $n.Name -eq 'Test-SqlReadOnlyAs' -or $n.Name -eq 'Remove-SqlComments' -or $n.Name -eq 'Split-OffKeyword' -or $n.Name -eq 'Strip-Parens')},$true) |
+$ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($n.Name -eq 'Test-SqlReadOnly' -or $n.Name -eq 'Test-SqlReadOnlyAs' -or $n.Name -eq 'Remove-SqlComments' -or $n.Name -eq 'Test-HasClientCommand' -or $n.Name -eq 'Split-OffKeyword' -or $n.Name -eq 'Strip-Parens')},$true) |
   ForEach-Object { Invoke-Expression $_.Extent.Text }
 $fail = 0
 function Check($sql, $expected, $label) {
@@ -111,4 +111,10 @@ Check 'SELECT 1 -- DELETE FROM t' $true 'a real -- comment'
 Check 'SELECT 1 # DELETE FROM t' $true 'a real # comment'
 Check 'SELECT 1--1' $true 'arithmetic that looks like a comment'
 Check "SELECT '--', '#', '/*' FROM t" $true 'comment markers inside strings'
+# mysql.exe acts on its own backslash commands wherever they stand outside a string: "\." runs a
+# file, measured on both clients, whatever the file holds.
+Check 'SELECT 1 \. C:/x.sql' $false 'a client command after a SELECT runs a file'
+Check "SELECT 1;`n\. C:/x.sql" $false 'a client command on a line of its own'
+Check "SELECT 'C:\temp' AS p" $true 'a backslash inside a string is not a command'
+Check 'SELECT `a\b` FROM t' $true 'nor inside a backticked name'
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }

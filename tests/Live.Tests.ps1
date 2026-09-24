@@ -282,6 +282,34 @@ try {
     if ($unforced.log) { $unforcedLine = [string]$unforced.log[0] }
     Check ($unforcedLine -match '^FAILED') 'without force, a failing import still reports FAILED' "log: $unforcedLine"
 
+    # A dump sets a non-strict sql_mode, so a value too long for its column is cut with a warning
+    # and the import carries on - it was logged as a plain OK. Harmless warnings about the dump's
+    # own spelling (utf8 as an alias) are not counted.
+    $warnSql = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-import-warn-$PID.sql"
+    Set-Content -LiteralPath $warnSql -Encoding ascii -Value @(
+        "SET SESSION sql_mode='';"
+        'DROP TABLE IF EXISTS imp_warn;'
+        'CREATE TABLE imp_warn (v VARCHAR(2));'
+        "INSERT INTO imp_warn VALUES ('abcd');"
+        'SET character_set_client = utf8;'
+        'DROP TABLE imp_warn;'
+    )
+    $warned = Api '/api/import' @{ conn = $conn; files = @($warnSql); targetDb = 'nobs_test' }
+    $warnLine = ''
+    if ($warned.log) { $warnLine = [string]$warned.log[0] }
+    Check ($warnLine -match '^OK with 1 warning\(s\)' -and $warnLine -match '1265') 'an import that cut a value says so' "log: $warnLine"
+    Remove-Item -LiteralPath $warnSql -Force -ErrorAction SilentlyContinue
+
+    # mariadb-dump 11.x+ opens every dump with a line MySQL's client does not know; with MySQL's
+    # tools the import failed at line 1 ("Unknown command '\-'").
+    $sbSql = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-import-sandbox-$PID.sql"
+    [IO.File]::WriteAllText($sbSql, "/*M!999999\- enable the sandbox mode */ `n-- MariaDB dump`nSELECT 1;`n")
+    $sb = Api '/api/import' @{ conn = $conn; files = @($sbSql); targetDb = 'nobs_test' }
+    $sbLine = ''
+    if ($sb.log) { $sbLine = [string]$sb.log[0] }
+    Check ($sbLine -match '^OK  ') 'a MariaDB dump opens on either client' "log: $sbLine"
+    Remove-Item -LiteralPath $sbSql -Force -ErrorAction SilentlyContinue
+
     # And a genuinely clean import must stay a plain OK - otherwise the check above could be
     # satisfied by simply never saying OK again.
     $goodSql = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-import-good-$PID.sql"

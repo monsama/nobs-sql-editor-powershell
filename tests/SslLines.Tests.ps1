@@ -40,14 +40,14 @@ function Check($got, $expected, $label) {
 
 "-- each dialect names the options the way its own client does --"
 Check (Get-SslLines 'disabled' $true)  'skip-ssl'                  'MariaDB client, disabled'
-Check (Get-SslLines 'required' $true)  'ssl'                       'MariaDB client, required'
+Check (Get-SslLines 'required' $true)  'ssl,skip-ssl-verify-server-cert' 'MariaDB client, required (11.4+ would check the certificate)'
 Check (Get-SslLines 'verify'   $true)  'ssl,ssl-verify-server-cert' 'MariaDB client, verify'
-Check (Get-SslLines 'disabled' $false) 'ssl-mode=DISABLED'         'MySQL client, disabled'
+Check (Get-SslLines 'disabled' $false) 'ssl-mode=DISABLED,loose-get-server-public-key' 'MySQL client, disabled (asks for the key caching_sha2_password needs without TLS)'
 Check (Get-SslLines 'required' $false) 'ssl-mode=REQUIRED'         'MySQL client, required'
 Check (Get-SslLines 'verify'   $false) 'ssl-mode=VERIFY_IDENTITY'  'MySQL client, verify'
 
-"`n-- 'default' means leave it to the client, so it writes nothing at all --"
-Check (Get-SslLines 'default' $true)  '' 'default, MariaDB client'
+"`n-- 'default' means leave it to the client - which on MariaDB 11.4+ would check the certificate --"
+Check (Get-SslLines 'default' $true)  'skip-ssl-verify-server-cert' 'default, MariaDB client'
 Check (Get-SslLines 'default' $false) '' 'default, MySQL client'
 Check (Get-SslLines ''        $true)  '' 'empty mode'
 Check (Get-SslLines $null     $true)  '' 'null mode'
@@ -64,9 +64,9 @@ Check (Get-SslLines 'verify' $false 'C:\certs\ca.pem') 'ssl-mode=VERIFY_IDENTITY
 Check (Get-SslLines 'verify' $true 'C:\a\b\ca.pem') 'ssl,ssl-verify-server-cert,ssl-ca=C:\\a\\b\\ca.pem' 'backslashes are doubled for the option-file parser'
 
 # The other modes verify nothing, so a CA there would imply a check that is not happening.
-Check (Get-SslLines 'required' $true  'C:\certs\ca.pem') 'ssl'               'a CA is ignored for required (nothing is verified)'
+Check (Get-SslLines 'required' $true  'C:\certs\ca.pem') 'ssl,skip-ssl-verify-server-cert' 'a CA is ignored for required (nothing is verified)'
 Check (Get-SslLines 'disabled' $true  'C:\certs\ca.pem') 'skip-ssl'          'a CA is ignored for disabled'
-Check (Get-SslLines 'default'  $true  'C:\certs\ca.pem') ''                  'a CA is ignored for default'
+Check (Get-SslLines 'default'  $true  'C:\certs\ca.pem') 'skip-ssl-verify-server-cert' 'a CA is ignored for default'
 Check (Get-SslLines 'required' $false 'C:\certs\ca.pem') 'ssl-mode=REQUIRED' 'a CA is ignored for required, MySQL dialect'
 
 # And no CA means no line at all, rather than an empty one the client would choke on.

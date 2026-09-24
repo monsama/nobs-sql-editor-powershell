@@ -220,8 +220,13 @@ function Test-ToolIsMariaDB { param([string]$Path)
 # "CA certificate is required if ssl-mode is VERIFY_CA or VERIFY_IDENTITY".
 function Get-SslLines {
     param($Mode, $Maria, $Ca)
-    if (-not $Mode -or $Mode -eq 'default') { return @() }
+    if (-not $Mode) { return @() }
     if ($null -eq $Maria) { $Maria = Test-ClientIsMariaDB }
+    # MariaDB's client checks the server's certificate by default since 11.4, so 'required' (encrypt,
+    # check nothing) and 'default' failed against a remote server with a self-signed certificate -
+    # measured, 12.3 against MySQL 8 over the LAN: CERT_E_UNTRUSTEDROOT. skip-ssl-verify-server-cert
+    # says what those modes mean, and is the negated form of an option every MariaDB client knows.
+    if ($Mode -eq 'default') { if ($Maria) { return @('skip-ssl-verify-server-cert') } else { return @() } }
     $lines = @()
     # 'verify-ca' checks the certificate chain but not the host name - which is what a CA needs to
     # be any use against the certificate MariaDB and MySQL generate for themselves, since its name
@@ -230,8 +235,11 @@ function Get-SslLines {
     # that off without also putting the chain check in doubt. So on the MariaDB client verify-ca gets
     # the full, STRICTER verification. A setting that asks for verification must never quietly get
     # less; getting more only means failing where a looser client would have connected.
-    if ($Maria) { switch ($Mode) { 'disabled'{$lines=@('skip-ssl')} 'required'{$lines=@('ssl')} 'verify'{$lines=@('ssl','ssl-verify-server-cert')} 'verify-ca'{$lines=@('ssl','ssl-verify-server-cert')} } }
-    else        { switch ($Mode) { 'disabled'{$lines=@('ssl-mode=DISABLED')} 'required'{$lines=@('ssl-mode=REQUIRED')} 'verify'{$lines=@('ssl-mode=VERIFY_IDENTITY')} 'verify-ca'{$lines=@('ssl-mode=VERIFY_CA')} } }
+    if ($Maria) { switch ($Mode) { 'disabled'{$lines=@('skip-ssl')} 'required'{$lines=@('ssl','skip-ssl-verify-server-cert')} 'verify'{$lines=@('ssl','ssl-verify-server-cert')} 'verify-ca'{$lines=@('ssl','ssl-verify-server-cert')} } }
+    # Without TLS, MySQL's client can only send a caching_sha2_password password encrypted with the
+    # server's RSA key, and does not ask for it unless told to: the first login after a server
+    # restart failed with 2061. loose-, so a client too old to know the option ignores it.
+    else        { switch ($Mode) { 'disabled'{$lines=@('ssl-mode=DISABLED','loose-get-server-public-key')} 'required'{$lines=@('ssl-mode=REQUIRED')} 'verify'{$lines=@('ssl-mode=VERIFY_IDENTITY')} 'verify-ca'{$lines=@('ssl-mode=VERIFY_CA')} } }
     if (($Mode -eq 'verify' -or $Mode -eq 'verify-ca') -and $Ca) { $lines += "ssl-ca=$((Get-CnfSafe ([string]$Ca)) -replace '\\','\\')" }
     return $lines
 }
@@ -476,19 +484,25 @@ function Run-Proc {
 }
 # Like Run-Proc, but also pipes SQL text into the process via standard input.
 function Run-Stdin {
-    param([string]$Exe,[string[]]$Arguments,[string]$Text,[string]$File,[string]$JobId,[string]$RequestId,[hashtable]$Rename)
+    param([string]$Exe,[string[]]$Arguments,[string]$Text,[string]$File,[string]$JobId,[string]$RequestId,[hashtable]$Rename,[string]$Sql,$Conn,[switch]$Warnings,[switch]$SkipSandbox)
     $psi=New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName=$Exe; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
     $psi.RedirectStandardInput=$true; $psi.RedirectStandardError=$true; $psi.Arguments=Format-Args $Arguments
+    # -Warnings: what mysql prints on stdout with --show-warnings is read, and only its warning lines
+    # are kept (see Get-ImportWarnings).
+    if ($Warnings) { $psi.RedirectStandardOutput=$true; $psi.StandardOutputEncoding=[System.Text.Encoding]::UTF8 }
     $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi; [void]$p.Start()
     if ($JobId -and $script:RunningJobs.ContainsKey($JobId)) { $script:RunningJobs[$JobId].CurrentProcess = $p }
     $qEntry=$null
-    if ($RequestId) { $qEntry=[pscustomobject]@{ Process=$p; Cancelled=$false }; $script:RunningQueries[$RequestId]=$qEntry }
+    if ($RequestId) { $qEntry=[pscustomobject]@{ Process=$p; Cancelled=$false; Sql=$Sql; Conn=$Conn }; $script:RunningQueries[$RequestId]=$qEntry }
     try {
         $et=$p.StandardError.ReadToEndAsync()
-        if ($File -and $Rename) {
+        $ot=$null; if ($Warnings) { $ot=$p.StandardOutput.ReadToEndAsync() }
+        if ($File -and ($Rename -or $SkipSandbox)) {
             # See Get-DumpPlan: the dump's own database statements are pointed at the chosen target.
-            try { [NobsDumpDb]::CopyRenamed($File, $p.StandardInput.BaseStream, $Rename.From, $Rename.To) } finally { try { $p.StandardInput.Close() } catch {} }
+            # -SkipSandbox: see NobsDumpDb.CopyForClient.
+            $from = $null; $to = $null; if ($Rename) { $from = $Rename.From; $to = $Rename.To }
+            try { [NobsDumpDb]::CopyForClient($File, $p.StandardInput.BaseStream, $from, $to, [bool]$SkipSandbox) } finally { try { $p.StandardInput.Close() } catch {} }
         } elseif ($File) {
             $fs=[IO.File]::OpenRead($File); $buf=New-Object byte[] 1048576
             try { while(($n=$fs.Read($buf,0,$buf.Length)) -gt 0){ try { $p.StandardInput.BaseStream.Write($buf,0,$n) } catch { break } }; try { $p.StandardInput.BaseStream.Flush() } catch {} } finally { $fs.Close(); try { $p.StandardInput.Close() } catch {} }
@@ -498,7 +512,8 @@ function Run-Stdin {
         $p.WaitForExit()
         $errTxt = try { $et.Result } catch { '' }
         if ($qEntry -and $qEntry.Cancelled) { $errTxt = 'Cancelled by user.' }
-        @{ exit=$p.ExitCode; err=$errTxt }
+        $outTxt = ''; if ($ot) { $outTxt = try { [string]$ot.Result } catch { '' } }
+        @{ exit=$p.ExitCode; err=$errTxt; out=$outTxt }
     } finally {
         if ($JobId -and $script:RunningJobs.ContainsKey($JobId)) { $script:RunningJobs[$JobId].CurrentProcess = $null }
         if ($RequestId) { $null = $script:RunningQueries.TryRemove($RequestId, [ref]$null) }
@@ -540,6 +555,9 @@ function SqlId  { param($x) $s=[string]$x; if (Needs-Quote $s) { '`' + ($s -repl
 # in a mysql.exe of their own, so they start with this, which takes the mode off for that session
 # and changes nothing else.
 function Get-EscapesOnSql { return "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','));" }
+# A column's EXTRA as far as it describes the column, spelled the same for both servers: MySQL adds
+# DEFAULT_GENERATED and writes CURRENT_TIMESTAMP, MariaDB current_timestamp().
+function Get-ExtraNorm { param([string]$e) ((([string]$e).ToLower() -replace 'default_generated','' -replace 'current_timestamp\(\)','current_timestamp') -split '\s+' | Where-Object { $_ }) -join ' ' }
 function SqlLit { param($x) if($null -eq $x){'NULL'} else { "'" + ((((([string]$x) -replace '\\','\\') -replace "'","''") -replace "`r",'\r') -replace "`0",'\0') + "'" } }
 # Run-Query2 represents binary/control-character values (e.g. a bit(1) byte, or blob content
 # with unprintable bytes) as hex text like "0x00" for safe display - that is NOT a real value,
@@ -998,7 +1016,7 @@ function Open-QueryCursor {
     $psi.StandardOutputEncoding=$script:RawEnc; $psi.StandardErrorEncoding=[System.Text.Encoding]::UTF8
     $psi.Arguments=Format-Args $a
     $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi; [void]$p.Start()
-    $entry=[pscustomobject]@{ Process=$p; Cancelled=$false }
+    $entry=[pscustomobject]@{ Process=$p; Cancelled=$false; Sql=$sql; Conn=$conn }
     if ($RequestId) { $script:RunningQueries[$RequestId] = $entry }
     $cursor=[pscustomobject]@{
         Process=$p; Reader=$p.StandardOutput; Rows=(New-Object NobsXmlRows $p.StandardOutput)
@@ -1180,7 +1198,9 @@ function Api-Ddl { param($conn,$db,$type,$name)
     for($i=0;$i -lt $cols.Count;$i++){ if($cols[$i] -match '(?i)create|statement'){ $idx=$i; break } }
     if($idx -lt 0){ $idx=$cols.Count-1 }
     $ddl=$r.rows[0][$idx]
-    '{"ok":true,"ddl":'+(J-Str $ddl)+'}'
+    # The sql_mode a routine, trigger or event was created under, which decides how its body is read.
+    $modeJ='null'; for($i=0;$i -lt $cols.Count;$i++){ if($cols[$i] -eq 'sql_mode' -and $null -ne $r.rows[0][$i]){ $modeJ=(J-Str ([string]$r.rows[0][$i])) } }
+    '{"ok":true,"ddl":'+(J-Str $ddl)+',"sqlMode":'+$modeJ+'}'
 }
 # Find a table primary-key columns - needed so grid edits update the correct row.
 function Api-Pk { param($conn,$db,$table)
@@ -1320,12 +1340,23 @@ function Remove-SqlComments { param([string]$sql, [bool]$BackslashEscapes)
 # where a backslash escapes and a string followed by a DELETE where it does not (sql_mode
 # NO_BACKSLASH_ESCAPES), and the other way round - so a text that would run a write under either
 # reading is refused.
+# Whether text holds a mysql client command (\. \! \G ...) outside strings and backticked names.
+function Test-HasClientCommand { param([string]$sql, [bool]$BackslashEscapes)
+    $sq = if ($BackslashEscapes) { '''(?:[^''\\]|\\[\s\S]|'''')*''?' } else { '''(?:[^'']|'''')*''?' }
+    $dq = if ($BackslashEscapes) { '"(?:[^"\\]|\\[\s\S]|"")*"?' } else { '"(?:[^"]|"")*"?' }
+    foreach ($m in [regex]::Matches($sql, '(?<s>' + $sq + '|' + $dq + '|`(?:[^`]|``)*`?)|\\\S')) { if (-not $m.Groups['s'].Success) { return $true } }
+    return $false
+}
 function Test-SqlReadOnly { param([string]$sql)
     return ((Test-SqlReadOnlyAs $sql $true) -and (Test-SqlReadOnlyAs $sql $false))
 }
 function Test-SqlReadOnlyAs { param([string]$sql, [bool]$BackslashEscapes)
     if(-not $sql){ return $true }
     $s = Remove-SqlComments $sql $BackslashEscapes
+    # This edition hands the text to mysql.exe, which acts on its own backslash commands wherever
+    # they stand outside a string - "SELECT 1 \. C:/x.sql" ran that file, measured on both clients,
+    # and the file could hold anything while the text read as one SELECT. None is read-only here.
+    if (Test-HasClientCommand $s $BackslashEscapes) { return $false }
     $allow = 'SELECT','SHOW','DESCRIBE','DESC','EXPLAIN','USE','WITH','SET','HELP','VALUES','TABLE','ANALYZE','CHECK','CHECKSUM'
     foreach($stmt in ($s -split ';')){
         $t = $stmt.Trim()
@@ -1446,9 +1477,9 @@ function Api-Script { param($conn,$data)
         # table half-updated - the one outcome a pending-changes model exists to prevent.
         if($data.transaction){ $scriptSql = "START TRANSACTION;`n" + $scriptSql + "`nCOMMIT;" }
         [IO.File]::WriteAllText($tmp, $scriptSql, (New-Object System.Text.UTF8Encoding($false)))
-        $r=Run-Stdin $my @("--defaults-extra-file=$cnf","--comments") $null $tmp $null $requestId
+        $r=Run-Stdin $my @("--defaults-extra-file=$cnf","--comments") $null $tmp $null $requestId -Sql $scriptSql -Conn $conn
         if ($r.exit -ne 0 -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
-            $r=Run-Stdin $my @("--defaults-extra-file=$cnf","--comments","--binary-mode") $null $tmp $null $requestId
+            $r=Run-Stdin $my @("--defaults-extra-file=$cnf","--comments","--binary-mode") $null $tmp $null $requestId -Sql $scriptSql -Conn $conn
             if($r.exit -eq 0){ return '{"ok":true,"message":"Auto-retried with --binary-mode (statement contained raw NUL bytes)."}' }
         }
         if($r.exit -eq 0){ return '{"ok":true}' } else { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
@@ -1476,7 +1507,7 @@ function Api-ScriptResults { param($conn,$data)
         $psi.StandardOutputEncoding = $script:RawEnc; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
         $psi.Arguments = Format-Args (@("--defaults-extra-file=$cnf", "--comments") + $ra + $dbArg)
         $p = New-Object System.Diagnostics.Process; $p.StartInfo = $psi; [void]$p.Start()
-        if ($requestId) { $entry = [pscustomobject]@{ Process=$p; Cancelled=$false }; $script:RunningQueries[$requestId] = $entry }
+        if ($requestId) { $entry = [pscustomobject]@{ Process=$p; Cancelled=$false; Sql=$scriptSql; Conn=$conn }; $script:RunningQueries[$requestId] = $entry }
         $et = $p.StandardError.ReadToEndAsync()
         $feed = [NobsXmlRows]::FeedAndClose($p.StandardInput.BaseStream, [Text.Encoding]::UTF8.GetBytes($scriptSql))
         $sets = $null; $readErr = $null
@@ -1639,7 +1670,7 @@ function Open-TxSession { param([string]$Id, $conn)
         $psi.StandardOutputEncoding = $script:RawEnc; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
         $psi.Arguments = Format-Args (@("--defaults-extra-file=$cnf", '--comments', '--force', '--unbuffered') + $ra)
         $p = New-Object System.Diagnostics.Process; $p.StartInfo = $psi; [void]$p.Start()
-        $s = [pscustomobject]@{ Id=$Id; Process=$p; Out=(New-Object NobsXmlRows $p.StandardOutput); Err=(New-Object NobsLineSink $p.StandardError); Lock=(New-Object object); Cid=0; Conn=$conn }
+        $s = [pscustomobject]@{ Id=$Id; Process=$p; Out=(New-Object NobsXmlRows $p.StandardOutput); Err=(New-Object NobsLineSink @($p.StandardError, $p)); Lock=(New-Object object); Cid=0; Conn=$conn }
         $r = Invoke-TxStatements $s @('SET autocommit=0', 'SELECT CONNECTION_ID()') 1
         if ($r.err) { try { if (-not $p.HasExited) { $p.Kill() } } catch {}; throw $r.err }
         $s.Cid = [long]$r.sets[0].Rows[0][0]
@@ -1826,13 +1857,40 @@ function Api-CancelQuery { param($data)
         if ($entry.TxSession) { $entry.Cancelled = $true; Stop-TxQuery $entry; return '{"ok":true,"message":"Cancel signal sent."}' }
         try {
             $entry.Cancelled = $true
-            if (-not $entry.Process.HasExited) { $entry.Process.Kill() }
+            $onServer = Stop-ServerStatement $entry
+            # KILL QUERY usually ends mysql.exe by itself, and the process may be gone by now.
+            try { if (-not $entry.Process.HasExited) { $entry.Process.Kill() } } catch { }
+            if ($onServer -eq $false) { return '{"ok":true,"message":"Cancelled here. The statement could not be found on the server, so it may still be running there."}' }
             return '{"ok":true,"message":"Cancel signal sent."}'
         } catch {
             return '{"ok":false,"error":'+(J-Str $_.Exception.Message)+'}'
         }
     }
     return '{"ok":false,"error":"Query not found - it may have already finished."}'
+}
+# Stopping mysql.exe does not stop the statement it sent: the server runs it to the end, and with
+# autocommit a cancelled UPDATE was committed all the same, while the tab said "Query cancelled".
+# The server's own connection for that mysql.exe is not known here - through an SSH tunnel not even
+# its address is - so it is found by what it is running: the one query of this account whose text
+# is one of the statements that were sent. It is stopped with KILL QUERY from a connection of its
+# own, as a tab's transaction already is. Nothing is killed unless exactly one such query is
+# found. Returns $true when one was stopped, $false when none could be told apart, and $null when
+# there was nothing to look for.
+function Stop-ServerStatement { param($entry)
+    if (-not $entry -or -not $entry.Sql -or -not $entry.Conn) { return $null }
+    try {
+        Initialize-DumpDb
+        $norm = { param($t) (((Remove-SqlComments ([string]$t) $true) -replace '\s+', ' ').Trim() -replace ';+$', '').Trim() }
+        $want = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($st in [NobsTxSql]::Split([string]$entry.Sql)) { $n = & $norm $st; if ($n) { [void]$want.Add($n) } }
+        if ($want.Count -eq 0) { return $null }
+        $r = Run-Query2 $entry.Conn ("SELECT ID, INFO FROM information_schema.PROCESSLIST WHERE COMMAND='Query' AND ID<>CONNECTION_ID() AND USER=" + (SqlLit ([string]$entry.Conn.user))) $null
+        if (-not $r.ok) { return $false }
+        $ids = @($r.rows | Where-Object { $null -ne $_[1] -and $want.Contains((& $norm $_[1])) } | ForEach-Object { [string]$_[0] })
+        if ($ids.Count -ne 1 -or $ids[0] -notmatch '^\d+$') { return $false }
+        $k = Run-Exec $entry.Conn ("KILL QUERY " + $ids[0])
+        return ($k -like '*"ok":true*')
+    } catch { return $false }
 }
 # Endpoint: cancel a running export/import job. Kills the in-flight process and
 # sets a flag so the job's loop stops starting new tables/files.
@@ -2740,12 +2798,26 @@ public static class NobsDumpDb {
             }
         }
     }
-    public static void CopyRenamed(string path, Stream dst, string from, string to) {
+    public static void CopyRenamed(string path, Stream dst, string from, string to) { CopyForClient(path, dst, from, to, false); }
+    // As CopyRenamed (from null: nothing renamed), and with skipSandbox the first line is left out
+    // when it is mariadb-dump's "/*M!999999\- enable the sandbox mode */", which MySQL's client
+    // does not know - a MariaDB dump restored with it failed at line 1 ("Unknown command '\-'").
+    public static void CopyForClient(string path, Stream dst, string from, string to, bool skipSandbox) {
+        byte[] sandbox = Encoding.ASCII.GetBytes("/*M!999999\\- enable the sandbox mode */");
         using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16)) {
             var r = new LineReader(f); var line = new MemoryStream();
             var w = new BufferedStream(dst, 1 << 20);
+            bool first = true;
             try {
-                while (r.Next(line)) { var b = RewriteLine(line.GetBuffer(), (int)line.Length, from, to); w.Write(b, 0, b.Length); }
+                while (r.Next(line)) {
+                    byte[] buf = line.GetBuffer(); int n = (int)line.Length;
+                    if (first) {
+                        first = false;
+                        if (skipSandbox && n >= sandbox.Length) { bool same = true; for (int i = 0; i < sandbox.Length; i++) if (buf[i] != sandbox[i]) { same = false; break; } if (same) continue; }
+                    }
+                    if (from == null) { w.Write(buf, 0, n); continue; }
+                    var b = RewriteLine(buf, n, from, to); w.Write(b, 0, b.Length);
+                }
                 w.Flush();
             } catch (IOException) { }
         }
@@ -2769,7 +2841,8 @@ public static class NobsTxSql {
             if (lineStart && i + 9 <= n && string.Compare(sql, i, "DELIMITER", 0, 9, StringComparison.OrdinalIgnoreCase) == 0 && (i + 9 == n || sql[i + 9] == ' ' || sql[i + 9] == '\t')) {
                 int j = i + 9; while (j < n && (sql[j] == ' ' || sql[j] == '\t')) j++;
                 int k = j; while (k < n && sql[k] != '\r' && sql[k] != '\n') k++;
-                string d = sql.Substring(j, k - j).Trim(); if (d.Length > 0) delim = d;
+                // The first word of the line, as the mysql client reads it.
+                string d = sql.Substring(j, k - j).Trim(); int sp = d.IndexOfAny(new[] { ' ', '\t' }); if (sp > 0) d = d.Substring(0, sp); if (d.Length > 0) delim = d;
                 i = k; buf.Clear(); lineStart = true; continue;
             }
             if (c == '/' && i + 1 < n && sql[i + 1] == '*') {
@@ -2818,9 +2891,24 @@ public sealed class NobsLineSink {
     readonly Queue<string> q = new Queue<string>();
     readonly object gate = new object();
     long seen;
-    public NobsLineSink(TextReader r) {
+    public NobsLineSink(TextReader r) : this(r, null) { }
+    // With a process: a line saying the connection is gone (2006 server has gone away, 2013 lost
+    // connection) ends it. A tab's transaction is one mysql.exe fed a statement at a time; after a
+    // server restart or a network drop it did not reconnect - rightly, since the transaction was
+    // gone - but stayed alive answering every statement with that error and never with the result
+    // the tab waits for, so the tab showed "running" until Cancel. Ended, its output closes and the
+    // tab is told the transaction was lost.
+    public NobsLineSink(TextReader r, System.Diagnostics.Process endOnLost) {
         var t = new System.Threading.Thread(() => {
-            try { string l; while ((l = r.ReadLine()) != null) lock (gate) { q.Enqueue(l); seen++; } }
+            try {
+                string l;
+                while ((l = r.ReadLine()) != null) {
+                    lock (gate) { q.Enqueue(l); seen++; }
+                    if (endOnLost != null && (l.StartsWith("ERROR 2006") || l.StartsWith("ERROR 2013"))) {
+                        try { if (!endOnLost.HasExited) endOnLost.Kill(); } catch (Exception) { }
+                    }
+                }
+            }
             catch (IOException) { } catch (ObjectDisposedException) { }
         });
         t.IsBackground = true; t.Start();
@@ -2870,8 +2958,35 @@ function Get-DumpPlan { param([string[]]$Names, [string]$Target)
     return @{ Kind = 'Refuse'; Why = "this file contains $($Names.Count) databases ($($Names -join ', ')), so it cannot be restored into the single target '$Target'. Clear ""Target database"" to restore each under its own name." }
 }
 
+# The warnings mysql printed with --show-warnings, less the ones about the dump's own spelling that
+# change no data: deprecated syntax (1287), the utf8/utf8mb3 and NATIONAL aliases (3719, 3720, 3778),
+# the integer display width (1681), and a value given for a generated column (1906), which the
+# server computes again anyway. A dump sets a non-strict sql_mode, so a value too long for its
+# column was cut with a warning, and the import was logged as a plain OK.
+function Get-ImportWarnings { param([string]$out)
+    $harmless = '1287','1681','1906','3719','3720','3778'
+    foreach ($l in ($out -split "`r?`n")) { $t = $l.Trim(); if ($t -match '^Warning \(Code (\d+)\)' -and $harmless -notcontains $Matches[1]) { $t } }
+}
+# Whether a dump file is a view's: mysqldump heads a view's section "Temporary view structure for
+# view" (MySQL 8), "Temporary table structure for view" (MariaDB and older) or "Final view structure
+# for view", and a per-table file starts with its object's section.
+function Test-DumpFileIsView { param([string]$Path)
+    try {
+        $fs = [IO.File]::OpenRead($Path)
+        try { $buf = New-Object byte[] 65536; $n = $fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
+        $head = [Text.Encoding]::UTF8.GetString($buf, 0, $n)
+        foreach ($l in ($head -split "`r?`n")) {
+            if ($l -match '^-- (Table structure for table|Dumping data for table|Temporary view structure for view|Temporary table structure for view|Final view structure for view)') { return ($l -match 'for view') }
+        }
+    } catch { }
+    return $false
+}
 function Api-Import { param($conn,$data)
     $files=@($data.files); if($files.Count -eq 0){ return '{"ok":false,"error":"No files."}' }
+    # A per-table export folder holds each view in a file of its own, and files went in by name:
+    # "active_customers" ran before "customers" and failed with 1146, leaving the view out of the
+    # restore. Views go after everything else; the order within each is kept.
+    $files = @(@($files | Where-Object { -not (Test-DumpFileIsView ([string]$_)) }) + @($files | Where-Object { Test-DumpFileIsView ([string]$_) }))
     $mysql = Get-ToolFor $conn 'mysql'
     if(-not $mysql -or -not (Test-Path $mysql)){ return '{"ok":false,"error":"mysql.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
     $cnf=New-Cnf $conn -Tool $mysql; $log=New-Object System.Collections.ArrayList
@@ -2894,19 +3009,20 @@ function Api-Import { param($conn,$data)
             # own, separate default (16M) - without a matching bump here, re-importing a dump
             # exported with a larger packet size fails with "MySQL server has gone away".
             $maxPacket = ([string]$data.maxpacket).Trim()
-            $a=@("--defaults-extra-file=$cnf"); if($data.force){$a+='--force'}; if($binMode){$a+='--binary-mode'}; if($maxPacket){$a+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a+=$target}
+            $a=@("--defaults-extra-file=$cnf","--show-warnings"); if($data.force){$a+='--force'}; if($binMode){$a+='--binary-mode'}; if($maxPacket){$a+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a+=$target}
             $short = [IO.Path]::GetFileName($f)
             Initialize-DumpDb
             $plan = Get-DumpPlan ([NobsDumpDb]::Names($f)) $target
             if ($plan.Kind -eq 'Refuse') { [void]$log.Add("SKIPPED $short : "+$plan.Why); continue }
             $rename = $null
             if ($plan.Kind -eq 'Rename') { $rename = @{ From = $plan.From; To = $target }; [void]$log.Add("$short holds database '$($plan.From)' - restoring it into '$target' instead") }
-            $r=Run-Stdin $mysql $a $null $f $jobId -Rename $rename
+            $skipSb = (-not (Test-ClientIsMariaDB $mysql))
+            $r=Run-Stdin $mysql $a $null $f $jobId -Rename $rename -Warnings -SkipSandbox:$skipSb
             if($job.Cancelled){ [void]$log.Add("CANCELLED"); break }
             $autoRetried = $false
             if ($r.exit -ne 0 -and -not $binMode -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
-                $a2=@("--defaults-extra-file=$cnf","--binary-mode"); if($data.force){$a2+='--force'}; if($maxPacket){$a2+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a2+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a2+=$target}
-                $r=Run-Stdin $mysql $a2 $null $f $jobId -Rename $rename
+                $a2=@("--defaults-extra-file=$cnf","--binary-mode","--show-warnings"); if($data.force){$a2+='--force'}; if($maxPacket){$a2+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a2+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a2+=$target}
+                $r=Run-Stdin $mysql $a2 $null $f $jobId -Rename $rename -Warnings -SkipSandbox:$skipSb
                 $autoRetried = $true
             }
             $retryNote = $(if($autoRetried){" (auto-retried with --binary-mode)"}else{""})
@@ -2916,8 +3032,12 @@ function Api-Import { param($conn,$data)
                 # turned a completely failed import into a clean list of OK lines - the worst possible
                 # outcome for a restore, because it looks like it worked. Report what the tool said.
                 $skipped = @(($r.err -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "ERROR" })
-                if($skipped.Count -eq 0){
+                $warns = @(Get-ImportWarnings $r.out)
+                if($skipped.Count -eq 0 -and $warns.Count -eq 0){
                     [void]$log.Add("OK  $short$retryNote")
+                } elseif($skipped.Count -eq 0){
+                    $more = $(if($warns.Count -gt 1){" (+"+($warns.Count-1)+" more)"}else{""})
+                    [void]$log.Add("OK with $($warns.Count) warning(s)  $short : "+$warns[0]+$more+$retryNote)
                 } else {
                     $errorsSkipped += $skipped.Count
                     $more = $(if($skipped.Count -gt 1){" (+"+($skipped.Count-1)+" more)"}else{""})
@@ -2982,6 +3102,11 @@ function Api-ImportCsv { param($conn,$data)
     if ($fsz -gt 200MB -and -not [bool]$data.forceLarge) {
         return '{"ok":false,"error":"This CSV is '+([math]::Round($fsz/1MB,0))+' MB. The built-in CSV import loads the whole file into memory and is not recommended above ~200 MB - use mysqlimport or LOAD DATA INFILE for very large files instead. Pass forceLarge to proceed anyway."}'
     }
+    # The file is read as UTF-8, so one saved in the Windows code page ("CSV" rather than "CSV
+    # UTF-8" in Excel) came in with U+FFFD in place of every accented letter, and nothing said so.
+    # Such a file is refused, as the desktop edition refuses it.
+    try { $null = (New-Object System.Text.UTF8Encoding($false, $true)).GetString([IO.File]::ReadAllBytes($file)) }
+    catch { return '{"ok":false,"error":'+(J-Str "This file is not UTF-8 text, so its accented letters and symbols would be imported wrong. Save it as UTF-8 (in Excel: CSV UTF-8) and import it again. Nothing was imported.")+'}' }
     $db=[string]$data.db; $table=[string]$data.table
     if(-not $db -or -not $table){ return '{"ok":false,"error":"No target table."}' }
     $dbl=SqlLit $db; $tl=SqlLit $table
@@ -3058,6 +3183,15 @@ function Api-ImportCsv { param($conn,$data)
     # DELETE FROM (no WHERE) does the same job here and, unlike TRUNCATE, is ordinary
     # transactional DML that a rollback genuinely undoes - the one real cost is that it doesn't
     # reset an AUTO_INCREMENT counter the way TRUNCATE does.
+    # All of that holds only for an engine that can roll back. MyISAM and Aria cannot: Replace
+    # deleted every row first, and a failure part way left only the rows written before it. Replace
+    # is refused on such a table, and a failed Append says rows may already be in.
+    $eng = Run-Query2 $conn ("SELECT t.ENGINE, e.TRANSACTIONS FROM information_schema.TABLES t LEFT JOIN information_schema.ENGINES e ON e.ENGINE=t.ENGINE WHERE t.TABLE_SCHEMA=$dbl AND t.TABLE_NAME=$tl") $null
+    $engine = ''; $transactional = $true
+    if ($eng.ok -and $eng.rows.Count) { $engine = [string]$eng.rows[0][0]; $transactional = ([string]$eng.rows[0][1]) -ne 'NO' }
+    if (-not $transactional -and $data.truncate) {
+        return '{"ok":false,"error":'+(J-Str "$db.$table uses the $engine engine, which cannot undo a failed import - Replace would delete its rows before knowing whether the new ones go in. Nothing was changed. Empty the table yourself and import with Append, or convert it to InnoDB first.")+'}'
+    }
     $sb=New-Object System.Text.StringBuilder
     [void]$sb.AppendLine((Get-EscapesOnSql))
     [void]$sb.AppendLine('START TRANSACTION;')
@@ -3086,7 +3220,8 @@ function Api-ImportCsv { param($conn,$data)
         $r=Run-Stdin $my @("--defaults-extra-file=$cnf") $null $tmp
         $note = if ($skippedGen.Count) { '; generated, so computed by the server: ' + ($skippedGen -join ', ') } else { '' }
         if($r.exit -eq 0){ return '{"ok":true,"message":'+(J-Str ("Imported $n row(s) into $db.$table (columns: "+($useCols -join ', ')+$note+")"))+'}' }
-        return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}'
+        $after = if ($transactional) { '' } else { "`n`nRows before the one that failed may already be in the table: the $engine engine cannot undo them." }
+        return '{"ok":false,"error":'+(J-Str ((FirstErr $r.err) + $after))+'}'
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
 }
 # Endpoint: open a native file/folder picker dialog for the UI.
@@ -3703,13 +3838,22 @@ function Compare-TableSets { param($srcConn,$srcDb,$srcCols,$tgtCols,$RequestId)
             if(-not $tByName.Contains($c.name)){ $kind = 'add_column' }
             else {
                 $tc = $tByName[$c.name]
-                if($c.type -ne $tc.type -or $c.null -ne $tc.null -or [string]$c.default -ne [string]$tc.default -or
-                   [string]$c.collation -ne [string]$tc.collation -or $c.comment -cne $tc.comment -or $c.generation -ne $tc.generation){ $kind = 'modify_column' }
+                # Compared exactly: -ne ignores case, so ENUM('A','B') against ENUM('a','b'), or a
+                # default of 'Yes' against 'yes', showed as the same here and different in the desktop
+                # edition. EXTRA is compared too - AUTO_INCREMENT, ON UPDATE, INVISIBLE - in the form
+                # Get-ExtraNorm gives both servers' spellings.
+                if($c.type -cne $tc.type -or $c.null -cne $tc.null -or [string]$c.default -cne [string]$tc.default -or
+                   [string]$c.collation -cne [string]$tc.collation -or $c.comment -cne $tc.comment -or $c.generation -cne $tc.generation -or
+                   (Get-ExtraNorm $c.extra) -cne (Get-ExtraNorm $tc.extra)){ $kind = 'modify_column' }
             }
             if ($kind) {
                 if ($null -eq $defs) { $defs = Get-ColumnDefinitions (Get-CreateTableSql $srcConn $srcDb $t) }
                 $verb = if ($kind -eq 'add_column') { ' ADD COLUMN ' } else { ' MODIFY COLUMN ' }
-                [void]$diffs.Add([pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+$verb+(ColDefinition $c $defs)+';'); checked=$true; kind=$kind })
+                # An added column goes in the place it has in the source, after the same column; it
+                # used to go at the end, so the two tables' column order differed from then on.
+                $place = ''
+                if ($kind -eq 'add_column') { $ci = [array]::IndexOf(@($sCols), $c); $place = if ($ci -le 0) { ' FIRST' } else { ' AFTER ' + (SqlId @($sCols)[$ci-1].name) } }
+                [void]$diffs.Add([pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+$verb+(ColDefinition $c $defs)+$place+';'); checked=$true; kind=$kind })
             }
         }
         foreach($c in $tCols){
@@ -3782,7 +3926,9 @@ function Get-TableFkCols { param($conn,$db,$table)
 # PK/FK badge display and only need the local column names, so their existing shape stays
 # untouched. This powers "go to referenced row" navigation instead.
 function Get-TableFkDetails { param($conn,$db,$table)
-    $sql = "SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=" + (SqlLit $db) + " AND TABLE_NAME=" + (SqlLit $table) + " AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY ORDINAL_POSITION"
+    # The referenced table's database and the constraint come too: a key into another database was
+    # looked up in this one, and a key over two columns was followed on one of them.
+    $sql = "SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, REFERENCED_TABLE_SCHEMA, CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=" + (SqlLit $db) + " AND TABLE_NAME=" + (SqlLit $table) + " AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY ORDINAL_POSITION"
     $r = Run-Query2 $conn $sql $null
     if(-not $r.ok){ return $null }
     return ,@($r.rows)
@@ -4330,12 +4476,24 @@ function Api-CompareApply { param($data)
     if($tgt.readonly){ return '{"ok":false,"error":"Target connection is read-only / safe mode - blocked."}' }
     $db = [string]$data.targetDb
     $stmts = @($data.statements)
-    $log = New-Object System.Collections.ArrayList
-    foreach($stmt in $stmts){
-        $r = Run-Query2 $tgt $stmt $db
-        if($r.ok){ [void]$log.Add('OK  '+$stmt) } else { [void]$log.Add('FAILED  '+$stmt+'  :  '+$r.err) }
+    # Missing tables are created in name order, so a child table came before its parent and failed
+    # on its foreign key. A CREATE TABLE that failed is tried again after the others, for as long as
+    # each round gets at least one more through; anything else stands as it failed.
+    if ($stmts.Count -eq 0) { return '{"ok":true,"log":[]}' }
+    $result = New-Object string[] $stmts.Count
+    $pending = @(0..($stmts.Count-1))
+    while ($true) {
+        $again = @(); $progress = $false
+        foreach($i in $pending){
+            $stmt = [string]$stmts[$i]
+            $r = Run-Query2 $tgt $stmt $db
+            if($r.ok){ $result[$i] = 'OK  '+$stmt; $progress = $true }
+            else { $result[$i] = 'FAILED  '+$stmt+'  :  '+$r.err; if ($stmt.TrimStart() -match '^(?i)CREATE\s+TABLE') { $again += $i } }
+        }
+        if ($again.Count -eq 0 -or -not $progress) { break }
+        $pending = $again
     }
-    '{"ok":true,"log":['+(($log|ForEach-Object{ J-Str $_ }) -join ',')+']}'
+    '{"ok":true,"log":['+(($result|ForEach-Object{ J-Str $_ }) -join ',')+']}'
 }
 
 function Api-ConnGet { param($data)
@@ -5599,6 +5757,16 @@ const GENERATED_EXTRA=/(VIRTUAL|STORED|PERSISTENT) GENERATED/i;
 // An INSERT that skips a row whose key already exists, as INSERT IGNORE did - without IGNORE's
 // other effect: it turns errors into warnings, so a value too long for its column was cut short
 // and an impossible date stored as 0000-00-00, silently, when the file was run.
+// An INSERT file says how its strings are written - a backslash escaped as \\, or, from a server
+// with NO_BACKSLASH_ESCAPES, left as it is (see strLit) - and puts the session that way while it
+// runs, then back. Without it, a file written one way and loaded on a server set the other way
+// stored every backslash doubled, or lost it.
+function insertsFile(body){const nbe=typeof window!=='undefined'&&!!window.noBackslashEscapes;
+ return '-- Values in this file '+(nbe?'leave a backslash as it is':'escape a backslash as \\\\')+', so the session reads them that way.\n'
+  +'SET @nobs_old_sql_mode = @@SESSION.sql_mode;\n'
+  +(nbe?"SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@SESSION.sql_mode, ''), 'NO_BACKSLASH_ESCAPES');\n"
+       :"SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','));\n")
+  +body+(body.endsWith('\n')?'':'\n')+'SET SESSION sql_mode = @nobs_old_sql_mode;\n';}
 function insertSkipExisting(tbl,cols,tuple){const f=qid(cols[0]);return 'INSERT INTO '+tbl+' ('+cols.map(qid).join(',')+') VALUES '+tuple+' ON DUPLICATE KEY UPDATE '+f+'='+f+';';}
 // How Apply finds a grid row: by its key, as the grid holds it. Two key types do not survive that:
 //  - FLOAT is shown rounded (1.1 is stored as 1.10000002384), so k = '1.1' matched nothing, and the
@@ -7137,16 +7305,25 @@ async function openDdl(db,type,name){const r=await api('/api/ddl',{db,type,name}
  // Apply, reported "Applied OK" and had nothing to put back.
  if(!String(r.ddl==null?'':r.ddl).trim()){toast('The server did not show the definition of '+name+' - this account may not read it, so it cannot be edited here.',true);return;}
  let body=r.ddl;
+ // A trigger that is not first among its table's triggers for the same event goes back in the same
+ // place. Recreating it put it last: SHOW CREATE TRIGGER does not say FOLLOWS, so a trigger that
+ // ran before another ran after it from then on.
+ if(type==='trigger'&&!/\bFOR\s+EACH\s+ROW\s+(FOLLOWS|PRECEDES)\b/i.test(body)){
+  // The one before it, which it FOLLOWS; for the first, the one after it, which it PRECEDES.
+  const o=await api('/api/query',{sql:"SELECT p.TRIGGER_NAME, p.ACTION_ORDER-t.ACTION_ORDER FROM information_schema.TRIGGERS t JOIN information_schema.TRIGGERS p ON p.TRIGGER_SCHEMA=t.TRIGGER_SCHEMA AND p.EVENT_OBJECT_TABLE=t.EVENT_OBJECT_TABLE AND p.ACTION_TIMING=t.ACTION_TIMING AND p.EVENT_MANIPULATION=t.EVENT_MANIPULATION AND p.ACTION_ORDER IN (t.ACTION_ORDER-1, t.ACTION_ORDER+1) WHERE t.TRIGGER_SCHEMA="+lit(db)+" AND t.TRIGGER_NAME="+lit(name)+" ORDER BY 2"});
+  if(o.ok&&o.rows.length)body=body.replace(/\bFOR\s+EACH\s+ROW\b/i,m=>m+(+o.rows[0][1]<0?' FOLLOWS ':' PRECEDES ')+qid(String(o.rows[0][0])));}
+ const modeHead=r.sqlMode!=null?'-- Created under this sql_mode, which decides how the body is read; it is used again here.\nSET @nobs_old_sql_mode = @@SESSION.sql_mode;\nSET SESSION sql_mode = '+strLit(r.sqlMode)+';\n':'';
+ const modeTail=r.sqlMode!=null?'SET SESSION sql_mode = @nobs_old_sql_mode;\n':'';
  if(type==='procedure'||type==='function'||type==='trigger'){const kw={procedure:'PROCEDURE',function:'FUNCTION',trigger:'TRIGGER'}[type];
   if(window.mariadb){
    // MariaDB: CREATE OR REPLACE is atomic - no window where the routine is missing, and no separate DROP.
-   body='-- Edit then "Apply (recreate)". (MariaDB CREATE OR REPLACE - atomic)\nDELIMITER $$\n'+body.replace(/^CREATE/i,'CREATE OR REPLACE')+'$$\nDELIMITER ;\n';
+   body='-- Edit then "Apply (recreate)". (MariaDB CREATE OR REPLACE - atomic)\n'+modeHead+'DELIMITER $$\n'+body.replace(/^CREATE/i,'CREATE OR REPLACE')+'$$\nDELIMITER ;\n'+modeTail;
   } else {
    // MySQL has no CREATE OR REPLACE for routines/triggers, so drop then create.
-   body='-- Edit then "Apply (recreate)".\nDROP '+kw+' IF EXISTS '+qid(db)+'.'+qid(name)+';\nDELIMITER $$\n'+body+'$$\nDELIMITER ;\n';
+   body='-- Edit then "Apply (recreate)".\n'+modeHead+'DROP '+kw+' IF EXISTS '+qid(db)+'.'+qid(name)+';\nDELIMITER $$\n'+body+'$$\nDELIMITER ;\n'+modeTail;
   }}
  else if(type==='view'){body='-- Edit then "Apply (recreate)".\n'+body.replace(/^CREATE/i,'CREATE OR REPLACE')+';\n';}
- openTab(type+': '+name,body,db,false,null,{type,db,name,orig:r.ddl});}
+ openTab(type+': '+name,body,db,false,null,{type,db,name,orig:r.ddl,sqlMode:r.sqlMode});}
 
 // ---- tabs & editor ----
 // --- Query tabs: each tab has its own editor + result grid + pending edits.
@@ -7228,7 +7405,9 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
    let lineEnd=val.indexOf('\n',selEnd);
    if(lineEnd<0)lineEnd=val.length;
    const block=val.slice(lineStart,lineEnd);
-   ta.value=val.slice(0,lineEnd)+'\n'+block+val.slice(lineEnd);
+   // Through edReplaceRange, like every command here, so Ctrl+Z undoes it: setting the text
+   // directly threw the whole undo history away.
+   edReplaceRange(id,lineEnd,lineEnd,'\n'+block);
    const newLineStart=lineEnd+1;
    ta.selectionStart=newLineStart+(selStart-lineStart);
    ta.selectionEnd=newLineStart+(selEnd-lineStart);
@@ -7259,7 +7438,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
     ?lines.map(l=>l.trim()===''?l:l.replace(/^(\s*)-- ?/,'$1'))
     :lines.map(l=>l.trim()===''?l:l.replace(/^(\s*)/,'$1-- '));
    const newBlock=newLines.join('\n');
-   ta.value=val.slice(0,lineStart)+newBlock+val.slice(lineEnd);
+   edReplaceRange(id,lineStart,lineEnd,newBlock);
    ta.selectionStart=lineStart;ta.selectionEnd=lineStart+newBlock.length;
    syncHl(id);
   }
@@ -7277,14 +7456,14 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
    if(dir<0&&lineStart>0){
     const prevLineStart=val.lastIndexOf('\n',lineStart-2)+1;
     const prevLine=val.slice(prevLineStart,lineStart-1);
-    ta.value=val.slice(0,prevLineStart)+block+'\n'+prevLine+val.slice(lineEnd);
+    edReplaceRange(id,prevLineStart,lineEnd,block+'\n'+prevLine);
     ta.selectionStart=prevLineStart+(selStart-lineStart);ta.selectionEnd=prevLineStart+(selEnd-lineStart);
     syncHl(id);
    } else if(dir>0&&lineEnd<val.length){
     let nextLineEnd=val.indexOf('\n',lineEnd+1);
     if(nextLineEnd<0)nextLineEnd=val.length;
     const nextLine=val.slice(lineEnd+1,nextLineEnd);
-    ta.value=val.slice(0,lineStart)+nextLine+'\n'+block+val.slice(nextLineEnd);
+    edReplaceRange(id,lineStart,nextLineEnd,nextLine+'\n'+block);
     const newBlockStart=lineStart+nextLine.length+1;
     ta.selectionStart=newBlockStart+(selStart-lineStart);ta.selectionEnd=newBlockStart+(selEnd-lineStart);
     syncHl(id);
@@ -7300,11 +7479,16 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
    let deleteEnd;
    if(lineEnd<0){deleteEnd=val.length;if(lineStart>0)lineStart=lineStart-1;}
    else{deleteEnd=lineEnd+1;}
-   ta.value=val.slice(0,lineStart)+val.slice(deleteEnd);
+   edReplaceRange(id,lineStart,deleteEnd,'');
    ta.selectionStart=ta.selectionEnd=Math.min(lineStart,ta.value.length);
    syncHl(id);
   }
-  else if(e.key==='Tab'){e.preventDefault();const st=ta.selectionStart;ta.value=ta.value.slice(0,st)+'  '+ta.value.slice(ta.selectionEnd);ta.selectionStart=ta.selectionEnd=st+2;syncHl(id);}
+  // Tab with text selected indents the lines it touches; it used to replace the selection - a
+  // whole block of SQL - with two spaces, and without a way back.
+  else if(e.key==='Tab'&&!e.shiftKey){e.preventDefault();const val=ta.value,st=ta.selectionStart,en=ta.selectionEnd;
+   if(st===en){edReplaceRange(id,st,en,'  ');}
+   else{const ls=val.lastIndexOf('\n',st-1)+1;let le=val.indexOf('\n',en);if(le<0)le=val.length;const block=val.slice(ls,le).split('\n').map(l=>'  '+l).join('\n');
+    edReplaceRange(id,ls,le,block);ta.selectionStart=ls;ta.selectionEnd=ls+block.length;}}
  });
  syncHl(id);activate(id);if(run)runTab(id);return id;}
 function activate(id){activeTab=id;const _ov=$('overview');if(_ov)_ov.style.display='none';tabs.forEach(t=>{$('tabbtn_'+t.id).classList.toggle('active',t.id===id);$('pane_'+t.id).classList.toggle('active',t.id===id);});const ta=$('ed_'+id);if(ta)setTimeout(()=>ta.focus(),0);updateSchemaBadge(id);const _t=T(id);if(_t&&_t.cols&&_t.cols.length&&!_t.colsFitted){requestAnimationFrame(()=>autofitAll(id));}}
@@ -7324,7 +7508,10 @@ function uniqueTabTitle(base){
 function refreshTabDirty(id){const t=T(id);const tb=$('tabbtn_'+id);if(!tb)return;const lbl=tb.querySelector('.tablabel');if(!lbl)return;
  const n=pendingCount(t);lbl.textContent=(n>0?'\u25CF ':'')+(t?t.title:'');lbl.title=n>0?(n+' unsaved change'+(n===1?'':'s')):'';}
 async function closeTabAsk(id){const t=T(id);const n=pendingCount(t);if(n>0){if(!(await ask('This tab has '+n+' unsaved change'+(n===1?'':'s')+'. Close and discard?')))return;}
- if(t&&t.txDirty){if(!(await ask('This tab has a transaction that is not committed. Close it and roll the changes back?')))return;}closeTab(id);}
+ if(t&&t.txDirty){if(!(await ask('This tab has a transaction that is not committed. Close it and roll the changes back?')))return;}
+ // A routine, trigger or view being edited is only in this tab until it is applied.
+ if(t&&t.ddl){const ed=$('ed_'+id),cur=ed?ed.value:'';if(cur!==(t.ddlApplied!=null?t.ddlApplied:t.genSql)&&!(await ask('This tab has changes to '+t.ddl.type+' '+t.ddl.name+' that were not applied. Close it and lose them?')))return;}
+ closeTab(id);}
 function reorderTab(srcId,targetId){
   const srcIdx=tabs.findIndex(t=>t.id===srcId),tgtIdx=tabs.findIndex(t=>t.id===targetId);
   if(srcIdx<0||tgtIdx<0)return;
@@ -7368,13 +7555,24 @@ function closeTab(id){const t=T(id);if(t&&t.runningReqId){cancelQuery(id);}close
 // Each saved connection remembers its own open tabs (keyed by connection name; ad-hoc/unsaved
 // connections are keyed by host+user+port so different credentials don't collide).
 function sessionKeyFor(){const cn=$('connlist')?$('connlist').value:'';if(cn)return 'conn:'+cn;return 'adhoc:'+($('user')?$('user').value:'')+'@'+($('host')?$('host').value:'')+':'+($('port')?$('port').value:'');}
-function saveSession(key){try{const k=key||sessionKeyFor();const arr=tabs.map(t=>({title:t.title,sql:($('ed_'+t.id)?$('ed_'+t.id).value:''),db:t.db,table:t.table}));localStorage.setItem('session:'+k,JSON.stringify(arr));}catch(e){}}
+// The open tabs are the only copy of what is typed in them. When the browser's storage is full the
+// save failed without a word, and after a restart the tabs came back as they were some time ago.
+// The query history - a few large scripts fill it - makes room first; failing that, it is said, once.
+function saveSession(key){let k,json;try{k=key||sessionKeyFor();json=JSON.stringify(tabs.map(t=>({title:t.title,sql:($('ed_'+t.id)?$('ed_'+t.id).value:''),db:t.db,table:t.table,
+  // A tab editing a routine, trigger or view stays one: restored as a plain query tab it lost its
+  // Apply and the putting back of the old version when the new one fails, and running it on MySQL
+  // dropped the routine with nothing to restore it from.
+  ddl:t.ddl?{type:t.ddl.type,db:t.ddl.db,name:t.ddl.name,orig:t.ddl.orig,sqlMode:t.ddl.sqlMode}:undefined,
+  gen:t.ddl?(t.ddlApplied!=null?t.ddlApplied:t.genSql):undefined})));}catch(e){return;}
+ try{localStorage.setItem('session:'+k,json);return;}catch(e){}
+ try{const h=hist();localStorage.setItem('history',JSON.stringify(h.slice(0,20)));localStorage.setItem('session:'+k,json);return;}catch(e){}
+ if(!window._sessionSaveWarned){window._sessionSaveWarned=true;const m='The open tabs could not be saved - the browser storage for this app is full. Copy anything you need out of them before closing the app.';toast(m,true);log(m);}}
 function restoreSessionFor(key){if(tabs.length)return;let arr=[];try{const raw=localStorage.getItem('session:'+key);if(raw!=null){arr=JSON.parse(raw);}else if(!localStorage.getItem('_sessionMigrated')){const old=localStorage.getItem('session');if(old)arr=JSON.parse(old);localStorage.setItem('_sessionMigrated','1');}}catch(e){}if(Array.isArray(arr)&&arr.length){arr.forEach(t=>{
   // Table tabs are always bounded (LIMIT 1000), so it's safe to auto-run them on restore -
   // otherwise the tab looks silently empty even though the table has data (never actually queried).
   // Plain query tabs could be arbitrary/heavy, so those restore WITHOUT auto-running; a clear
   // status message replaces what would otherwise look like a blank, broken result.
-  const id=openTab(t.title,t.sql,t.db,!!t.table,t.table);
+  const id=openTab(t.title,t.sql,t.db,!!t.table,t.table,t.ddl||null);if(t.ddl&&t.gen!=null)T(id).genSql=t.gen;
   if(!t.table){const st=$('st_'+id);if(st)st.textContent='Restored - not yet run. Click Run Query.';}
 });}}
 // Closes every tab without the "unsaved changes" prompt - only called right after the user has
@@ -7437,7 +7635,12 @@ function splitStmts(sql,withPos){let out=[],cur='',curStart=0,i=0,q=null,delim='
 async function runTab(id){await runSql(id,$('ed_'+id).value);}
 async function explainTab(id){
  const ta=$('ed_'+id);const sel=ta.value.substring(ta.selectionStart,ta.selectionEnd).trim();
- const src=sel||ta.value;const stmts=splitStmts(src).filter(s=>!isCommentOnly(s));const stmt=(stmts[0]||src).trim().replace(/;+\s*$/,'');
+ // Without a selection, the statement the cursor is in, as Run at the cursor takes it - it used to
+ // be the first statement in the editor, whichever one the cursor was on.
+ let stmt;
+ if(sel){const stmts=splitStmts(sel).filter(s=>!isCommentOnly(s));stmt=(stmts[0]||sel);}
+ else{const pos=ta.selectionStart,all=splitStmts(ta.value,true).filter(s=>!isCommentOnly(s.text));const hit=all.find(s=>pos>=s.start&&pos<=s.end)||all[0];stmt=hit?hit.text:ta.value;}
+ stmt=String(stmt).trim().replace(/;+\s*$/,'');
  if(!stmt){toast('Nothing to explain.',true);return;}
  await runSql(id,'EXPLAIN '+stmt);
  planShow(id,stmt);
@@ -7452,7 +7655,12 @@ const PLAN_STEP={query_block:'Query',nested_loop:'Join',ordering_operation:'Sort
 // Keys that are details of a step, not steps of their own.
 const PLAN_SKIP=new Set(['cost_info','used_columns','possible_keys','used_key_parts','key_parts','ref','r_loops','r_rows','r_filtered','r_total_time_ms','r_table_time_ms','r_other_time_ms','r_engine_stats','sort_key','partitions']);
 function planNum(v){const n=+v;return isNaN(n)?String(v):(n>=100||Number.isInteger(n))?fmtCount(Math.round(n)):String(+n.toPrecision(3));}
-function planTable(t){const a=t.access_type||'',k=PLAN_ACCESS[a]||['',''],rows=t.rows_examined_per_scan!=null?t.rows_examined_per_scan:t.rows;
+// MySQL 8.3+ with explain_json_format_version=2 (the default on 9.x) says "table" for a full scan
+// and "index" for every index access, with the kind in index_access_type. Read as the older names,
+// a full scan was not called out and an index lookup was shown as a full index scan.
+function planAccess(t){const a=t.access_type||'';if(a==='table')return 'ALL';
+ if(a==='index'&&t.index_access_type)return ({index_lookup:'ref',index_range_scan:'range',index_scan:'index'})[t.index_access_type]||'index';return a;}
+function planTable(t){const a=planAccess(t),k=PLAN_ACCESS[a]||['',''],rows=t.rows_examined_per_scan!=null?t.rows_examined_per_scan:t.rows;
  const cost=t.cost_info&&t.cost_info.prefix_cost!=null?t.cost_info.prefix_cost:t.cost;
  const facts=[];if(t.key)facts.push('key '+t.key);else if(t.possible_keys)facts.push('could use '+[].concat(t.possible_keys).join(', '));
  if(rows!=null)facts.push(planNum(rows)+' row'+(+rows===1?'':'s'));if(t.filtered!=null&&+t.filtered<100)facts.push(planNum(t.filtered)+'% kept');
@@ -7476,7 +7684,7 @@ function planNode(k,v){if(k==='table')return planItems(v);
 // The whole drawing: a line saying what matters most - how many tables are read in full - then
 // the tree, then the JSON itself for anyone who wants it.
 function planHtml(json){let plan;try{plan=typeof json==='string'?JSON.parse(json):json;}catch(e){return '<div class="muted">The server did not answer with a plan this can read.</div><pre>'+esc(String(json))+'</pre>';}
- const scans=[];(function walk(o){if(!o||typeof o!=='object')return;if(Array.isArray(o)){o.forEach(walk);return;}if(o.table_name&&o.access_type==='ALL')scans.push(o.table_name);Object.keys(o).forEach(k=>walk(o[k]));})(plan);
+ const scans=[];(function walk(o){if(!o||typeof o!=='object')return;if(Array.isArray(o)){o.forEach(walk);return;}if(o.table_name&&planAccess(o)==='ALL')scans.push(o.table_name);Object.keys(o).forEach(k=>walk(o[k]));})(plan);
  const head=scans.length?'<div class="psum bad">'+scans.length+' table'+(scans.length===1?' is':'s are')+' read in full: '+esc(scans.join(', '))+'</div>':'<div class="psum good">No table is read in full.</div>';
  return head+'<ul class="plan">'+Object.keys(plan).map(k=>planNode(k,plan[k])).join('')+'</ul><details class="pjson"><summary>The plan as the server gave it (JSON)</summary><pre>'+esc(JSON.stringify(plan,null,2))+'</pre></details>';}
 async function planShow(id,stmt){const t=T(id);if(!t)return;
@@ -7673,7 +7881,16 @@ function dbOf(t){ if(t&&(t.table||t.ddl)&&!t.sqlEdited)return t.db||curSchema||n
 function scriptShowsResults(stmts){
  const heads=stmts.map(s=>sqlHead(s));
  if(heads.some(h=>/^call\b/i.test(h)))return true;
- return heads.filter(h=>/^(select|show|describe|desc|explain|with|table|values)\b/i.test(h)).length>1;
+ if(heads.filter(h=>/^(select|show|describe|desc|explain|with|table|values)\b/i.test(h)).length>1)return true;
+ // A script that ends in its one SELECT otherwise runs in two steps on two connections (see runSql),
+ // and whatever belongs to a connection did not carry over: "UPDATE ...; SELECT ROW_COUNT()" gave -1,
+ // "INSERT ...; SELECT LAST_INSERT_ID()" 0, "SET @x:=5; SELECT @x" NULL, and a temporary table was
+ // not there. Such a script runs on one connection, as this path does, at the cost of paging.
+ if(stmts.length>1&&!stmts.slice(0,-1).every(s=>/^use\s+\S/i.test(sqlHead(s)))){
+  const bare=sqlBlankStringsAndComments(stmts.join('\n'));
+  if(/@[A-Za-z_$`'"]|\b(row_count|last_insert_id|found_rows)\s*\(|\btemporary\b|\b(prepare|execute|deallocate)\s|\b(start\s+transaction|begin|lock\s+tables?)\b/i.test(bare))return true;
+ }
+ return false;
 }
 // Runs such a script on one connection and shows each result in a tab of its own. These grids
 // are read-only: a result of a script is not tied to one table's rows.
@@ -8400,7 +8617,15 @@ function clearGridFilters(id){const t=T(id);if(!t)return;t.filters={};const fr=$
 // q is already lower-cased. The same case-insensitive "contains" a column filter uses, on any column.
 function rowHasText(row,q){return row.some(v=>v!=null&&String(v).toLowerCase().includes(q));}
 function sortBy(id,ci){const t=T(id);if(t.sortCol===ci){if(t.sortDir>0){t.sortDir=-1;}else{t.sortCol=-1;t.sortDir=1;}}else{t.sortCol=ci;t.sortDir=1;}$('sortrow_'+id).innerHTML=sortHeader(id,!!t.pk);renderBody(id);syncFilterRowTop(id);wireColResize(id);updatePager(id);updateStatusLine(id);}
-function viewIndices(id){const t=T(id);let view=t.rows.map((r,ri)=>ri);
+// Kept until the rows, a filter, the search or the sort change: renderBody asks on every scroll
+// frame, and each ask filtered and sorted every loaded row again - on 50,000 rows, a sort per
+// frame. Rows are only ever replaced, never changed in place, so the array and its length say
+// whether they are the same. Callers only read what this returns.
+function viewIndices(id){const t=T(id);
+ const key=t.rows.length+'\u0001'+JSON.stringify(t.filters||{})+'\u0001'+(t.search||'')+'\u0001'+t.sortCol+'\u0001'+t.sortDir;
+ if(t._viewMemo&&t._viewMemo.rows===t.rows&&t._viewMemo.key===key)return t._viewMemo.view;
+ const view=viewIndicesFresh(t);t._viewMemo={rows:t.rows,key,view};return view;}
+function viewIndicesFresh(t){let view=t.rows.map((r,ri)=>ri);
  const fk=Object.keys(t.filters).filter(k=>t.filters[k]!=='' && t.filters[k]!=null);
  if(fk.length)view=view.filter(ri=>fk.every(ci=>{const v=t.rows[ri][ci];return v!=null&&String(v).toLowerCase().includes(String(t.filters[ci]).toLowerCase());}));
  // The toolbar's search, ANDed with the column filters.
@@ -8836,6 +9061,9 @@ function parseQuotedOptionList(colType){
  for(let i=0;i<m[1].length;i++){
   const c=m[1][i];
   if(inQ){
+   // Both servers write a backslash in a member as two (measured: enum('a\\b') for a\b). Read
+   // as it stood, the list offered a\\b, which is not a member, and saving it failed or stored ''.
+   if(c==='\\'&&i+1<m[1].length){cur+=m[1][i+1];i++;continue;}
    if(c==="'"&&m[1][i+1]==="'"){cur+="'";i++;continue;}
    if(c==="'"){inQ=false;continue;}
    cur+=c;
@@ -9158,6 +9386,11 @@ async function cellMenu(e,id,ri,ci){e.preventDefault();const t=T(id);const key=r
  const editable=!!(t.pk&&t.pending),nsel=(t.selected&&t.selected.size)||0,sel=nsel>0;
  // Whether this column takes NULL - a round trip the first time per table, then cached.
  if(editable&&t.table)await colMeta(id);
+ // Picked cells still on screen can all be given NULL or an empty value at once - staged like any
+ // edit, for Apply. NULL is offered when at least one of them can hold it; the others are left as
+ // they are and setUpdMany says so.
+ const pickView=new Set(viewIndices(id)),pickKeys=(editable&&t.cellSel)?[...t.cellSel].filter(k=>pickView.has(+k.split(':')[0])):[],npick=pickKeys.length;
+ const pickNull=npick>1&&pickKeys.some(k=>canNull(id,t.cols[+k.split(':')[1]]));
  // How many, in words the menu can say: "row" for one of them, "3 rows" for more.
  const rows=n=>n===1?'row':n+' rows';
  // A copied row belongs to the table it came from: one with a different number of columns cannot
@@ -9169,16 +9402,21 @@ async function cellMenu(e,id,ri,ci){e.preventDefault();const t=T(id);const key=r
  const items=[(t.pk&&t.pending)?['Edit value...',()=>editCell(null,id,ri,ci)]:['View value...',()=>viewCell(id,ri,ci)],'-',['Copy value',()=>{copyText(cellCopyValue(cur),'Copied cell value.',asHex?'Use "Copy value as hex" to keep the whole value.':'');}],
   (t.cellSel&&t.cellSel.size)?['Copy '+t.cellSel.size+' picked cell'+(t.cellSel.size===1?'':'s'),()=>{const n=t.cellSel.size;copyText(pickedCellsText(id),'Copied '+n+' cell'+(n===1?'':'s')+'.');}]:null,asHex&&['Copy value as hex',()=>{clipWrite(cur===null?'':String(cur));log('Copied cell value as hex.');}],['Copy row',()=>copyRow(id,ri)],sel&&['Copy '+(nsel===1?'the selected row':nsel+' selected rows'),()=>copySelRows(id)],editable&&fits(clip1)&&['Paste row here (overwrite)',()=>pasteRowInto(id,ri)],editable&&clipN&&nsel>1&&clipN.length===nsel&&clipN.every(fits)&&['Paste '+nsel+' rows over the '+nsel+' selected rows',()=>pasteRowsOver(id)],editable&&clipN&&clipN.every(fits)&&['Paste '+rows(clipN.length)+' as new',()=>pasteRowsAsNew(id)],['Copy column: '+t.cols[ci],()=>copyColumn(id,ci)],['Edit full row (form)...',()=>rowForm(id,ri)],'-'];if(t.table){const col=t.cols[ci];items.push(['Quick filter',qfSub(id,col,cur)]);if(t.filterClauses&&t.filterClauses.length)items.push(['Clear filter ('+t.filterClauses.length+')',()=>clearFilters(id)]);
   const fkd=(t.fkDetails||[]).find(f=>f[0]===col);
-  if(fkd&&cur!=null){items.push(['Go to referenced row ('+fkd[1]+'.'+fkd[2]+')',()=>goToFkRow(t.db,fkd[1],fkd[2],cur)]);}
-  items.push('-');}items.push(['Export to CSV (all rows)...',()=>csvGrid(id)],sel&&['Export to CSV ('+nsel+' selected)...',()=>csvSel(id)],['Export to INSERTs (all rows)...',()=>insGrid(id)],sel&&['Export to INSERTs ('+nsel+' selected)...',()=>insSel(id)],['Export to Excel (all rows)...',()=>exportRowsAs(id,'xlsx')],sel&&['Export to Excel ('+nsel+' selected)...',()=>exportRowsAs(id,'xlsx',true)],['Export to JSON (all rows)...',()=>exportRowsAs(id,'json')],sel&&['Export to JSON ('+nsel+' selected)...',()=>exportRowsAs(id,'json',true)],['Export to Markdown (all rows)...',()=>exportRowsAs(id,'md')],'-',editable&&pendingCount(t)>0&&['Show SQL of pending changes...',()=>applyChanges(id,true)],editable&&canNull(id,t.cols[ci])&&['Set NULL',()=>setUpd(id,ri,ci,null)],editable&&['Set empty',()=>setUpd(id,ri,ci,'')]);menu(e.clientX,e.clientY,items);}
+  // The key is followed into the database it names, on every column it has; a part that is NULL
+  // points nowhere.
+  if(fkd&&cur!=null){const refDb=fkd[3]||t.db,parts=fkd[4]!=null?(t.fkDetails||[]).filter(f=>f[4]===fkd[4]&&(f[3]||t.db)===refDb&&f[1]===fkd[1]):[fkd];
+   const valOf=c=>{const i=t.cols.indexOf(c),k=ri+':'+i;return i<0?undefined:(t.pending&&(k in t.pending.upd))?t.pending.upd[k]:t.rows[ri][i];};
+   const pairs=parts.map(f=>[f[2],valOf(f[0])]);
+   if(pairs.every(p=>p[1]!=null))items.push(['Go to referenced row ('+(refDb!==t.db?refDb+'.':'')+fkd[1]+'.'+pairs.map(p=>p[0]).join('+')+')',()=>goToFkRow(refDb,fkd[1],pairs)]);}
+  items.push('-');}items.push(['Export to CSV (all rows)...',()=>csvGrid(id)],sel&&['Export to CSV ('+nsel+' selected)...',()=>csvSel(id)],['Export to INSERTs (all rows)...',()=>insGrid(id)],sel&&['Export to INSERTs ('+nsel+' selected)...',()=>insSel(id)],['Export to Excel (all rows)...',()=>exportRowsAs(id,'xlsx')],sel&&['Export to Excel ('+nsel+' selected)...',()=>exportRowsAs(id,'xlsx',true)],['Export to JSON (all rows)...',()=>exportRowsAs(id,'json')],sel&&['Export to JSON ('+nsel+' selected)...',()=>exportRowsAs(id,'json',true)],['Export to Markdown (all rows)...',()=>exportRowsAs(id,'md')],'-',editable&&pendingCount(t)>0&&['Show SQL of pending changes...',()=>applyChanges(id,true)],editable&&canNull(id,t.cols[ci])&&['Set NULL',()=>setUpd(id,ri,ci,null)],editable&&['Set empty',()=>setUpd(id,ri,ci,'')],pickNull&&['Set '+npick+' picked cells to NULL',()=>setUpdMany(id,pickKeys,null)],npick>1&&['Set '+npick+' picked cells to empty',()=>setUpdMany(id,pickKeys,'')]);menu(e.clientX,e.clientY,items);}
 // The condition goes in as the tab's filter: openRun() rebuilds the query from the table and its
 // filters, so a WHERE written into the tab's SQL was dropped and the whole table came up. The
 // value is written for the column's type, so an empty binary key (0x) and a text key that looks
 // like hex both find their row.
-async function goToFkRow(db,refTable,refCol,val){
- const bc=await tableBinCols(db,refTable,[refCol]);
- const cond=qid(refCol)+'='+litAs(val,bc?bc[0]:null);
- const _i=openTab(refTable+' (FK: '+refCol+'='+val+')','SELECT * FROM '+qid(db)+'.'+qid(refTable)+' WHERE '+cond+';',db,false,refTable);
+async function goToFkRow(db,refTable,pairs){
+ const bc=await tableBinCols(db,refTable,pairs.map(p=>p[0]));
+ const cond=pairs.map((p,i)=>qid(p[0])+'='+litAs(p[1],bc?bc[i]:null)).join(' AND ');
+ const _i=openTab(refTable+' (FK: '+pairs.map(p=>p[0]+'='+p[1]).join(', ')+')','SELECT * FROM '+qid(db)+'.'+qid(refTable)+' WHERE '+cond+';',db,false,refTable);
  T(_i).filterClauses=[cond];
  await openRun(_i);
 }
@@ -9464,7 +9702,8 @@ async function ddlRememberCurrent(d){
 async function ddlRestoreIfDropped(d){
  if(!d||!d.orig||!/^(procedure|function|trigger)$/.test(d.type))return '';
  if((await ddlExists(d.db,d.type,d.name))!==false)return '';
- const script='DELIMITER $$\n'+d.orig+'$$\nDELIMITER ;\n';
+ // Put back under the sql_mode it was made with, as openDdl does.
+ const script=(d.sqlMode!=null?'SET SESSION sql_mode = '+strLit(d.sqlMode)+';\n':'')+'DELIMITER $$\n'+d.orig+'$$\nDELIMITER ;\n';
  const r=await api('/api/script',{sql:script,db:d.db});
  if(r.ok&&(await ddlExists(d.db,d.type,d.name))){
   loadObjects(d.db);
@@ -9479,7 +9718,11 @@ async function ddlConfirmNew(db,type,name){
  if(!(await ddlExists(db,type,name)))return true;
  return await ask('A '+type+' named '+name+' already exists in '+db+'.\n\nApplying the new one will REPLACE it. Continue?');
 }
-async function applyDdl(id){if(roBlock())return;const t=T(id);const st=$('st_'+id);st.className='status';st.textContent='Applying...';const sql=$('ed_'+id).value;const r=await api('/api/script',{sql,db:(t.ddl&&t.ddl.db)||dbOf(t)});if(r.ok){st.textContent='Applied OK.';log('APPLY OK: '+t.title);if(t.ddl){await ddlRememberCurrent(t.ddl);loadObjects(t.ddl.db);}}else{st.className='status err';const _n=ddlFailureNote(r.error,sql)+(await ddlRestoreIfDropped(t.ddl));st.textContent=_n;log('APPLY ERROR: '+_n);}}
+// One Apply at a time per tab: a second click while the first ran sent a second DROP and CREATE
+// alongside it, and two restores could each find the object gone.
+async function applyDdl(id){if(roBlock())return;const t=T(id);if(t._applying)return;t._applying=true;
+ try{const st=$('st_'+id);st.className='status';st.textContent='Applying...';const sql=$('ed_'+id).value;const r=await api('/api/script',{sql,db:(t.ddl&&t.ddl.db)||dbOf(t)});if(r.ok){st.textContent='Applied OK.';t.ddlApplied=sql;log('APPLY OK: '+t.title);if(t.ddl){await ddlRememberCurrent(t.ddl);loadObjects(t.ddl.db);}}else{st.className='status err';const _n=ddlFailureNote(r.error,sql)+(await ddlRestoreIfDropped(t.ddl));st.textContent=_n;log('APPLY ERROR: '+_n);}}
+ finally{t._applying=false;}}
 
 function bTSV(cols,rows){return cols.join('\t')+'\n'+rows.map(r=>r.map(v=>v===null?'NULL':v).join('\t')).join('\n');}
 // How a NULL is written to CSV. A NULL and an empty string both used to come out as an empty
@@ -9534,12 +9777,17 @@ function bJSON(cols,rows){return JSON.stringify(rows.map(r=>{const o={};cols.for
 // strings and numbers, in a zip that is stored rather than compressed. A value goes in as a number
 // only when Excel keeps it exactly - no leading zero, at most 15 digits - so an id or a code comes
 // out as it went in.
+// What Excel cannot hold is left out - a cell ends at 32,767 characters, and XML has no place for
+// most control characters - and counted, so the export can say so instead of handing over a
+// spreadsheet that quietly differs from the table.
+let _xlsxLoss={cut:0,ctrl:0};
 function xlsxCell(ref,v,st){if(v===null||v===undefined)return '';const s=String(v);
  if(/^-?(0|[1-9]\d*)(\.\d+)?$/.test(s)&&s.replace(/[-.]/g,'').length<=15)return '<c r="'+ref+'"'+st+'><v>'+s+'</v></c>';
+ if(typeof _xlsxLoss!=='undefined'){if(s.length>32767)_xlsxLoss.cut++;if(/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(s))_xlsxLoss.ctrl++;}
  const x=s.slice(0,32767).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F￾￿]/g,'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
  return '<c r="'+ref+'" t="inlineStr"'+st+'><is><t xml:space="preserve">'+x+'</t></is></c>';}
 function xlsxCol(i){let s='';i++;while(i>0){const m=(i-1)%26;s=String.fromCharCode(65+m)+s;i=Math.floor((i-1)/26);}return s;}
-function bXLSX(cols,rows){const X='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n',NS='http://schemas.openxmlformats.org/',R=NS+'officeDocument/2006/relationships/';
+function bXLSX(cols,rows){_xlsxLoss={cut:0,ctrl:0};const X='<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n',NS='http://schemas.openxmlformats.org/',R=NS+'officeDocument/2006/relationships/';
  const row=(vals,r,st)=>'<row r="'+r+'">'+vals.map((v,i)=>xlsxCell(xlsxCol(i)+r,v,st)).join('')+'</row>';
  const sheet=X+'<worksheet xmlns="'+NS+'spreadsheetml/2006/main"><sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><sheetData>'+
   row(cols,1,' s="1"')+rows.map((r,k)=>row(r,k+2,'')).join('')+'</sheetData></worksheet>';
@@ -9573,7 +9821,8 @@ async function exportRowsAs(id,fmt,selOnly){const t=T(id);if(!t||!t.cols)return;
  if(fmt==='json')await dl(bJSON(cols,rows),base+'.json');
  else if(fmt==='md')await dl(bMD(cols,rows),base+'.md');
  else await dlBinary(new Blob([bXLSX(cols,rows)],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}),base+'.xlsx');
- log('Exported '+rows.length+' row(s) to '+({json:'JSON',md:'Markdown',xlsx:'Excel'})[fmt]+'.');}
+ log('Exported '+rows.length+' row(s) to '+({json:'JSON',md:'Markdown',xlsx:'Excel'})[fmt]+'.');
+ if(fmt==='xlsx'&&(_xlsxLoss.cut||_xlsxLoss.ctrl)){const m='The Excel file is not an exact copy: '+[_xlsxLoss.cut&&(_xlsxLoss.cut+' value(s) longer than Excel\'s 32,767 characters were cut'),_xlsxLoss.ctrl&&(_xlsxLoss.ctrl+' value(s) lost control characters Excel cannot store')].filter(Boolean).join(', and ')+'. CSV or JSON keep them whole.';toast(m,true);log(m);}}
 async function copyJson(id,selOnly){const t=T(id);if(!t.cols)return;const a=selOnly?{cols:t.cols,rows:selRows(id)}:await allResultRows(id);if(!a)return;const rows=a.rows;if(selOnly&&!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}
  copyText(bJSON(a.cols,rows),'Copied '+rows.length+(selOnly?' selected':'')+' row(s) (JSON).');}
 function selRows(id){const t=T(id);return viewIndices(id).filter(ri=>t.selected&&t.selected.has(ri)).map(ri=>t.rows[ri]);}
@@ -9603,13 +9852,13 @@ async function insGrid(id){const t=T(id);if(!t.cols)return;if(wholeTableShown(t)
  // columns, which cannot be given a value.
  const info=t.table?await tableColumnsInfo(t.db,t.table):null;const gen=new Set((info||[]).filter(c=>c.generated).map(c=>c.name.toLowerCase()));
  const keep=a.cols.map((c,i)=>i).filter(i=>!gen.has(String(a.cols[i]).toLowerCase()));const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';
- const s=a.rows.map(r=>insertSkipExisting(tbl,keep.map(i=>a.cols[i]),'('+keep.map(i=>litAs(r[i],bc?bc[i]:null)).join(',')+')')).join('\n');dl(s,(t.table||'result')+'_inserts.sql');log('Exported '+a.rows.length+' row(s) as INSERTs.');}
+ const s=a.rows.map(r=>insertSkipExisting(tbl,keep.map(i=>a.cols[i]),'('+keep.map(i=>litAs(r[i],bc?bc[i]:null)).join(',')+')')).join('\n');dl(insertsFile(s),(t.table||'result')+'_inserts.sql');log('Exported '+a.rows.length+' row(s) as INSERTs.');}
 async function csvSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&!t.exact&&await refuseNulTextExport(t.db,t.table))return;dl(bCSV(t.cols,rows),(t.table||'result')+'_selected.csv');log('Exported '+rows.length+' selected row(s) to CSV.');}
 async function insSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&!t.exact&&await refuseNulTextExport(t.db,t.table))return;const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';const bc=await gridBinCols(id);
  // A generated column cannot be given a value, so it is left out.
  const info=t.table?await tableColumnsInfo(t.db,t.table):null;const gen=new Set((info||[]).filter(c=>c.generated).map(c=>c.name.toLowerCase()));
  const keep=t.cols.map((c,i)=>i).filter(i=>!gen.has(String(t.cols[i]).toLowerCase()));
- const s=rows.map(r=>insertSkipExisting(tbl,keep.map(i=>t.cols[i]),'('+keep.map(i=>litAs(r[i],bc?bc[i]:null)).join(',')+')')).join('\n');dl(s,(t.table||'result')+'_selected_inserts.sql');log('Exported '+rows.length+' selected row(s) as INSERTs.');}
+ const s=rows.map(r=>insertSkipExisting(tbl,keep.map(i=>t.cols[i]),'('+keep.map(i=>litAs(r[i],bc?bc[i]:null)).join(',')+')')).join('\n');dl(insertsFile(s),(t.table||'result')+'_selected_inserts.sql');log('Exported '+rows.length+' selected row(s) as INSERTs.');}
 async function dl(text,name){
  const ext=(name.split('.').pop()||'').toLowerCase();const filters=ext?[{name:ext.toUpperCase()+' file',extensions:[ext]}]:undefined;
  // Tauri: native Save As + backend write
@@ -10337,10 +10586,11 @@ function usersSelect(u,h){window._selAcct=_uaccts.find(a=>a.u===u&&a.h===h)||nul
 // Which privileges a level offers is the server's own list (SHOW PRIVILEGES), so a MySQL-only or
 // MariaDB-only privilege appears where it exists and nowhere else.
 const PRIV_TABLE=['SELECT','INSERT','UPDATE','DELETE','CREATE','DROP','ALTER','INDEX','REFERENCES','CREATE VIEW','SHOW VIEW','TRIGGER','DELETE HISTORY'];
-const PRIV_DB=[...PRIV_TABLE,'CREATE TEMPORARY TABLES','LOCK TABLES','EXECUTE','CREATE ROUTINE','ALTER ROUTINE','EVENT'];
+// SHOW CREATE ROUTINE is MariaDB 11.3's; like every entry it is shown only where SHOW PRIVILEGES lists it.
+const PRIV_DB=[...PRIV_TABLE,'CREATE TEMPORARY TABLES','LOCK TABLES','EXECUTE','CREATE ROUTINE','ALTER ROUTINE','EVENT','SHOW CREATE ROUTINE'];
 let _priv={acct:null,known:[],had:new Set(),hadGO:false};
 async function privOpen(){const a=window._selAcct;if(!a){toast('Select an account or a role first.',true);return;}
- _priv.acct=a;const sp=await api('/api/query',{sql:'SHOW PRIVILEGES'});
+ _priv.acct=a;_priv.wild=null;const sp=await api('/api/query',{sql:'SHOW PRIVILEGES'});
  _priv.known=(sp.ok&&sp.rows.length?sp.rows.map(r=>String(r[0]).toUpperCase()):PRIV_DB).filter(p=>!['USAGE','PROXY','GRANT OPTION'].includes(p));
  const sr=await api('/api/schemas');$('privDb').innerHTML=(sr.ok?sr.schemas:[]).map(s=>'<option>'+esc(s.name)+'</option>').join('');
  if(curSchema)$('privDb').value=curSchema;
@@ -10349,21 +10599,34 @@ async function privScopeChanged(){const sc=$('privScope').value;$('privDb').styl
  if(sc==='table'){const tr=await api('/api/query',{sql:'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='+lit($('privDb').value)+' ORDER BY TABLE_NAME'});
   $('privTable').innerHTML=(tr.ok?tr.rows:[]).map(r=>'<option>'+esc(r[0])+'</option>').join('');}
  await privLoad();}
-function privTarget(){const sc=$('privScope').value;return sc==='global'?'*.*':sc==='db'?qid($('privDb').value)+'.*':qid($('privDb').value)+'.'+qid($('privTable').value);}
+function privTarget(){const sc=$('privScope').value;return sc==='global'?'*.*':sc==='db'?qid(_priv.dbForm||$('privDb').value)+'.*':qid($('privDb').value)+'.'+qid($('privTable').value);}
+// In a database-level grant "_" and "%" are wildcards - on MariaDB, and on MySQL unless
+// partial_revokes is on - so SELECT granted on my_app was also SELECT on myXapp and my1app. A grant
+// made here names the database exactly (my\_app). One that already exists in the wildcard form
+// is kept in that form, so that taking a privilege away revokes what is really there, and the
+// window says what it covers.
+function privDbEscape(n){return String(n).replace(/[\\_%]/g,'\\$&');}
+async function privWildcards(){if(_priv.wild!=null)return _priv.wild;let wild=true;
+ if(!window.mariadb){try{const r=await api('/api/query',{sql:'SELECT @@partial_revokes'});if(r&&r.ok&&r.rows.length)wild=!(+r.rows[0][0]);}catch(e){}}
+ return _priv.wild=wild;}
 // information_schema names a grantee 'user'@'host', and a MariaDB role 'role' alone.
 function privGrantees(a){const u=String(a.u).replace(/'/g,"''"),h=String(a.h).replace(/'/g,"''");return ["'"+u+"'@'"+h+"'","'"+u+"'"].map(strLit).join(',');}
 async function privLoad(){const a=_priv.acct,sc=$('privScope').value;if(!a)return;const g=privGrantees(a);
  if(sc==='table'&&!$('privTable').value){$('privList').innerHTML='<div class="muted">This database has no tables.</div>';_priv.had=new Set();_priv.hadGO=false;privPreview();return;}
- const where=sc==='global'?'':' AND TABLE_SCHEMA='+lit($('privDb').value)+(sc==='table'?' AND TABLE_NAME='+lit($('privTable').value):'');
+ _priv.dbForm=null;let wildNote='';
+ const raw=$('privDb').value,exact=privDbEscape(raw),dbWild=sc==='db'&&exact!==raw&&await privWildcards();
+ const where=sc==='global'?'':' AND TABLE_SCHEMA'+(dbWild?' IN ('+lit(raw)+','+lit(exact)+')':'='+lit(raw))+(sc==='table'?' AND TABLE_NAME='+lit($('privTable').value):'');
  const t=sc==='global'?'USER_PRIVILEGES':sc==='db'?'SCHEMA_PRIVILEGES':'TABLE_PRIVILEGES';
- const r=await api('/api/query',{sql:'SELECT PRIVILEGE_TYPE,IS_GRANTABLE FROM information_schema.'+t+' WHERE GRANTEE IN ('+g+')'+where});const rows=r.ok?r.rows:[];
+ const r0=await api('/api/query',{sql:'SELECT PRIVILEGE_TYPE,IS_GRANTABLE'+(dbWild?',TABLE_SCHEMA':'')+' FROM information_schema.'+t+' WHERE GRANTEE IN ('+g+')'+where});let rows=r0.ok?r0.rows:[];
+ if(dbWild){const wildRows=rows.filter(x=>x[2]===raw);_priv.dbForm=wildRows.length?raw:exact;rows=wildRows.length?wildRows:rows.filter(x=>x[2]===exact);
+  if(wildRows.length)wildNote='<div class="muted" style="margin-top:8px;font-size:12px;color:var(--warn,#b8860b)">These were granted on '+esc(raw)+' as a pattern: "_" and "%" match any character, so they also apply to every database whose name fits it. Changes here are made to that same grant.</div>';}
  _priv.had=new Set(rows.map(x=>String(x[0]).toUpperCase()).filter(p=>p!=='USAGE'));_priv.hadGO=rows.some(x=>x[1]==='YES');
  const allowed=sc==='global'?_priv.known:(sc==='db'?PRIV_DB:PRIV_TABLE).filter(p=>_priv.known.includes(p));
  const data=allowed.filter(p=>PRIV_DB.includes(p)),admin=allowed.filter(p=>!PRIV_DB.includes(p));
  const box=p=>'<label class="ck"><input type="checkbox" value="'+esc(p)+'"'+(_priv.had.has(p)?' checked':'')+' onchange="privPreview()"> '+esc(p)+'</label>';
  $('privList').innerHTML=(sc==='global'?'<div class="psec">Data and structure, in every database</div>':'')+'<div class="pgrid">'+data.map(box).join('')+'</div>'+
   (admin.length?'<div class="psec">Running the server</div><div class="pgrid">'+admin.map(box).join('')+'</div>':'')+
-  (sc!=='global'?'<div class="muted" style="margin-top:8px;font-size:12px">Privileges on single columns or routines are not shown here - use Type a GRANT for those.</div>':'');
+  (sc!=='global'?'<div class="muted" style="margin-top:8px;font-size:12px">Privileges on single columns or routines are not shown here - use Type a GRANT for those.</div>':'')+wildNote;
  $('privGO').checked=_priv.hadGO;privPreview();}
 // The statements the boxes stand for: a GRANT for what was added, a REVOKE for what was taken away.
 function privSqlFor(){const a=_priv.acct;if(!a)return [];const on=privTarget(),who=uRef(a);
@@ -10411,7 +10674,9 @@ function identifiedBy(plugin,pw){if(!plugin)return 'IDENTIFIED BY '+strLit(pw);
  return window.mariadb?'IDENTIFIED VIA '+plugin+' USING PASSWORD('+strLit(pw)+')':'IDENTIFIED WITH '+plugin+' BY '+strLit(pw);}
 function acctExpiry(a){return !a||a.lifetime==null?'default':a.lifetime===0?'never':'days';}
 function acctSettingFields(a,group){return [
- {key:'ssl',label:'Connection security',type:'select',options:[{value:'NONE',label:'SSL not required'},{value:'ANY',label:'SSL required'},{value:'X509',label:'SSL with a client certificate required'}],value:a&&a.ssl==='X509'?'X509':a&&a.ssl==='ANY'?'ANY':'NONE',group},
+ // An account that requires a particular certificate (ISSUER, SUBJECT or CIPHER) keeps that as its
+ // own choice; it used to show as "SSL not required", one change away from being written so.
+ {key:'ssl',label:'Connection security',type:'select',options:[{value:'NONE',label:'SSL not required'},{value:'ANY',label:'SSL required'},{value:'X509',label:'SSL with a client certificate required'},...(a&&a.ssl==='SPECIFIED'?[{value:'SPECIFIED',label:'A specific client certificate required (kept as it is)'}]:[])],value:a&&['X509','ANY','SPECIFIED'].includes(a.ssl)?a.ssl:'NONE',group},
  {key:'exp',label:'Password expiry',type:'select',options:[{value:'default',label:'Server default'},{value:'never',label:'Never expires'},{value:'days',label:'Expires after the days below'}],value:acctExpiry(a),group},
  {key:'days',label:'Days until the password expires',value:a&&a.lifetime>0?String(a.lifetime):'90',group},
  {key:'mq',label:'Queries an hour (0 = no limit)',value:String(a?a.mq:0),group},
@@ -10419,8 +10684,8 @@ function acctSettingFields(a,group){return [
  {key:'mc',label:'Connections an hour (0 = no limit)',value:String(a?a.mc:0),group},
  {key:'muc',label:'Connections at once (0 = no limit)',value:String(a?a.muc:0),group}];}
 // ALTER USER for what differs from a (everything that is not the default, for a new account).
-function acctSettingSql(who,res,a){const out=[],n=k=>Math.max(0,parseInt(res[k],10)||0),curSsl=a?(a.ssl==='X509'?'X509':a.ssl==='ANY'?'ANY':'NONE'):'NONE';
- if(res.ssl!==curSsl)out.push('ALTER USER '+who+' REQUIRE '+(res.ssl==='ANY'?'SSL':res.ssl)+';');
+function acctSettingSql(who,res,a){const out=[],n=k=>Math.max(0,parseInt(res[k],10)||0),curSsl=a&&['X509','ANY','SPECIFIED'].includes(a.ssl)?a.ssl:'NONE';
+ if(res.ssl!==curSsl&&res.ssl!=='SPECIFIED')out.push('ALTER USER '+who+' REQUIRE '+(res.ssl==='ANY'?'SSL':res.ssl)+';');
  const lim=[['MAX_QUERIES_PER_HOUR','mq'],['MAX_UPDATES_PER_HOUR','mu'],['MAX_CONNECTIONS_PER_HOUR','mc'],['MAX_USER_CONNECTIONS','muc']].filter(([,k])=>n(k)!==(a?a[k]:0));
  if(lim.length)out.push('ALTER USER '+who+' WITH '+lim.map(([s,k])=>s+' '+n(k)).join(' ')+';');
  const days=Math.max(1,n('days'));
@@ -10460,14 +10725,23 @@ async function acctEdit(){const a=window._selAcct;if(!a){toast('Select an accoun
 function cloneGrantSql(lines,a,u,h){const bq=s=>'`'+String(s).replace(/`/g,'``')+'`',src=bq(a.u)+'@'+bq(a.h),dst=bq(u)+'@'+bq(h);
  return lines.map(s=>{for(const kw of [' TO ',' FOR ']){const i=s.lastIndexOf(kw+src);if(i>=0){const t=s.slice(0,i)+kw+dst+s.slice(i+kw.length+src.length);
    return t.replace(/\s+IDENTIFIED\s+(BY\s+PASSWORD\s+'[^']*'|VIA\s+.*?)(?=\s+(WITH|REQUIRE)\b|$)/i,'')+';';}}return null;}).filter(Boolean);}
+// REQUIRE ISSUER/SUBJECT/CIPHER as the account has it. A clone used to get no requirement at all -
+// weaker than the account it was made from - since SHOW GRANTS on MySQL 8 does not carry it.
+async function acctRequireSpecified(a,who){if(a.ssl!=='SPECIFIED')return [];
+ const q=await api('/api/query',{sql:'SELECT CONVERT(x509_issuer USING utf8mb4),CONVERT(x509_subject USING utf8mb4),CONVERT(ssl_cipher USING utf8mb4) FROM mysql.user WHERE User='+lit(a.u)+' AND Host='+lit(a.h)});
+ if(!q.ok||!q.rows.length){toast('Could not read the certificate '+uName(a)+' requires, so it was not cloned: '+(q.error||'no row'),true);return null;}
+ const [iss,sub,ci]=q.rows[0],parts=[iss&&'ISSUER '+strLit(iss),sub&&'SUBJECT '+strLit(sub),ci&&'CIPHER '+strLit(ci)].filter(Boolean);
+ return parts.length?['ALTER USER '+who+' REQUIRE '+parts.join(' AND ')+';']:['ALTER USER '+who+' REQUIRE X509;'];}
 async function acctClone(){const a=window._selAcct;if(!a){toast('Select an account first.',true);return;}
  if(a.role){toast('Clone makes accounts - select an account rather than a role.',true);return;}
  const res=await inputBox({title:'Clone '+uName(a),okText:'Clone',fields:[{key:'user',label:'New user name',value:a.u+'_copy'},{key:'host',label:'Host',value:a.h},{key:'pw',label:'Password for the new account',type:'password'}]});
  if(!res||!res.user.trim())return;const u=res.user.trim(),h=res.host.trim()||'%',who=strLit(u)+'@'+strLit(h);
  const g=await api('/api/query',{sql:'SHOW GRANTS FOR '+uRef(a)});if(!g.ok){toast(g.error,true);return;}
  const plugins=await authPlugins(),plugin=plugins.includes(a.plugin)?a.plugin:'';
+ const req=await acctRequireSpecified(a,who);if(req===null)return;
  const s=['CREATE USER '+who+' '+identifiedBy(plugin,res.pw)+';',
   ...acctSettingSql(who,{ssl:a.ssl==='X509'?'X509':a.ssl==='ANY'?'ANY':'NONE',exp:acctExpiry(a),days:String(a.lifetime||90),mq:a.mq,mu:a.mu,mc:a.mc,muc:a.muc},null),
+  ...req,
   ...cloneGrantSql(g.rows.map(x=>String(x[0])),a,u,h)];
  if(!window.mariadb&&a.defaults.length)s.push('SET DEFAULT ROLE '+a.defaults.map(uRef).join(', ')+' TO '+who+';');
  const r=await api('/api/script',{sql:s.join('\n')});if(!r.ok){toast(r.error,true);return;}
@@ -10481,7 +10755,7 @@ async function whoHasAccess(){const sr=await api('/api/schemas');const schemas=s
  const res=await inputBox({title:'Who has access',okText:'Show',fields:[{key:'db',label:'Database',type:'select',options:schemas,value:schemas.includes(curSchema)?curSchema:schemas[0]}]});if(!res)return;
  const db=res.db,sep=" SEPARATOR ', ')";
  const qs=["SELECT GRANTEE,'the whole server',GROUP_CONCAT(PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE"+sep+" FROM information_schema.USER_PRIVILEGES WHERE PRIVILEGE_TYPE IN ("+PRIV_DB.map(strLit).join(',')+") GROUP BY GRANTEE",
-  "SELECT GRANTEE,'the database',GROUP_CONCAT(PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE"+sep+" FROM information_schema.SCHEMA_PRIVILEGES WHERE TABLE_SCHEMA="+lit(db)+" GROUP BY GRANTEE",
+  "SELECT GRANTEE,'the database',GROUP_CONCAT(PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE"+sep+" FROM information_schema.SCHEMA_PRIVILEGES WHERE TABLE_SCHEMA IN ("+lit(db)+","+lit(privDbEscape(db))+") GROUP BY GRANTEE",
   "SELECT GRANTEE,CONCAT('table ',TABLE_NAME),GROUP_CONCAT(PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE"+sep+" FROM information_schema.TABLE_PRIVILEGES WHERE TABLE_SCHEMA="+lit(db)+" GROUP BY GRANTEE,TABLE_NAME",
   "SELECT GRANTEE,CONCAT('column ',TABLE_NAME,'.',COLUMN_NAME),GROUP_CONCAT(PRIVILEGE_TYPE ORDER BY PRIVILEGE_TYPE"+sep+" FROM information_schema.COLUMN_PRIVILEGES WHERE TABLE_SCHEMA="+lit(db)+" GROUP BY GRANTEE,TABLE_NAME,COLUMN_NAME"];
  const by=new Map();for(const q of qs){const r=await api('/api/query',{sql:q});if(r.ok)r.rows.forEach(([g,sc,p])=>{if(!by.has(g))by.set(g,[]);by.get(g).push(sc+': '+p);});}
@@ -10551,6 +10825,18 @@ function dColFromInfo(row,isMaria,tableColl){
    invisible:/\bINVISIBLE\b/i.test(extra),defShown,defSql,generated,genExpr:genExpr||''};
  return col;
 }
+// Each column's line in SHOW CREATE TABLE, keyed by lower-cased name.
+function dColumnLines(create){const out={};
+ String(create).split(/\r?\n/).forEach(l=>{const t=l.trim();if(!t.startsWith('`'))return;
+  let name='',i=1;for(;i<t.length;i++){if(t[i]==='`'){if(t[i+1]==='`'){name+='`';i++;continue;}break;}name+=t[i];}
+  if(i<t.length)out[name.toLowerCase()]=t.replace(/,$/,'');});
+ return out;}
+function dKeepFromCreate(col,line){if(!line||!col.keep)return;
+ const bare=sqlBlankStringsAndComments(line);
+ const at=bare.search(/\sCHECK\s*\((?![\s\S]*\sCHECK\s*\()/i);
+ if(at>=0){let d=0,ok=true;const open=bare.indexOf('(',at);for(let i=open;i<bare.length;i++){if(bare[i]==='(')d++;else if(bare[i]===')'){d--;if(d===0){ok=!bare.slice(i+1).trim();break;}}}
+  if(ok&&d===0)col.keep.check=line.slice(at).trim();}
+ const sr=/\/\*!80003 SRID (\d+) \*\//.exec(line);if(sr)col.keep.srid=sr[1];}
 function colDef(c){
  const k=c.keep||{};
  let s=qid(c.name)+' '+c.type;if(c.len)s+='('+c.len+')';
@@ -10559,7 +10845,9 @@ function colDef(c){
  if(c.nn)s+=' NOT NULL';if(c.ai)s+=' AUTO_INCREMENT';
  // An untouched default is written back exactly as it was read - including an empty-string
  // default, which the form cannot tell apart from "no default" by looking at the box.
- if(k.defSql!=null&&c.def===k.defShown)s+=' DEFAULT '+k.defSql;
+ // DEFAULT NULL is left out of a NOT NULL column: MariaDB reports a nullable column's default as the
+ // word NULL, and ticking NOT NULL then wrote NOT NULL DEFAULT NULL, which the server refuses.
+ if(k.defSql!=null&&c.def===k.defShown){if(!(c.nn&&/^NULL$/i.test(k.defSql)))s+=' DEFAULT '+k.defSql;}
  // A typed default is SQL where it can only be SQL - NULL, an expression in brackets such as
  // (CURDATE()) or (uuid()), and for a column that is not text a number, TRUE/FALSE, CURRENT_TIMESTAMP,
  // b'101' or 0x41 - and a string otherwise. A text column's "007" used to go in as the number 7,
@@ -10567,10 +10855,14 @@ function colDef(c){
  // BIT column, a wrong literal default on a VARCHAR.
  else if(c.def!==''&&c.def!=null){const d=String(c.def),texty=D_TEXTY.test(c.type);
   const asSql=/^NULL$/i.test(d)||/^\([\s\S]*\)$/.test(d)||(!texty&&/^(CURRENT_TIMESTAMP(\(\d*\))?|TRUE|FALSE|-?\d+(\.\d+)?([eE][+-]?\d+)?|[bB]'[01]*'|0x[0-9A-Fa-f]+)$/i.test(d));
-  s+=' DEFAULT '+(asSql?d:strLit(d));}
+  if(!(c.nn&&/^NULL$/i.test(d)))s+=' DEFAULT '+(asSql?d:strLit(d));}
  if(k.onUpdate&&D_TEMPORAL.test(c.type))s+=' ON UPDATE '+k.onUpdate;
  if(k.invisible)s+=' INVISIBLE';
- if(c.comment)s+=' COMMENT '+strLit(c.comment);return s;}
+ const sameType=k.origType!=null&&c.type===k.origType;
+ if(k.srid&&sameType)s+=' /*!80003 SRID '+k.srid+' */';
+ if(c.comment)s+=' COMMENT '+strLit(c.comment);
+ if(k.check&&sameType)s+=' '+k.check;
+ return s;}
 // The ALTER for a set of edited columns against what was read. A row keeps the name it was read
 // with, so renaming one is a CHANGE COLUMN; it used to be DROP COLUMN old + ADD COLUMN new, which
 // throws away every value in it.
@@ -10591,9 +10883,11 @@ function dAlterSql(orig,cols,tbl){
   alt.push((renamed?'CHANGE COLUMN '+qid(o.name)+' ':'MODIFY COLUMN ')+colDef(c));
  });
  orig.filter(o=>!seen.has(o.name)).forEach(o=>alt.push('DROP COLUMN '+qid(o.name)));
- const oldPk=orig.filter(c=>c.pk).map(c=>c.name).join(',');
- const newPk=cols.filter(c=>c.pk).map(c=>(c.keep&&c.keep.origName)||c.name).join(',');
- if(oldPk!==newPk){if(oldPk)alt.push('DROP PRIMARY KEY');const pk=cols.filter(c=>c.pk).map(c=>qid(c.name));if(pk.length)alt.push('ADD PRIMARY KEY ('+pk.join(',')+')');}
+ // The key keeps the order it has: its own columns first, as they were, then any newly ticked.
+ const was=c=>(c.keep&&c.keep.origName)||c.name,oldOrder=orig.pkOrder||orig.filter(c=>c.pk).map(c=>c.name);
+ const ticked=cols.filter(c=>c.pk),pkCols=[...oldOrder.map(n=>ticked.find(c=>was(c)===n)).filter(Boolean),...ticked.filter(c=>!oldOrder.includes(was(c)))];
+ const oldPk=oldOrder.join(','),newPk=pkCols.map(was).join(',');
+ if(oldPk!==newPk){if(oldPk)alt.push('DROP PRIMARY KEY');if(pkCols.length)alt.push('ADD PRIMARY KEY ('+pkCols.map(c=>qid(c.name)).join(',')+')');}
  const head=notes.length?notes.join('\n')+'\n':'';
  return alt.length?head+'ALTER TABLE '+tbl+'\n  '+alt.join(',\n  ')+';':head+'-- no changes detected';
 }
@@ -10602,7 +10896,20 @@ async function designTable(name,db){dEdited=false;db=db||curSchema||'';$('dSchem
    const r=await api('/api/query',{sql:"SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA,COLUMN_KEY,COLUMN_COMMENT,CHARACTER_SET_NAME,COLLATION_NAME,GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)+" ORDER BY ORDINAL_POSITION"});
    const tc=await api('/api/query',{sql:"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)});
    const tableColl=tc.ok&&tc.rows[0]?tc.rows[0][0]:null;
-   dOrig=[];if(r.ok)r.rows.forEach(row=>{const col=dColFromInfo(row,!!window.mariadb,tableColl);dOrig.push(col);dAddCol(col);});
+   // What information_schema does not say about a column, the server's own CREATE line does: a
+   // column-level CHECK (MariaDB writes one for every JSON column, json_valid) and MySQL's SRID. A
+   // MODIFY built without them dropped both - invalid JSON was accepted afterwards, and a spatial
+   // column took any SRID - so they are kept from that line while the column keeps its type.
+   const sc=await api('/api/query',{sql:'SHOW CREATE TABLE '+qid(db)+'.'+qid(name)});
+   const lines=dColumnLines(sc.ok&&sc.rows[0]?String(sc.rows[0][1]||''):'');
+   // The primary key as the table has it, in its own order. COLUMN_KEY says PRI for a UNIQUE NOT NULL
+   // column too when there is no primary key, which showed it ticked - and unticking or adding
+   // another wrote DROP PRIMARY KEY on a table that had none. And the key was rebuilt in column
+   // order, so PRIMARY KEY (b,a) became (a,b,...) the moment another column joined it.
+   const pkr=await api('/api/query',{sql:"SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)+" AND CONSTRAINT_NAME='PRIMARY' ORDER BY ORDINAL_POSITION"});
+   const pkOrder=pkr.ok?pkr.rows.map(x=>String(x[0])):null;
+   dOrig=[];if(pkOrder)dOrig.pkOrder=pkOrder;
+   if(r.ok)r.rows.forEach(row=>{const col=dColFromInfo(row,!!window.mariadb,tableColl);if(pkOrder)col.pk=pkOrder.includes(col.name);dKeepFromCreate(col,lines[String(col.name).toLowerCase()]);dOrig.push(col);dAddCol(col);});
    else{$('dLog').textContent='Could not read the table: '+r.error;}
  } else {$('dTitle').textContent='Create table';$('dMode').textContent='(new - generates CREATE)';dAddCol({name:'id',type:'INT',len:'',nn:true,ai:true,pk:true,def:null,comment:''});dAddCol({name:'',type:'VARCHAR',len:'255',nn:false,ai:false,pk:false,def:null,comment:''});}
  dGen();show('mDesign');}
@@ -10750,12 +11057,11 @@ if(!dbs.length && !tables.length){
     return;
 }
 
-// If no databases selected but tables are selected, extract the unique databases from tables
-if(!dbs.length && tables.length){
-    // Extract unique database names from the selected tables
-    const tableDbs = [...new Set(tables.map(t => t.split('.')[0]))];
-    dbs.push(...tableDbs);
-}const o={charset:$('expCharset').value};EXPOPTS.forEach(([k])=>o[k]=$('eo_'+k).checked);o.what=expWhat();if(o.what==='data')EXP_NOT_FOR.data.forEach(k=>o[k]=false);o.maxpacket=$('expMaxPacket').value.trim();let mode='table';if($('expPer').checked)mode='db';else if($('expSingle').checked)mode='single';const excludes=[...document.querySelectorAll('.exptbl:not(:checked)')].filter(c=>dbs.includes(c.dataset.db)).map(c=>c.dataset.db+'.'+c.value);
+// A database whose tables are ticked goes in with those tables (its unticked ones are left out below),
+// whether or not another database is ticked as well. Tables ticked under an unticked database used to
+// be dropped without a word as soon as any database box was ticked, and a database name with a dot
+// in it was cut at the dot. The name comes from the box itself.
+[...new Set([...document.querySelectorAll('.exptbl:checked')].map(c => c.dataset.db))].forEach(d => { if (!dbs.includes(d)) dbs.push(d); });const o={charset:$('expCharset').value};EXPOPTS.forEach(([k])=>o[k]=$('eo_'+k).checked);o.what=expWhat();if(o.what==='data')EXP_NOT_FOR.data.forEach(k=>o[k]=false);o.maxpacket=$('expMaxPacket').value.trim();let mode='table';if($('expPer').checked)mode='db';else if($('expSingle').checked)mode='single';const excludes=[...document.querySelectorAll('.exptbl:not(:checked)')].filter(c=>dbs.includes(c.dataset.db)).map(c=>c.dataset.db+'.'+c.value);
  if(!$('expStamp').checked){
    const chk=await api('/api/browse',{path:$('expFolder').value,filter:'*.sql',dirsOnly:false});
    if(chk.ok && chk.files && chk.files.length>0){
@@ -11462,7 +11768,7 @@ function acMove(dir){acIdx=(acIdx+dir+acItems.length)%acItems.length;acRender();
 // (e.g. from an earlier accepted suggestion that wasn't fully cleared first) mashes the new
 // suggestion and that old text together with no separator between them.
 function acAccept(id){const ta=acTa||$('ed_'+id);const pos=ta.selectionStart;const before=ta.value.slice(0,pos);const after=ta.value.slice(pos);const m=before.match(/[A-Za-z_][A-Za-z0-9_]*$/);const start=pos-(m?m[0].length:0);const mAfter=after.match(/^[A-Za-z0-9_]+/);const end=pos+(mAfter?mAfter[0].length:0);const val=acItems[acIdx]||'';
- ta.value=ta.value.slice(0,start)+val+ta.value.slice(end);const np=start+val.length;ta.selectionStart=ta.selectionEnd=np;acHide();syncHl(id);ta.focus();}
+ edReplaceRange(id,start,end,val);const np=start+val.length;ta.selectionStart=ta.selectionEnd=np;acHide();syncHl(id);ta.focus();}
 
 let csvTarget={db:null,table:null};
 async function exportFull(db,name,fmt){fmt=fmt||'csv';const ext=(fmt==='inserts')?'sql':'csv';const defName=name+(fmt==='inserts'?'_inserts.sql':'.csv');
@@ -11483,7 +11789,7 @@ async function exportFull(db,name,fmt){fmt=fmt||'csv';const ext=(fmt==='inserts'
  const expCols=info.filter(c=>fmt!=='inserts'||!c.generated).map(c=>c.name);
  const q=await api('/api/query',{sql:'SELECT '+expCols.map(qid).join(',')+' FROM '+qid(db)+'.'+qid(name),db:db});if(!q.ok){toast(q.error,true);return;}
  if(await refuseNulTextExport(db,name))return;
- if(fmt==='inserts'){const tbl=qid(db)+'.'+qid(name);const bc=await tableBinCols(db,name,q.columns);const s=q.rows.map(r=>insertSkipExisting(tbl,q.columns,'('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+')')).join('\n');dl(s,defName);}
+ if(fmt==='inserts'){const tbl=qid(db)+'.'+qid(name);const bc=await tableBinCols(db,name,q.columns);const s=q.rows.map(r=>insertSkipExisting(tbl,q.columns,'('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+')')).join('\n');dl(insertsFile(s),defName);}
  else{dl(bCSV(q.columns,q.rows),defName);}}
 function importCsv(db,table){csvTarget={db,table};$('csvTitle').textContent='Import CSV into '+db+'.'+table;$('csvFile').value='';$('csvLog').textContent='';show('mCsv');}
 async function runCsvImport(){const f=$('csvFile').value.trim();if(!f){toast('Choose a CSV file.',true);return;}

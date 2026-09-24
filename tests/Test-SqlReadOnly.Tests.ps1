@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
-$ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($n.Name -eq 'Test-SqlReadOnly' -or $n.Name -eq 'Split-OffKeyword' -or $n.Name -eq 'Strip-Parens')},$true) |
+$ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($n.Name -eq 'Test-SqlReadOnly' -or $n.Name -eq 'Test-SqlReadOnlyAs' -or $n.Name -eq 'Remove-SqlComments' -or $n.Name -eq 'Split-OffKeyword' -or $n.Name -eq 'Strip-Parens')},$true) |
   ForEach-Object { Invoke-Expression $_.Extent.Text }
 $fail = 0
 function Check($sql, $expected, $label) {
@@ -97,4 +97,18 @@ Check 'ALTER TABLE t DROP COLUMN c' $false 'designer DROP COLUMN blocked'
 Check 'RENAME TABLE a TO b' $false 'RENAME TABLE blocked'
 Check 'CREATE TABLE t (a INT)' $false 'designer CREATE TABLE blocked'
 Check 'SHOW CREATE TABLE t' $true 'reading a table DDL is still allowed'
+# Comments as the server reads them: "--" without a space is two minus signs, and nothing in
+# quotes is a comment. Each of these hid a DELETE from the check while the server ran it.
+Check 'SELECT 1--1; DELETE FROM t' $false '"--" with no space is not a comment'
+Check "SELECT '#'; DELETE FROM t" $false '# inside a string is not a comment'
+Check 'SELECT "--"; DELETE FROM t' $false '-- inside a string is not a comment'
+Check "SELECT '/*'; DELETE FROM t; SELECT '*/'" $false '/* inside a string is not a comment'
+Check 'SELECT `#x`; DELETE FROM t' $false '# inside a backticked name is not a comment'
+Check "SELECT 'a\'; DELETE FROM t; SELECT '" $false 'a backslash that escapes nothing under NO_BACKSLASH_ESCAPES'
+Check "SELECT 'a\''; DELETE FROM t; -- '" $false 'a backslash that escapes a quote by default'
+Check '/*M!100100 DELETE FROM t */' $false 'a MariaDB versioned comment runs its contents'
+Check 'SELECT 1 -- DELETE FROM t' $true 'a real -- comment'
+Check 'SELECT 1 # DELETE FROM t' $true 'a real # comment'
+Check 'SELECT 1--1' $true 'arithmetic that looks like a comment'
+Check "SELECT '--', '#', '/*' FROM t" $true 'comment markers inside strings'
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }

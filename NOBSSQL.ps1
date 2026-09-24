@@ -387,8 +387,13 @@ function New-Cnf {
     $sb = [System.Text.StringBuilder]::new()
     # Through the SSH tunnel when the connection has one (Get-Endpoint).
     $ep = Get-Endpoint $conn
-    [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$(Get-CnfSafe $ep.host)"); [void]$sb.AppendLine("port=$(Get-CnfSafe $ep.port)"); [void]$sb.AppendLine("user=$(Get-CnfSafe $conn.user)")
-    if ($conn.password) { [void]$sb.AppendLine("password=$((Get-CnfSafe $conn.password) -replace '\\','\\')") }
+    # User and password go in double quotes. Unquoted, the client ends the value at a "#" (the rest
+    # is a comment), drops spaces at either end and takes off a pair of quotes around it, so a
+    # password such as "ab#cd" reached the server as "ab" and nothing could log in. Inside the
+    # quotes a backslash and a double quote are escaped; both clients read back exactly this.
+    $q = { param($v) '"' + ((Get-CnfSafe $v) -replace '\\','\\' -replace '"','\"') + '"' }
+    [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$(Get-CnfSafe $ep.host)"); [void]$sb.AppendLine("port=$(Get-CnfSafe $ep.port)"); [void]$sb.AppendLine("user=$(& $q $conn.user)")
+    if ($conn.password) { [void]$sb.AppendLine("password=$(& $q $conn.password)") }
     # Every statement this app sends is UTF-8. Without this MySQL's mysql.exe takes the console code
     # page (cp850 here), so text written through it was converted as if it were cp850: an accented
     # letter was refused by a latin1 column, and stored as other characters elsewhere. MariaDB's
@@ -529,6 +534,12 @@ function SqlId  { param($x) $s=[string]$x; if (Needs-Quote $s) { '`' + ($s -repl
 # CR and NUL are written as escapes. mysql.exe reading a script (stdin, or source) turns every CR LF
 # into LF, so a raw CR before a line feed was silently dropped - measured with both clients. A raw
 # NUL makes it refuse the whole statement unless --binary-mode is on.
+# The values written with SqlLit escape a backslash as "\\". On a server whose sql_mode has
+# NO_BACKSLASH_ESCAPES a backslash is an ordinary character, and "C:\\temp" was stored as written,
+# one backslash too many - a CSV import, a synced row, a saved cell. The scripts that write them run
+# in a mysql.exe of their own, so they start with this, which takes the mode off for that session
+# and changes nothing else.
+function Get-EscapesOnSql { return "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',NO_BACKSLASH_ESCAPES,', ','));" }
 function SqlLit { param($x) if($null -eq $x){'NULL'} else { "'" + ((((([string]$x) -replace '\\','\\') -replace "'","''") -replace "`r",'\r') -replace "`0",'\0') + "'" } }
 # Run-Query2 represents binary/control-character values (e.g. a bit(1) byte, or blob content
 # with unprintable bytes) as hex text like "0x00" for safe display - that is NOT a real value,
@@ -1105,7 +1116,7 @@ function Api-Schemas { param($conn)
     $sizes = @{}
     foreach ($db in $dbs) {
         $escapedDb = $db -replace "'", "''"
-		$sizeQuery = "SELECT SUM(DATA_LENGTH + INDEX_LENGTH) as total_size FROM information_schema.TABLES WHERE TABLE_SCHEMA = "+(SqlLit $db)+" AND TABLE_TYPE = 'BASE TABLE'"
+		$sizeQuery = "SELECT SUM(DATA_LENGTH + INDEX_LENGTH) as total_size FROM information_schema.TABLES WHERE TABLE_SCHEMA = "+(SqlLit $db)+" AND TABLE_TYPE IN ('BASE TABLE','SYSTEM VERSIONED')"
         $sizeR = Run-Query2 $conn $sizeQuery $null
         if ($sizeR.ok -and $sizeR.rows.Count -gt 0 -and $sizeR.rows[0][0] -ne $null) {
             $sizes[$db] = [math]::Round([double]$sizeR.rows[0][0], 2)
@@ -1125,8 +1136,8 @@ function Api-Schemas { param($conn)
 # List everything inside a database: tables, views, routines, triggers, events.
 function Api-Objects { param($conn,$db)
     $dbl=SqlLit $db
-    $sql="SELECT 'table' t,TABLE_NAME n FROM information_schema.TABLES WHERE TABLE_SCHEMA=$dbl AND TABLE_TYPE='BASE TABLE' " +
-         "UNION ALL SELECT 'view',TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=$dbl AND TABLE_TYPE='VIEW' " +
+    $sql="SELECT 'table' t,TABLE_NAME n FROM information_schema.TABLES WHERE TABLE_SCHEMA=$dbl AND TABLE_TYPE IN ('BASE TABLE','SYSTEM VERSIONED') " +
+         "UNION ALL SELECT 'view',TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=$dbl AND TABLE_TYPE IN ('VIEW','SYSTEM VIEW') " +
          "UNION ALL SELECT IF(ROUTINE_TYPE='PROCEDURE','procedure','function'),ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=$dbl " +
          "UNION ALL SELECT 'trigger',TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=$dbl " +
          "UNION ALL SELECT 'event',EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA=$dbl ORDER BY 1,2"
@@ -1184,8 +1195,8 @@ function Api-Pk { param($conn,$db,$table)
 function Api-SearchAllSchemas { param($conn,$term)
     if(-not $term -or -not ([string]$term).Trim()){ return '{"ok":false,"error":"Empty search term."}' }
     $t = SqlLit ('%'+$term+'%')
-    $sql = "SELECT TABLE_SCHEMA,'table',TABLE_NAME FROM information_schema.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME LIKE $t " +
-           "UNION ALL SELECT TABLE_SCHEMA,'view',TABLE_NAME FROM information_schema.TABLES WHERE TABLE_TYPE='VIEW' AND TABLE_NAME LIKE $t " +
+    $sql = "SELECT TABLE_SCHEMA,'table',TABLE_NAME FROM information_schema.TABLES WHERE TABLE_TYPE IN ('BASE TABLE','SYSTEM VERSIONED') AND TABLE_NAME LIKE $t " +
+           "UNION ALL SELECT TABLE_SCHEMA,'view',TABLE_NAME FROM information_schema.TABLES WHERE TABLE_TYPE IN ('VIEW','SYSTEM VIEW') AND TABLE_NAME LIKE $t " +
            "UNION ALL SELECT ROUTINE_SCHEMA,IF(ROUTINE_TYPE='PROCEDURE','procedure','function'),ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_NAME LIKE $t " +
            "UNION ALL SELECT TRIGGER_SCHEMA,'trigger',TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_NAME LIKE $t " +
            "UNION ALL SELECT EVENT_SCHEMA,'event',EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_NAME LIKE $t " +
@@ -1288,16 +1299,33 @@ function Split-OffKeyword {
     return $null
 }
 
+# The text with its comments taken out the way the server reads them, strings left as they are.
+# "--" is a comment only when a space or control character follows it - "SELECT 1--1" is one
+# minus minus one - and nothing inside quotes is a comment. Patterns that ignored both let
+# "SELECT 1--1; DELETE FROM t", "SELECT '#'; DELETE FROM t" and "SELECT '/*'; DELETE FROM t;
+# SELECT '*/'" through as read-only, the DELETE hidden in what was taken for a comment.
+# /*! ... */ and /*M! ... */ are not comments at all: the server runs what they hold, so their
+# contents stay. One pattern reads the text from the left, so a quote met first starts a string
+# and a comment marker inside it is only text. Whether a backslash escapes a quote depends on the
+# server's sql_mode, which is why the caller asks both ways.
+function Remove-SqlComments { param([string]$sql, [bool]$BackslashEscapes)
+    $sq = if ($BackslashEscapes) { '''(?:[^''\\]|\\[\s\S]|'''')*''?' } else { '''(?:[^'']|'''')*''?' }
+    $dq = if ($BackslashEscapes) { '"(?:[^"\\]|\\[\s\S]|"")*"?' } else { '"(?:[^"]|"")*"?' }
+    $bq = '`(?:[^`]|``)*`?'
+    $re = [regex]('(?<s>' + $sq + '|' + $dq + '|' + $bq + ')|/\*M?!\d*(?<v>[\s\S]*?)(?:\*/|$)|/\*[\s\S]*?(?:\*/|$)|#[^\n]*|--(?=[\s\x00-\x1f]|$)[^\n]*')
+    return $re.Replace($sql, [System.Text.RegularExpressions.MatchEvaluator]{ param($m)
+        if ($m.Groups['s'].Success) { $m.Value } elseif ($m.Groups['v'].Success) { ' ' + $m.Groups['v'].Value + ' ' } else { ' ' } })
+}
+# Read-only only if it is read-only however a backslash is read: 'a\'; DELETE ...' is one string
+# where a backslash escapes and a string followed by a DELETE where it does not (sql_mode
+# NO_BACKSLASH_ESCAPES), and the other way round - so a text that would run a write under either
+# reading is refused.
 function Test-SqlReadOnly { param([string]$sql)
+    return ((Test-SqlReadOnlyAs $sql $true) -and (Test-SqlReadOnlyAs $sql $false))
+}
+function Test-SqlReadOnlyAs { param([string]$sql, [bool]$BackslashEscapes)
     if(-not $sql){ return $true }
-    # /*! ... */ and /*!50000 ... */ are NOT comments: MySQL executes their contents. Stripping
-    # them like a comment hid the statement inside from the keyword check below, so
-    # "/*!50000 DELETE FROM t */" passed as read-only and then deleted rows. Unwrap them first so
-    # the SQL they carry is checked like any other, and only then strip real comments.
-    $s = [regex]::Replace($sql, '/\*!\d*(.*?)\*/', ' $1 ', [System.Text.RegularExpressions.RegexOptions]::Singleline)
-    $s = [regex]::Replace($s, '/\*.*?\*/', ' ', [System.Text.RegularExpressions.RegexOptions]::Singleline)
-    $s = [regex]::Replace($s, '(?m)--.*$', ' ')
-    $s = [regex]::Replace($s, '(?m)#.*$', ' ')
+    $s = Remove-SqlComments $sql $BackslashEscapes
     $allow = 'SELECT','SHOW','DESCRIBE','DESC','EXPLAIN','USE','WITH','SET','HELP','VALUES','TABLE','ANALYZE','CHECK','CHECKSUM'
     foreach($stmt in ($s -split ';')){
         $t = $stmt.Trim()
@@ -1514,7 +1542,7 @@ function Api-RowOp { param($conn,$data)
         if($cols.Count -eq 0){ return '{"ok":false,"error":"no values"}' }
         $sql="INSERT INTO $obj ("+($cols -join ',')+") VALUES ("+($vals -join ',')+")"
     } else { return '{"ok":false,"error":"bad op"}' }
-    Run-Exec $conn $sql
+    Run-Exec $conn ((Get-EscapesOnSql) + "`n" + $sql)
 }
 # Endpoint: run a SELECT and return the first page of rows for the results grid, via a streaming
 # --quick cursor (Open-QueryCursor) instead of Run-Query2's full-buffer read - the fix for a
@@ -1827,12 +1855,39 @@ function Api-CancelJob { param($data)
 # objects. Strip it from the resulting file after a successful dump, leaving the surrounding
 # `SQL SECURITY DEFINER/INVOKER` clause and versioned comment wrappers intact - the object just
 # falls back to CURRENT_USER at creation time, which restores identically on the original server too.
+# Only the object definitions are touched. The whole file used to be read as UTF-8, run through the
+# pattern and written back: a row whose text held "DEFINER=`root`@`localhost`" (a table that keeps
+# DDL, an audit log) was changed in the backup, every byte of a latin1 or binary dump that is not
+# UTF-8 became U+FFFD, and a file too large to read was left as it was without a word. It is now
+# read a line at a time as ISO-8859-1 - one character per byte, both ways, so nothing is
+# re-encoded - into a file beside it that then takes its place. Rows are never touched: mysqldump
+# writes each INSERT on a line of its own and escapes line breaks inside values. Returns why it
+# could not be done, or nothing.
 function Strip-DefinerFile { param($file)
+    $tmp = "$file.definer.tmp"
+    $enc = [Text.Encoding]::GetEncoding(28591)
+    $re = [regex]'DEFINER=`(?:[^`]|``)*`@`(?:[^`]|``)*`\s*'
+    $r = $null; $w = $null
     try {
-        $content = [IO.File]::ReadAllText($file)
-        $stripped = [regex]::Replace($content, 'DEFINER=`(?:[^`]|``)*`@`(?:[^`]|``)*`\s*', '')
-        [IO.File]::WriteAllText($file, $stripped)
-    } catch {}
+        $r = New-Object IO.StreamReader($file, $enc, $false)
+        $w = New-Object IO.StreamWriter($tmp, $false, $enc)
+        $buf = New-Object char[] 1048576; $carry = ''
+        $emit = { param($line) if ($line.StartsWith('INSERT ') -or $line.StartsWith('REPLACE ')) { $w.Write($line) } else { $w.Write($re.Replace($line, '')) } }
+        while (($n = $r.Read($buf, 0, $buf.Length)) -gt 0) {
+            $chunk = $carry + (New-Object string($buf, 0, $n))
+            $at = 0
+            while (($nl = $chunk.IndexOf("`n", $at)) -ge 0) { & $emit $chunk.Substring($at, $nl - $at + 1); $at = $nl + 1 }
+            $carry = $chunk.Substring($at)
+        }
+        if ($carry.Length) { & $emit $carry }
+        $w.Close(); $w = $null; $r.Close(); $r = $null
+        Move-Item -LiteralPath $tmp -Destination $file -Force
+        return $null
+    } catch {
+        if ($w) { $w.Close() }; if ($r) { $r.Close() }
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        return $_.Exception.Message
+    }
 }
 # Whether a dump binary is MariaDB's, cached against its path like Test-ClientIsMariaDB.
 function Test-DumpIsMariaDB { param([string]$Path)
@@ -2014,7 +2069,7 @@ function Api-Export { param($conn,$data)
                 if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
                 [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
             }
-            elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $singleBase : "+(Friendly-DumpErr (FirstErr $r.err))) }
+            elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ $dn = Strip-DefinerFile $file; if($dn){ [void]$log.Add("NOTE $file : DEFINER could not be left out - $dn") } }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $singleBase : "+(Friendly-DumpErr (FirstErr $r.err))) }
         }
         elseif($mode -eq 'db'){
             # One file per database (includes routines/events/create-db as chosen).
@@ -2033,7 +2088,7 @@ function Api-Export { param($conn,$data)
                     [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
                     break
                 }
-                if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d : "+(Friendly-DumpErr (FirstErr $r.err))) }
+                if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ $dn = Strip-DefinerFile $file; if($dn){ [void]$log.Add("NOTE $file : DEFINER could not be left out - $dn") } }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d : "+(Friendly-DumpErr (FirstErr $r.err))) }
             }
         }
         else {
@@ -2044,7 +2099,7 @@ function Api-Export { param($conn,$data)
             :dbloop foreach($d in $dbs){
                 if($job.Cancelled){ [void]$log.Add("CANCELLED (remaining databases skipped)"); break }
                 # A view has no rows, so data only has nothing of it to split out; its tables only.
-                $onlyTables = if ($o.what -eq 'data') { " AND TABLE_TYPE='BASE TABLE'" } else { '' }
+                $onlyTables = if ($o.what -eq 'data') { " AND TABLE_TYPE IN ('BASE TABLE','SYSTEM VERSIONED')" } else { '' }
                 $q=Run-Query2 $conn ("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA="+(SqlLit $d)+$onlyTables+" ORDER BY TABLE_NAME") $null
                 if(-not $q.ok){ [void]$log.Add("FAILED (list tables) $d : "+$q.err); continue }
                 $tabs=@($q.rows | ForEach-Object { [string]$_[0] })
@@ -2065,9 +2120,10 @@ function Api-Export { param($conn,$data)
                     try {
                         if($job.Cancelled){ [void]$log.Add("CANCELLED $d"); break dbloop }
                         if($r.exit -eq 0 -and (Test-Path $whole)){
-                            if($o.nodefiner){ Strip-DefinerFile $whole }
+                            if($o.nodefiner){ $dn = Strip-DefinerFile $whole; if($dn){ [void]$log.Add("NOTE DEFINER could not be left out - $dn") } }
                             $files = $null
-                            try { $files = [NobsDumpDb]::SplitByTable($whole, $folder, "$dsafe.", "$stamp.sql") }
+                            $reserved = if($o.routines -or $o.events){ [string[]]@(Join-Path $folder "$dsafe.routines_events$stamp.sql") } else { [string[]]@() }
+                            try { $files = [NobsDumpDb]::SplitByTable($whole, $folder, "$dsafe.", "$stamp.sql", $reserved) }
                             catch { [void]$log.Add("FAILED $d : could not split the dump into tables: " + (Get-InnerMessage $_)) }
                             if($null -ne $files){
                                 $pathOf = New-Object 'System.Collections.Generic.Dictionary[string,string]'
@@ -2097,7 +2153,7 @@ function Api-Export { param($conn,$data)
                         if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
                         [void]$log.Add("CANCELLED (routines/events for $d stopped)")
                     }
-                    elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB, routines/events)") }
+                    elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ $dn = Strip-DefinerFile $file; if($dn){ [void]$log.Add("NOTE $file : DEFINER could not be left out - $dn") } }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB, routines/events)") }
                     else { [void]$log.Add("FAILED ($($r.exit)) $d routines/events : "+(Friendly-DumpErr (FirstErr $r.err))) }
                 }
             }
@@ -2563,7 +2619,10 @@ public static class NobsDumpDb {
     // One dump is one snapshot; splitting it keeps that. Files are named prefix + name + suffix,
     // with characters a file name cannot hold replaced; two names that come out the same get
     // _2, _3. Returns {name, path} in dump order. The dump is streamed, never held in memory.
-    public static List<string[]> SplitByTable(string src, string folder, string prefix, string suffix) {
+    public static List<string[]> SplitByTable(string src, string folder, string prefix, string suffix) { return SplitByTable(src, folder, prefix, suffix, null); }
+    // reserved: paths something else will write into the same folder - the routines file,
+    // "<db>.routines_events" - so that a table of that name gets a file of its own.
+    public static List<string[]> SplitByTable(string src, string folder, string prefix, string suffix, string[] reserved) {
         long off = 0, prevOff = 0, first = -1, lastSection = 0, tz = -1, mode = -1;
         bool prevDashes = false;
         using (var fs = File.OpenRead(src)) {
@@ -2591,6 +2650,7 @@ public static class NobsDumpDb {
             ReadFully(fs, footer);
         }
         var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (reserved != null) foreach (var p in reserved) used.Add(p);
         var pathOf = new Dictionary<string, string>(StringComparer.Ordinal);
         FileStream cur = null;
         byte[] pending = null;
@@ -2892,7 +2952,8 @@ function Read-Request { param($client)
                 $arr=$ms.ToArray(); $body=''
                 if($cl -gt 0){ $take=[Math]::Min($cl,$arr.Length-$bodyStart); $body=[Text.Encoding]::UTF8.GetString($arr,$bodyStart,$take) }
                 $first=($htext -split "`r`n")[0]; $parts=$first -split ' '
-                return @{ method=$parts[0]; path=$parts[1]; body=$body }
+                $hostHdr = if($htext -match '(?im)^Host:[ \t]*([^\r\n]*)'){ $Matches[1].Trim() } else { '' }
+                return @{ method=$parts[0]; path=$parts[1]; body=$body; host=$hostHdr }
             }
         }
     } catch { }
@@ -2998,6 +3059,7 @@ function Api-ImportCsv { param($conn,$data)
     # transactional DML that a rollback genuinely undoes - the one real cost is that it doesn't
     # reset an AUTO_INCREMENT counter the way TRUNCATE does.
     $sb=New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine((Get-EscapesOnSql))
     [void]$sb.AppendLine('START TRANSACTION;')
     # Foreign key and unique checks stay on. They were switched off here, which let a CSV row
     # point at a parent that does not exist - stored without an error.
@@ -4085,7 +4147,7 @@ function Api-CompareRowsApplyDiff { param($data)
     $log = New-Object System.Collections.ArrayList
     foreach($s in $skipped){ [void]$log.Add("SKIPPED (no columns/key) id=$s") }
     if($stmts.Count -eq 0){ return '{"ok":true,"log":'+(J-Arr $log)+'}' }
-    $script = "START TRANSACTION;`n" + ($stmts -join "`n") + "`nCOMMIT;`n"
+    $script = (Get-EscapesOnSql) + "`nSTART TRANSACTION;`n" + ($stmts -join "`n") + "`nCOMMIT;`n"
     $my = Get-Mysql $tgt
     $cnf = New-Cnf $tgt -Tool $my
     try {
@@ -4199,7 +4261,7 @@ function Api-CompareRowsApply { param($data)
             $endIdx = [Math]::Min($i+$batchSize,$rows.Count) - 1
             $batch = $rows[$i..$endIdx]
             $valuesSql = ($batch | ForEach-Object { Get-ValuesTuple $cols $_ $binSet }) -join ','
-            $sql = "INSERT INTO $obj ($colList) VALUES $valuesSql"
+            $sql = (Get-EscapesOnSql) + "`nINSERT INTO $obj ($colList) VALUES $valuesSql"
             # IMPORTANT: pipe the SQL via stdin (Run-Stdin), not as a "-e" command-line argument
             # (Run-Proc) - a batch of rows easily exceeds Windows' command-line length limit
             # ("The filename or extension is too long"), especially for wide tables.
@@ -5645,7 +5707,16 @@ async function refuseNulTextExport(db,table){
 // CR and NUL are written as escapes. mysql.exe reading a script (stdin, or source) turns every CR LF
 // into LF, so a raw CR before a line feed was silently dropped; a raw NUL makes it refuse the
 // statement unless --binary-mode is on.
-function strLit(v){return "'"+String(v).replace(/\\/g,'\\\\').replace(/'/g,"''").replace(/\r/g,'\\r').replace(/\0/g,'\\0')+"'";}
+// What a text box gives back has LF line ends whatever the value had. A value that was written
+// with CRLF throughout keeps CRLF when it is saved from one; anything else is saved as typed.
+function keepLineEnds(orig,edited){
+ if(typeof orig!=='string'||typeof edited!=='string'||orig.indexOf('\r\n')<0)return edited;
+ if(/\r(?!\n)|[^\r]\n|^\n/.test(orig))return edited;
+ return edited.replace(/\r\n|\n/g,'\r\n');}
+// A backslash is an escape in a string unless the server runs with NO_BACKSLASH_ESCAPES, and then
+// there is nothing to escape but the quote itself (see connect()).
+function strLit(v){if(typeof window!=="undefined"&&window.noBackslashEscapes)return "'"+String(v).replace(/'/g,"''")+"'";
+ return "'"+String(v).replace(/\\/g,'\\\\').replace(/'/g,"''").replace(/\r/g,'\\r').replace(/\0/g,'\\0')+"'";}
 
 // "All DBs" is a toggle. On, the filter box searches every schema, again after each pause in
 // typing; a second click, opening a schema or opening one of the matches goes back to one schema.
@@ -6285,7 +6356,18 @@ async function connect() {window._connFormTouched=true;
     // printed it twice.
     toast(/^Connection failed/i.test(String(r.error)) ? r.error : 'Connection failed: ' + r.error, true);
     disconnect();
-    if (tabs.length) { await closeAll(); }
+    // The open tabs belong to the connection that was open before, not to the one that failed. They
+    // are kept under that connection's own name and then closed. closeAll() saved the now empty
+    // list under whatever the dropdown said - the connection that failed - and the next successful
+    // Connect saved it again over the previous connection's tabs: a mistyped password lost every
+    // query tab, and the editor text lives nowhere else.
+    if (tabs.length) {
+      if (window._sessionKey) saveSession(window._sessionKey);
+      await Promise.all(tabs.filter(t=>t.runningReqId).map(t=>cancelQuery(t.id)));
+      tabs.forEach(closeCursorFor);
+      clearAllTabsSilently();
+    }
+    window._sessionKey = null;
     return;
   }
   log('  Connected: ' + r.version + ' (' + (r.mariadb ? 'MariaDB' : 'MySQL') + ')');
@@ -6307,6 +6389,12 @@ async function connect() {window._connFormTouched=true;
   // restored tabs briefly queried the CONNECTION YOU JUST LEFT instead of the new one.
   window._activeConn = getConn();
   window._activeReadOnly = window.readOnly;
+  // Whether a backslash inside a string is an escape on this server. With NO_BACKSLASH_ESCAPES in
+  // its sql_mode it is an ordinary character, and every literal the app wrote - grid edits,
+  // comments, passwords - stored C:\temp as C:\\temp, one more pair on every save. strLit()
+  // writes to match what the server says here.
+  window.noBackslashEscapes=false;
+  try{const m=await api('/api/query',{sql:'SELECT @@SESSION.sql_mode'});if(m&&m.ok&&m.rows&&m.rows.length)window.noBackslashEscapes=/NO_BACKSLASH_ESCAPES/i.test(String(m.rows[0][0]||''));}catch(e){}
   // Each connection remembers its own open tabs. Switching to a different connection saves
   // the tabs you're leaving (under its own key) and restores the new connection's own tabs.
   const _newKey = sessionKeyFor();
@@ -6426,12 +6514,38 @@ function fmtMs(ms){ms=+ms||0;if(ms>=10000)return Math.round(ms/1000)+'s';if(ms>=
 // The statement behind the grid: the result picked from a script's results, else the last
 // statement run.
 function gridSql(t){const rs=t.resultSets&&t.resultSets[t.resultIdx||0];if(rs)return rs.sql;const s=splitStmts(String(t.curRun||'')).filter(x=>!isCommentOnly(x));return s.length?s[s.length-1]:'';}
+// Whether the grid shows a whole table as it is - the app's own "SELECT * FROM db.table", with no
+// filter - so that "all rows" can be read straight from the table, streamed.
+function wholeTableShown(t){if(!t||!t.table||(t.filterClauses&&t.filterClauses.length))return false;
+ const ID='(?:`(?:[^`]|``)+`|[A-Za-z_$][A-Za-z0-9_$]*)';
+ return new RegExp('^select\\s+\\*\\s+from\\s+'+ID+'(?:\\s*\\.\\s*'+ID+')?$','i').test(sqlHead(gridSql(t)).replace(/;\s*$/,'').trim());}
+// Every row of the result the grid shows, for the commands that say "all rows". The grid holds the
+// rows read so far, 1000 at first; the rest are read by running the same query again, in the same
+// session. Those commands used to export the whole table whenever the grid was bound to one - a
+// quick-filtered tab or "SELECT ... WHERE ... LIMIT 20" wrote every row and column of the table -
+// and otherwise the rows loaded so far, which on a large result was only the first 1000.
+async function allResultRows(id){const t=T(id);
+ if(!t.hasMore)return {cols:t.cols,rows:t.rows};
+ const sql=gridSql(t);
+ if(!/^(select|with|show|table|values|desc|describe|explain)\b/i.test(sqlHead(sql))){
+  toast('Only the '+fmtCount(t.rows.length)+' rows read so far are included: this statement is not run a second time to read the rest.',true);
+  return {cols:t.cols,rows:t.rows};}
+ log('Reading every row of the result...');
+ const rs=t.resultSets&&t.resultSets[t.resultIdx||0];
+ // The same request the grid's rows came from (in the PowerShell edition that can be the exact-text
+ // form of the query), in the same session.
+ const q=await api('/api/query',Object.assign({},(!rs&&t.lastRunQ)||{sql,db:dbOf(t)},{session:sessOf(t)}));
+ if(!q.ok){toast(q.error,true);return null;}
+ return {cols:q.columns,rows:q.rows};}
 // How many rows the LIMIT at the very end of a statement allows - LIMIT n, LIMIT offset,n and
 // LIMIT n OFFSET m alike - or null. Only a trailing one: a LIMIT in a subquery is followed by its
 // ")", and limits that subquery, not the result.
 function trailingLimit(sql){const m=/\blimit\s+(\d+)\s*(?:,\s*(\d+)|offset\s+\d+)?\s*;?\s*$/i.exec(String(sql||''));if(!m)return null;return +(m[2]!=null?m[2]:m[1]);}
 function updateStatusLine(id){const t=T(id);if(!t||!t.rows)return;const st=$('st_'+id);if(!st)return;
-  const rowLabel=(t.table&&t.estRows!=null)?(t.rows.length+' row(s) of '+fmtCount(t.estRows)+' rows.'):(t.rows.length+' row(s).');
+  // The table's row count comes from information_schema, which for InnoDB is an estimate (a fully
+  // loaded table could read "60 row(s) of 57 rows"), and it is the whole table's - so it is said
+  // to be one, and only shown when the grid shows the whole table rather than a filtered part.
+  const rowLabel=(t.table&&t.estRows!=null&&wholeTableShown(t))?(t.rows.length+' row(s) of about '+fmtCount(t.estRows)+' (estimate).'):(t.rows.length+' row(s).');
   const ms=(t.lastElapsedMs!=null)?(' '+t.lastElapsedMs+' ms'):'';
   st.className='status';
   // The grid itself is a single continuous virtualized list over everything loaded so far - no
@@ -6634,8 +6748,8 @@ async function showOverview(forceRefresh) {
 
     const sql = `SELECT s.SCHEMA_NAME, COALESCE(t.tbls,0), COALESCE(t.rws,0), COALESCE(t.sz,0), COALESCE(v.vw,0), COALESCE(r.pr,0), COALESCE(r.fn,0), COALESCE(tr.trg,0), COALESCE(ev.evt,0), s.DEFAULT_CHARACTER_SET_NAME, s.DEFAULT_COLLATION_NAME
         FROM information_schema.SCHEMATA s
-        LEFT JOIN (SELECT TABLE_SCHEMA sc, COUNT(*) tbls, SUM(TABLE_ROWS) rws, SUM(DATA_LENGTH+INDEX_LENGTH) sz FROM information_schema.TABLES WHERE TABLE_TYPE='BASE TABLE' GROUP BY TABLE_SCHEMA) t ON t.sc=s.SCHEMA_NAME
-        LEFT JOIN (SELECT TABLE_SCHEMA sc, COUNT(*) vw FROM information_schema.TABLES WHERE TABLE_TYPE='VIEW' GROUP BY TABLE_SCHEMA) v ON v.sc=s.SCHEMA_NAME
+        LEFT JOIN (SELECT TABLE_SCHEMA sc, COUNT(*) tbls, SUM(TABLE_ROWS) rws, SUM(DATA_LENGTH+INDEX_LENGTH) sz FROM information_schema.TABLES WHERE TABLE_TYPE IN ('BASE TABLE','SYSTEM VERSIONED') GROUP BY TABLE_SCHEMA) t ON t.sc=s.SCHEMA_NAME
+        LEFT JOIN (SELECT TABLE_SCHEMA sc, COUNT(*) vw FROM information_schema.TABLES WHERE TABLE_TYPE IN ('VIEW','SYSTEM VIEW') GROUP BY TABLE_SCHEMA) v ON v.sc=s.SCHEMA_NAME
         LEFT JOIN (SELECT ROUTINE_SCHEMA sc, SUM(ROUTINE_TYPE='PROCEDURE') pr, SUM(ROUTINE_TYPE='FUNCTION') fn FROM information_schema.ROUTINES GROUP BY ROUTINE_SCHEMA) r ON r.sc=s.SCHEMA_NAME
         LEFT JOIN (SELECT TRIGGER_SCHEMA sc, COUNT(*) trg FROM information_schema.TRIGGERS GROUP BY TRIGGER_SCHEMA) tr ON tr.sc=s.SCHEMA_NAME
         LEFT JOIN (SELECT EVENT_SCHEMA sc, COUNT(*) evt FROM information_schema.EVENTS GROUP BY EVENT_SCHEMA) ev ON ev.sc=s.SCHEMA_NAME
@@ -6998,7 +7112,12 @@ async function duplicateTable(db,name){
   sql+='\nINSERT INTO '+qid(db)+'.'+qid(newName)+' ('+cl+') SELECT '+cl+' FROM '+qid(db)+'.'+qid(name)+';';
  }
  const r=await api('/api/script',{sql,db});
- if(r.ok){log('Duplicated '+name+' as '+newName+(res.data?' (with data)':' (structure only)')+'.');loadObjects(db);}
+ if(r.ok){log('Duplicated '+name+' as '+newName+(res.data?' (with data)':' (structure only)')+'.');loadObjects(db);
+  // CREATE TABLE ... LIKE copies the columns, indexes and CHECK constraints but never the foreign
+  // keys, and the copy was presented as a duplicate without a word about them.
+  try{const fk=await api('/api/query',{sql:'SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA='+lit(db)+' AND TABLE_NAME='+lit(name)});
+   const nfk=(fk&&fk.ok&&fk.rows.length)?+fk.rows[0][0]:0;
+   if(nfk>0){const m=newName+' has none of the '+nfk+' foreign key'+(nfk===1?'':'s')+' of '+name+': a copied table never gets them. Add them in the DDL if the copy needs them.';toast(m,true);log(m);}}catch(e){}}
  else{toast(r.error||'Duplicate failed',true);}
 }
 async function maint(db,name,op){const kw=op==='OPTIMIZE'?'OPTIMIZE TABLE':op==='ANALYZE'?'ANALYZE TABLE':op==='CHECK'?'CHECK TABLE':'REPAIR TABLE';const r=await api('/api/query',{sql:kw+' '+qid(db)+'.'+qid(name)});if(r.ok&&r.rows&&r.rows.length){log(op+': '+r.rows.map(x=>x.join(' | ')).join(' ; '));}else if(r.ok){log(op+' OK');}else{log(op+' error: '+r.error);}}
@@ -7013,6 +7132,10 @@ function fmtB(n){n=+n||0;return n>1048576?(n/1048576).toFixed(1)+' MB':n>1024?(n
 
 // ---- DDL ----
 async function openDdl(db,type,name){const r=await api('/api/ddl',{db,type,name});if(!r.ok){log('DDL error: '+r.error);toast(r.error,true);return;}
+ // MySQL answers with no definition at all when the account may run or alter a routine but not read
+ // it. What was built from that - DROP, then a CREATE with nothing in it - dropped the routine on
+ // Apply, reported "Applied OK" and had nothing to put back.
+ if(!String(r.ddl==null?'':r.ddl).trim()){toast('The server did not show the definition of '+name+' - this account may not read it, so it cannot be edited here.',true);return;}
  let body=r.ddl;
  if(type==='procedure'||type==='function'||type==='trigger'){const kw={procedure:'PROCEDURE',function:'FUNCTION',trigger:'TRIGGER'}[type];
   if(window.mariadb){
@@ -7290,13 +7413,22 @@ function sqlHead(s){
  }
 }
 function isCommentOnly(s){ return sqlHead(s)===''; }
+// Comments are read as the server reads them: "#" to the end of the line, and "--" only when a
+// space or control character follows it ("5--3" is five minus minus three). "#" used to be left
+// to the rest of the text, so an apostrophe in "# Don't run the next one" opened a string that
+// never closed, and Run at the cursor sent that SELECT together with every statement after it,
+// a DELETE included; "SELECT 1--1; DELETE ..." was one statement to this and two to the server.
+// DELIMITER is a client command only at the start of a line - "SELECT csv_delimiter FROM t"
+// used to be cut there. A backslash escapes the next character unless the server runs with
+// NO_BACKSLASH_ESCAPES, where 'C:\' is a whole string.
 function splitStmts(sql,withPos){let out=[],cur='',curStart=0,i=0,q=null,delim=';';sql=sql.replace(/\r\n/g,'\n');
+ const nbe=typeof window!=='undefined'&&!!window.noBackslashEscapes;
  while(i<sql.length){const c=sql[i];
-  if(q){cur+=c;if(c==='\\'&&q!=='`'){cur+=sql[i+1]||'';i+=2;continue;}if(c===q)q=null;i++;continue;}
-  if(c==='-'&&sql[i+1]==='-'){const e=sql.indexOf('\n',i);const seg=sql.slice(i,e<0?sql.length:e);cur+=seg;i+=seg.length;continue;}
+  if(q){cur+=c;if(c==='\\'&&q!=='`'&&!nbe){cur+=sql[i+1]||'';i+=2;continue;}if(c===q)q=null;i++;continue;}
+  if(c==='#'||(c==='-'&&sql[i+1]==='-'&&(i+2>=sql.length||/[\s\x00-\x1f]/.test(sql[i+2])))){const e=sql.indexOf('\n',i);const seg=sql.slice(i,e<0?sql.length:e);cur+=seg;i+=seg.length;continue;}
   if(c==='/'&&sql[i+1]==='*'){const e=sql.indexOf('*/',i);const seg=sql.slice(i,e<0?sql.length:e+2);cur+=seg;i+=seg.length;continue;}
   if(c==="'"||c==='"'||c==='`'){q=c;cur+=c;i++;continue;}
-  if(sql.slice(i).match(/^delimiter[ \t]+(\S+)/i)){const mm=sql.slice(i).match(/^delimiter[ \t]+(\S+)[^\n]*\n?/i);delim=mm[1];i+=mm[0].length;continue;}
+  if((c==='d'||c==='D')&&/^[ \t]*$/.test(sql.slice(sql.lastIndexOf('\n',i-1)+1,i))&&sql.slice(i).match(/^delimiter[ \t]+(\S+)/i)){const mm=sql.slice(i).match(/^delimiter[ \t]+(\S+)[^\n]*\n?/i);delim=mm[1];i+=mm[0].length;continue;}
   if(sql.slice(i,i+delim.length)===delim){if(cur.trim())out.push(withPos?{text:cur.trim(),start:curStart,end:i}:cur.trim());cur='';i+=delim.length;curStart=i;continue;}
   cur+=c;i++;}
  if(cur.trim())out.push(withPos?{text:cur.trim(),start:curStart,end:sql.length}:cur.trim());
@@ -7422,8 +7554,20 @@ if(typeof ResizeObserver!=='undefined')document.addEventListener('DOMContentLoad
 // indentation), but that limitation is purely cosmetic: the one thing this is guaranteed to
 // never do is alter what the query actually says, since every non-whitespace token passes
 // through completely unchanged.
+// Each token has to come out exactly as it went in, because only the space between tokens is
+// changed. The tokens used to be cut too small, and a space put into the middle of one changed the
+// query: 'O''Brien' became 'O' 'Brien' (two strings, which MySQL joins into OBrien), 1e5 became
+// "1 e5" and 0x41 "0 x41" (a number and a column alias), >= became "> =" (a syntax error), größe
+// fell apart at the ö, and @var at the @. A "--" or "#" comment ran on into the next token,
+// so the line after it - "AND b = 2" of a DELETE's WHERE - became part of the comment.
 function formatSql(sql){
- const re=/(\/\*[\s\S]*?\*\/|--[^\n]*)|('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`]|``)*`)|(\b\d+(?:\.\d+)?\b)|([A-Za-z_][A-Za-z0-9_]*)|([\s\S])/g;
+ const W='[A-Za-z0-9_$\\u0080-\\uffff]';
+ const STR="'(?:[^'\\\\]|\\\\[\\s\\S]|'')*'";
+ const re=new RegExp('(\\/\\*[\\s\\S]*?\\*\\/|(?:--(?=\\s|$)|#)[^\\n]*)'
+  +'|([xXbBnN]?'+STR+'|"(?:[^"\\\\]|\\\\[\\s\\S]|"")*"|`(?:[^`]|``)*`)'
+  +'|(0x[0-9A-Fa-f]+(?!'+W+')|0b[01]+(?!'+W+')|(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?(?!'+W+'))'
+  +'|(@@?(?:[A-Za-z0-9_$.\\u0080-\\uffff]+|`(?:[^`]|``)*`|'+STR+')|'+W+'+)'
+  +'|(<=>|->>|->|<>|!=|<=|>=|:=|\\|\\||&&|<<|>>|[\\s\\S])','g');
  let m,toks=[];
  while((m=re.exec(sql))){
   if(m[1])toks.push({t:'comment',v:m[1]});
@@ -7456,10 +7600,20 @@ function formatSql(sql){
    }
    out+=tok.v;
   }
+  // A line comment ends at the end of its line; whatever follows starts a new one.
+  if(tok.t==='comment'&&!tok.v.startsWith('/*'))out+='\n';
  }
  return out.trim();
 }
-function formatTabSql(id){const ta=$('ed_'+id);ta.value=formatSql(ta.value);syncHl(id);log('Formatted query.');}
+// A script with DELIMITER lines is left as it is: the delimiter is whatever the line says, and
+// nothing here knows where a routine body starts or ends. The text is replaced as an edit, so
+// Ctrl+Z brings the original back.
+function formatTabSql(id){const ta=$('ed_'+id);
+ if(/^[ \t]*delimiter[ \t]/im.test(ta.value)){toast('A script with DELIMITER lines is not formatted - the routine bodies in it would be.',true);return;}
+ const next=formatSql(ta.value);if(next===ta.value)return;
+ ta.focus();ta.select();let ok=false;try{ok=document.execCommand('insertText',false,next);}catch(e){}
+ if(!ok||ta.value!==next)ta.value=next;
+ syncHl(id);markEdited(id);log('Formatted query.');}
 async function runSel(id){
  const ta=$('ed_'+id);
  const sel=ta.value.substring(ta.selectionStart,ta.selectionEnd).trim();
@@ -7634,7 +7788,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     const bind=t.ddl?null:parseSingleEditableTable(lastStmt,tableDb);
     const exact=bind?await exactTextQuery(_q,lastStmt,bind):null;
     if(stale())return;
-    const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,requestId:reqId,pageSize:PAGE_BATCH,browse:true,exactText:exact&&exact.cols.length?exact.cols:undefined,session:sessOf(t)},t.abortCtrl.signal);
+    t.lastRunQ={sql:exact?exact.sql:_q,db:runDb,exactText:exact&&exact.cols.length?exact.cols:undefined};const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,requestId:reqId,pageSize:PAGE_BATCH,browse:true,exactText:exact&&exact.cols.length?exact.cols:undefined,session:sessOf(t)},t.abortCtrl.signal);
     if(r.aborted){if(!stale()){st.className='status';st.textContent='Query cancelled.';}return;}
     if(stale())return;
     if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log(logErr(r.error));await schemaGoneNote(id,r.error);return;}
@@ -7651,6 +7805,10 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';return;}
     const ra=$('resultActions_'+id);if(ra)ra.style.display='inline-flex';
     refreshRunTableBinding(id,lastStmt,tableDb);
+    // Column types and NULL-ability are read again for every result: the tab may now show another
+    // table, or the table may have been altered since, and a cached ENUM list or NOT NULL decides
+    // what an edit offers and writes.
+    t._colMetaP=null;
     if(t.table){const pk=await api('/api/pk',{db:t.db,table:t.table});if(pk.ok&&pk.pk.length){t.pk=pk.pk;t.pending={upd:{},del:new Set(),ins:[]};}
       const fk=await api('/api/fk',{db:t.db,table:t.table});if(fk.ok){t.fk=fk.fk||[];t.fkDetails=fk.fkDetails||[];}
       // Prime column-type info (and derive which columns are BIT) right away, alongside pk/fk -
@@ -7856,26 +8014,68 @@ function useTarget(stmts){
  return db;
 }
 // Conservative on purpose: only recognizes "SELECT ... FROM <one table>" with no JOIN/comma-join,
-// UNION, GROUP BY, DISTINCT, or bare aggregate call - any of those can produce a result that
-// isn't one row per primary key, which is exactly what row-editing (and Apply's UPDATE/DELETE
-// WHERE pk=...) assumes. No alias support either, matching the one pattern this app itself ever
-// generates (openRun/toggleAll's own "SELECT * FROM db.table"). False negatives (a hand-written
-// query that IS safely editable but doesn't match) just mean no edit bar, never a false positive.
+// UNION, GROUP BY, or DISTINCT - any of those can produce a result that isn't one row per primary
+// key, which is exactly what row-editing (and Apply's UPDATE/DELETE WHERE pk=...) assumes. No
+// alias support either, matching the one pattern this app itself ever generates (openRun/
+// toggleAll's own "SELECT * FROM db.table") - false negatives (a hand-written query that IS
+// safely editable but doesn't match) just mean no edit bar, never a false positive.
+// The statement is read with its strings and comments blanked out, and the FROM that counts is the
+// one outside all brackets. The first "from" anywhere used to decide: a subquery in the column list
+// ("(SELECT name FROM users WHERE ...) AS n ... FROM orders"), a commented-out line or a string
+// bound the grid to that other table, and Apply wrote an orders row's values into the users row
+// with the same key. Every column must also be the table's own, under its own name: "LEFT(body,20)
+// AS body" saved back cut the text to 20 characters, and "parent_id AS id" keyed an edit to
+// another row.
 function parseSingleEditableTable(sql,fallbackDb){
  const head=sqlHead(sql).replace(/;\s*$/,'').trim();
  if(!/^select\b/i.test(head))return null;
- if(/^select\s+distinct\b/i.test(head))return null;
- if(/\bunion\b/i.test(head))return null;
- if(/\bgroup\s+by\b/i.test(head))return null;
+ // A versioned comment is code the server runs - nothing here can say what it adds.
+ if(/\/\*[!M]/.test(head))return null;
+ const bare=sqlBlankStringsAndComments(head);
+ if(/^select\s+distinct\b/i.test(bare))return null;
+ if(/\bunion\b/i.test(bare))return null;
+ if(/\bgroup\s+by\b/i.test(bare))return null;
+ // How deep in brackets each character is: 0 is the statement itself.
+ const depth=[];for(let i=0,d=0;i<bare.length;i++){if(bare[i]==='(')d++;depth.push(d);if(bare[i]===')')d--;}
  const ID='(?:`(?:[^`]|``)+`|[A-Za-z_$][A-Za-z0-9_$]*)';
- const m=head.match(new RegExp('\\bfrom\\s+('+ID+')(?:\\s*\\.\\s*('+ID+'))?','i'));
+ const re=new RegExp('\\bfrom\\s+('+ID+')(?:\\s*\\.\\s*('+ID+'))?','ig');let m;
+ while((m=re.exec(bare))&&depth[m.index]!==0){}
  if(!m)return null;
- if(/\b(count|sum|avg|min|max|group_concat|std|stddev|variance|bit_and|bit_or|bit_xor)\s*\(/i.test(head.slice(0,m.index)))return null;
- const rest=head.slice(m.index+m[0].length).trim();
+ const rest=bare.slice(m.index+m[0].length).trim();
  if(rest&&!/^(where|order\s+by|limit|having)\b/i.test(rest))return null;
  const unq=s=>s.startsWith('`')?s.slice(1,-1).replace(/``/g,'`'):s;
- return m[2]?{db:unq(m[1]),table:unq(m[2])}:{db:fallbackDb,table:unq(m[1])};
+ const table=unq(m[2]||m[1]),db=m[2]?unq(m[1]):fallbackDb;
+ // The column list: * or the table's own columns, each at most qualified by the table's name and
+ // "renamed" to itself. Anything else - an expression, a literal, a function, an alias - is a
+ // column the table does not have, or one of its columns under another name.
+ const lead=bare.match(/^select\s+(?:(?:all|high_priority|straight_join|sql_small_result|sql_big_result|sql_buffer_result|sql_no_cache|sql_cache|sql_calc_found_rows)\s+)*/i)[0].length;
+ const items=[];let from=lead;
+ for(let i=lead,bq=false;i<m.index;i++){if(bare[i]==='`')bq=!bq;else if(!bq&&bare[i]===','&&depth[i]===0){items.push(bare.slice(from,i));from=i+1;}}
+ items.push(bare.slice(from,m.index));
+ const itemRe=new RegExp('^\\s*(?:('+ID+')\\s*\\.\\s*)?(\\*|'+ID+')(?:\\s+(?:as\\s+)?('+ID+'))?\\s*$','i');
+ const same=(a,b)=>a.toLowerCase()===b.toLowerCase();
+ for(const it of items){const x=it.match(itemRe);if(!x)return null;
+  if(x[1]&&!same(unq(x[1]),table))return null;
+  if(x[3]&&(x[2]==='*'||!same(unq(x[3]),unq(x[2]))))return null;}
+ return {db,table};
 }
+// The same text with the inside of every string and every comment replaced by spaces, so what is
+// left can be searched for keywords without a quoted "from" or a commented-out line counting. It
+// is as long as the input, so a position in one is the same position in the other. Backticked
+// names are kept as they are: they are what is being looked for. "--" starts a comment only when
+// whitespace follows it, as in MySQL.
+function sqlBlankStringsAndComments(s){let out='',q=null;
+ for(let i=0;i<s.length;i++){const c=s[i];
+  if(q){
+   if(q==='`'){out+=c;if(c==='`'){if(s[i+1]==='`'){out+='`';i++;}else q=null;}continue;}
+   if(c==='\\'&&i+1<s.length){out+='  ';i++;continue;}
+   if(c===q){if(s[i+1]===q){out+='  ';i++;continue;}q=null;out+=c;continue;}
+   out+=(c==='\n'?'\n':' ');continue;}
+  if(c==="'"||c==='"'||c==='`'){q=c;out+=c;continue;}
+  if(c==='#'||(c==='-'&&s[i+1]==='-'&&(i+2>=s.length||/\s/.test(s[i+2])))){let e=s.indexOf('\n',i);if(e<0)e=s.length;out+=' '.repeat(e-i);i=e-1;continue;}
+  if(c==='/'&&s[i+1]==='*'){let e=s.indexOf('*/',i+2);e=e<0?s.length:e+2;out+=s.slice(i,e).replace(/[^\n]/g,' ');i=e-1;continue;}
+  out+=c;}
+ return out;}
 async function openRun(id){const t=T(id);const where=combinedFilterWhere(t);const wh=where?(' WHERE '+where):'';const sql='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+wh+';';$('ed_'+id).value=sql;syncHl(id);await runSql(id,sql);updateFilterBar(id);}
 
 // ---- editable grid with pending changes ----
@@ -7916,7 +8116,11 @@ function ctrlCharNote(s,hasHexTab){
 }
 function setVNote(text){const n=$('vNote');if(!n)return;n.textContent=text||'';n.style.display=text?'block':'none';}
 function decodeCtrlCharCell(hexStr,maxChars){
- const hex=hexStr.slice(2);const bytes=[];for(let i=0;i<hex.length;i+=2){bytes.push(parseInt(hex.substr(i,2),16));}
+ // Only as many bytes as the characters shown can take (four at most per character). The whole
+ // value used to be turned into a byte array first, on every scroll frame, for every blob cell
+ // in view - a few MB each - just to show the first 300 characters of it.
+ const full=hexStr.slice(2),cap=((maxChars||0)+2)*8;const hex=full.length>cap?full.slice(0,cap):full;
+ const bytes=[];for(let i=0;i<hex.length;i+=2){bytes.push(parseInt(hex.substr(i,2),16));}
  const decoder=new TextDecoder('utf-8',{fatal:false});
  let html='',shown=0,segStart=0,truncated=false;
  for(let i=0;i<=bytes.length;i++){
@@ -7932,7 +8136,7 @@ function decodeCtrlCharCell(hexStr,maxChars){
   }
   if(truncated)break;
  }
- if(truncated)html+='\u2026';
+ if(truncated||hex.length<full.length)html+='\u2026';
  return html;
 }
 // A binary column holding no bytes arrives as a bare "0x" - the prefix with nothing after it. The
@@ -8521,15 +8725,20 @@ function viewText(title,text,opts){opts=opts||{};$('vTitle').textContent=title;c
    : ctrlCharNote(ta.value,false));
  }
  const a=$('vActions');a.innerHTML='';const add=(label,cls,fn)=>{const b=document.createElement('button');b.textContent=label;if(cls)b.className=cls;b.onclick=fn;a.appendChild(b);};
+ // A text box hands CRLF back as LF, so a value holding CRLF came back changed from a window
+ // that was only opened and saved. Untouched, the value is given back exactly as it came; edited,
+ // it keeps the line endings it had.
+ const taInit=ta.value,modeInit=(opts.hexText&&_vHexState)?_vHexState.mode:null;
  const getVal=()=>{
   if(opts.multiOptions&&opts.multiOptions.length)return [...multi.querySelectorAll('input:checked')].map(cb=>cb.value).join(',');
+  if(!opts.options&&!opts.dateType&&ta.value===taInit&&(!opts.hexText||!_vHexState||_vHexState.mode===modeInit))return text;
   if(opts.dateType)return nativeDateToMysql(dt.value,opts.dateType);
   // bitNumeric: both tabs pass their box content straight through unconverted - a plain decimal
   // string goes unquoted via litForCol's existing BIT-integer path, a "0x.." string goes unquoted
   // via lit()'s existing hex-literal passthrough. Neither needs re-encoding here.
   if(opts.bitNumeric)return ta.value;
   if(opts.hexText)return hexCellValueForSave(_vHexState.mode, ta.value);
-  return opts.options?sel.value:ta.value;
+  return opts.options?sel.value:keepLineEnds(text,ta.value);
  };
  if(!opts.options&&!opts.multiOptions&&!opts.dateType){
   add('Copy','',()=>{copyText(ta.value,'Copied to clipboard.',opts.hexText?'Copy it from the Hex tab instead to keep the whole value.':'');});
@@ -8583,15 +8792,20 @@ if(opts.onSave)add('Save','go',async()=>{
 function colMeta(id){
  const t=T(id);if(!t||!t.table)return Promise.resolve(null);
  if(!t._colMetaP){
-  t.colTypes={};t.colNull={};t.colAi={};
+  t.colTypes={};t.colNull={};t.colAi={};t.colGen={};
   t._colMetaP=(async()=>{try{
    const r=await api('/api/query',{sql:"SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(dbOf(t))+" AND TABLE_NAME="+lit(t.table)});
-   if(r.ok)r.rows.forEach(row=>{t.colTypes[row[0]]=row[1];t.colNull[row[0]]=(String(row[2]).toUpperCase()==='YES');t.colAi[row[0]]=/auto_increment/i.test(row[3]||'');});
+   if(r.ok)r.rows.forEach(row=>{t.colTypes[row[0]]=row[1];t.colNull[row[0]]=(String(row[2]).toUpperCase()==='YES');t.colAi[row[0]]=/auto_increment/i.test(row[3]||'');t.colGen[row[0]]=/\b(virtual|stored|persistent)\s+generated\b/i.test(row[3]||'');});
   }catch(e){}})();
  }
  return t._colMetaP.then(()=>t);
 }
 async function getColType(id,colName){const t=await colMeta(id);return t?(t.colTypes[colName]||null):null;}
+// A generated column is computed by the server and cannot be given a value: MySQL refuses the whole
+// Apply (3105), and MariaDB outside strict mode ignores the value with a warning while the app
+// reported it saved. As with NULL, what is known right now decides.
+function isGenCol(id,colName){const t=T(id);return !!(t&&t.colGen&&t.colGen[colName]);}
+function genColMsg(c){return 'Column "'+c+'" is generated - the server computes its value, so it cannot be edited.';}
 // Whether a column can be set to NULL, as far as is known right now: not a key column, nor one the
 // table declares NOT NULL. When nothing is known - a result that is not one table, a lookup that
 // failed - it is offered, and the server has the last word.
@@ -8656,7 +8870,9 @@ async function editWidgetFor(id,colName,curVal){
  const colType=await getColType(id,colName);
  if(colType&&/^enum\(/i.test(colType))return {options:parseQuotedOptionList(colType)};
  if(colType&&/^set\(/i.test(colType))return {multiOptions:parseQuotedOptionList(colType)};
- if(colType&&/^tinyint\(1\)/i.test(colType))return {options:['0','1']};
+ // Only for a value the dropdown can show: a TINYINT(1) holding 2 or -1 (it is an integer, not a
+ // boolean) had nothing selected, and Save wrote ''. Such a value is edited as text.
+ if(colType&&/^tinyint\(1\)/i.test(colType)&&(curVal==null||curVal===''||curVal==='0'||curVal==='1'||curVal===0||curVal===1))return {options:['0','1']};
  let dateType=null;
  if(colType&&/^date$/i.test(colType))dateType='date';
  else if(colType&&/^(datetime|timestamp)/i.test(colType))dateType='datetime-local';
@@ -8703,18 +8919,21 @@ function binaryEditMode(flaggedBinary,v){
 }
 async function editCell(td,id,ri,ci){clearTimeout(clickTimer);const t=T(id);t._fullEditAt=Date.now();const key=ri+':'+ci;const cur=(key in t.pending.upd)?t.pending.upd[key]:t.rows[ri][ci];
  const ew=await editWidgetFor(id,t.cols[ci],cur);
+ if(isGenCol(id,t.cols[ci])){viewText('Cell - '+t.cols[ci]+'  (generated)',cur==null?'':cur,{readonly:true});return;}
  viewText('Cell - '+t.cols[ci]+(cur===null?'  (currently NULL)':''),cur,{onSave:v=>setUpd(id,ri,ci,v),onNull:canNull(id,t.cols[ci])?()=>setUpd(id,ri,ci,null):null,...ew});}
 // The cell window for a result that cannot be edited: the whole value, to read and copy.
 function viewCell(id,ri,ci){const t=T(id);if(!t||!t.rows[ri])return;const v=t.rows[ri][ci];viewText('Cell - '+t.cols[ci]+(v===null?'  (NULL)':''),v===null?'':v,{readonly:true});}
-function setUpd(id,ri,ci,v){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}if(v===null&&t.pk&&t.pk.indexOf(t.cols[ci])>=0){toast('Column "'+t.cols[ci]+'" is part of the primary key and cannot be set to NULL.',true);return;}if(v===null&&!canNull(id,t.cols[ci])){toast('Column "'+t.cols[ci]+'" is NOT NULL and cannot be set to NULL.',true);return;}const key=ri+':'+ci;if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;renderGrid(id);}
+function setUpd(id,ri,ci,v){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}if(v===null&&t.pk&&t.pk.indexOf(t.cols[ci])>=0){toast('Column "'+t.cols[ci]+'" is part of the primary key and cannot be set to NULL.',true);return;}if(v===null&&!canNull(id,t.cols[ci])){toast('Column "'+t.cols[ci]+'" is NOT NULL and cannot be set to NULL.',true);return;}if(isGenCol(id,t.cols[ci])){toast(genColMsg(t.cols[ci]),true);return;}const key=ri+':'+ci;if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;renderGrid(id);}
 // The same for a set of cells given one value, with one rebuild at the end. A key column or a NOT
 // NULL one is never given NULL; it is left as it was, and the user is told.
 function setUpdMany(id,keys,v){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}
- let n=0,kept=0;
+ let n=0,kept=0,gen=0;
  keys.forEach(key=>{const p=key.split(':'),ri=+p[0],ci=+p[1];if(!t.rows[ri])return;
+  if(isGenCol(id,t.cols[ci])){gen++;return;}
   if(v===null&&!canNull(id,t.cols[ci])){kept++;return;}
   if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;n++;});
  renderGrid(id);
+ if(gen)toast(gen+' cell'+(gen===1?' is':'s are')+' in a generated column and '+(gen===1?'was':'were')+' left as '+(gen===1?'it was':'they were')+'.',true);
  if(kept)toast(kept+' cell'+(kept===1?' was':'s were')+' left as they were - '+(kept===1?'its column':'their columns')+' cannot hold NULL.',true);
  else if(n>1)toast('Set '+n+' cells.');}
 // Typing with cells picked: the editor opens on the focused cell (or else the anchor) holding the
@@ -8896,6 +9115,7 @@ async function inlineEdit(td,id,ri,ci,opts){const t=T(id);const key=ri+':'+ci;co
  // click that already put a box here, wins: a box made now would sit behind the window and take
  // the focus from it.
  if(!td.isConnected||td.querySelector('input,textarea')||(t._fullEditAt||0)>=started)return;
+ if(isGenCol(id,t.cols[ci])){toast(genColMsg(t.cols[ci]),true);return;}
  if(colType&&(/^enum\(/i.test(colType)||/^tinyint\(1\)/i.test(colType))){editCell(td,id,ri,ci);return;}}
  else if(td.querySelector('input,textarea'))return;
  // A value with embedded newlines used to jump straight to the big modal on a single click, which
@@ -8915,7 +9135,7 @@ async function inlineEdit(td,id,ri,ci,opts){const t=T(id);const key=ri+':'+ci;co
  // if none of these columns can hold NULL after all.
  if(nb&&opts)colMeta(id).then(()=>{if(!nullCols.some(c=>canNull(id,c)))nb.remove();});
  if(opts&&opts.keys.length>1)inp.title='Writes to all '+opts.keys.length+' picked cells';
- const set=v=>{done=true;if(opts)setUpdMany(id,opts.keys,v);else setUpd(id,ri,ci,v);};
+ const set=v=>{done=true;if(v!==null)v=keepLineEnds(cur,v);if(opts)setUpdMany(id,opts.keys,v);else setUpd(id,ri,ci,v);};
  inp.addEventListener('input',()=>dirty=true);
  if(nb)nullBtnWire(nb,()=>set(null));
  // A plain Enter commits for a single-line input, but inserts a newline (as it always does in a
@@ -8923,11 +9143,11 @@ async function inlineEdit(td,id,ri,ci,opts){const t=T(id);const key=ri+':'+ci;co
  // "Run Query Selection" elsewhere in the app.
  inp.addEventListener('keydown',e=>{if(e.key==='Enter'&&(!isMulti||e.ctrlKey||e.metaKey)){e.preventDefault();if(dirty)set(inp.value);else{done=true;cellRevert(td,id,ri,ci);}}else if(e.key==='Escape'){done=true;cellRevert(td,id,ri,ci);}});
  inp.addEventListener('blur',()=>setTimeout(()=>{if(!done){if(dirty)set(inp.value);else cellRevert(td,id,ri,ci);}},120));}
-function inlineEditIns(td,id,ii,col){const t=T(id);const cur=t.pending.ins[ii][col];
+function inlineEditIns(td,id,ii,col){const t=T(id);if(isGenCol(id,col)){toast(genColMsg(col),true);return;}const cur=t.pending.ins[ii][col];
  const isMulti=cur!=null&&/[\r\n]/.test(String(cur));const nullOk=canNullIns(id,col);
  td.classList.add('cellEditing');td.innerHTML=(isMulti?'':td.innerHTML)+'<div class="celled'+(isMulti?'':' over')+'">'+(isMulti?'<textarea rows="'+Math.min(8,Math.max(2,String(cur).split(/\r\n|\r|\n/).length))+'"></textarea>':'<input>')+(nullOk?'<button tabindex="-1" title="Set NULL">&empty;</button>':'')+'</div>';const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('.celled button');inp.value=(cur==null?'':cur);inp.focus();let done=false,dirty=false;
  if(nb)colMeta(id).then(()=>{if(!canNullIns(id,col))nb.remove();});
- const set=v=>{done=true;t.pending.ins[ii][col]=v;renderGrid(id);};
+ const set=v=>{done=true;if(v!==null)v=keepLineEnds(cur,v);t.pending.ins[ii][col]=v;renderGrid(id);};
  inp.addEventListener('input',()=>dirty=true);
  if(nb)nullBtnWire(nb,()=>set(null));
  inp.addEventListener('keydown',e=>{if(e.key==='Enter'&&(!isMulti||e.ctrlKey||e.metaKey)){e.preventDefault();if(dirty)set(inp.value);else{done=true;insCellRevert(td,id,ii,col);}}else if(e.key==='Escape'){done=true;insCellRevert(td,id,ii,col);}});
@@ -9052,7 +9272,7 @@ function singleRowClipboard(){if(window._rowClipboard&&window._rowClipboard.leng
 // actively misleading when rows genuinely were copied, just more than the one this paste can use.
 function noSingleRowMsg(target){const n=window._rowsClipboard&&window._rowsClipboard.length;if(n>1)return 'You copied '+n+' rows - overwrite can only use one. Copy just the row you want, or use "Paste rows as new" instead.';return 'Copy a row first, then right-click a '+target+' row to paste it.';}
 function pasteRowInto(id,ri){const t=T(id);if(!t.pk){toast('This result is not editable (no primary key).',true);return;}const vals=singleRowClipboard();if(!vals||!vals.length){toast(noSingleRowMsg('target'),true);return;}if(vals.length!==t.cols.length){toast('Copied row has '+vals.length+' column(s) but this table has '+t.cols.length+'. Cannot paste.',true);return;}
- t.cols.forEach((c,ci)=>{if(t.pk.indexOf(c)>=0)return;const v=vals[ci];const key=ri+':'+ci;if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;});
+ t.cols.forEach((c,ci)=>{if(t.pk.indexOf(c)>=0||isGenCol(id,c))return;const v=vals[ci];const key=ri+':'+ci;if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;});
  renderGrid(id);log('Pasted copied row into row '+(ri+1)+' (primary key column(s) left unchanged). Review and click Apply to commit.');}
 // Mirror image of singleRowClipboard() above: "Copy row" (singular) only ever fills
 // _rowClipboard, so pasting-as-new after copying exactly one row that way needs the same
@@ -9068,12 +9288,12 @@ function pasteRowsOver(id){const t=T(id);
  if(!idxs.length){toast('No rows selected. Tick the rows you want to overwrite.',true);return;}
  if(src.length!==idxs.length){toast('You copied '+src.length+' row(s) but ticked '+idxs.length+' - overwrite needs the same number of each.',true);return;}
  if(src.some(v=>v.length!==t.cols.length)){toast('Copied row(s) have a different number of columns than this table. Cannot paste.',true);return;}
- idxs.forEach((ri,k)=>{const vals=src[k];t.cols.forEach((c,ci)=>{if(t.pk.indexOf(c)>=0)return;
+ idxs.forEach((ri,k)=>{const vals=src[k];t.cols.forEach((c,ci)=>{if(t.pk.indexOf(c)>=0||isGenCol(id,c))return;
   const v=vals[ci],key=ri+':'+ci;
   if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;});});
  renderGrid(id);
  log('Pasted '+src.length+' copied row(s) over the '+idxs.length+' selected row(s) (primary key column(s) left unchanged). Review and click Apply to commit.');}
-function pasteRowsAsNew(id){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}const rowsData=rowsClipboard();if(!rowsData||!rowsData.length){toast('Copy some rows first (tick them, then "Copy 2 selected rows"), then paste them as new rows.',true);return;}const bad=rowsData.find(vals=>vals.length!==t.cols.length);if(bad){toast('Copied row(s) have a different number of columns than this table. Cannot paste.',true);return;}rowsData.forEach(vals=>{const obj={};t.cols.forEach((c,ci)=>{obj[c]=vals[ci];});t.pending.ins.push(obj);});renderGrid(id);log('Pasted '+rowsData.length+' row(s) as new rows. Review and click Apply to commit.');}
+function pasteRowsAsNew(id){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}const rowsData=rowsClipboard();if(!rowsData||!rowsData.length){toast('Copy some rows first (tick them, then "Copy 2 selected rows"), then paste them as new rows.',true);return;}const bad=rowsData.find(vals=>vals.length!==t.cols.length);if(bad){toast('Copied row(s) have a different number of columns than this table. Cannot paste.',true);return;}rowsData.forEach(vals=>{const obj={};t.cols.forEach((c,ci)=>{if(!isGenCol(id,c))obj[c]=vals[ci];});t.pending.ins.push(obj);});renderGrid(id);log('Pasted '+rowsData.length+' row(s) as new rows. Review and click Apply to commit.');}
 function copyColumn(id,ci){const t=T(id);const vals=t.rows.map((row,ri)=>{const key=ri+':'+ci;return (t.pending&&(key in t.pending.upd))?t.pending.upd[key]:row[ci];});copyText(vals.map(v=>v===null?'':v).join('\n'),'Copied '+vals.length+' value(s) from column "'+t.cols[ci]+'".').then(st=>{if(st!=='failed')tsvShapeHint(vals.map(v=>[v]),'an empty line');});}
 // The comparisons are built when picked, with the value written for the column's type (see litAs):
 // lit() alone turned an empty binary value into the text '0x' and a text value like 0x41 into a
@@ -9102,19 +9322,23 @@ async function rowForm(id,ri){const t=T(id);if(t.pending&&t.table)await colMeta(
   const w=document.createElement('div');w.style.display='flex';w.style.alignItems='flex-start';w.style.gap='8px';w.style.margin='4px 0';
   const lb=document.createElement('label');lb.textContent=c+(t.pk&&t.pk.indexOf(c)>=0?' (PK)':'');lb.style.width='170px';lb.style.flex='0 0 170px';lb.style.fontSize='12px';lb.style.textAlign='right';lb.style.paddingTop='5px';lb.style.color='var(--muted)';lb.style.overflow='hidden';lb.style.textOverflow='ellipsis';
   const ta=document.createElement('textarea');ta.id='rf_'+ci;ta.value=(cur===null?'':cur);ta.rows=(cur!=null&&String(cur).length>60)?3:1;ta.style.flex='1';ta.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';ta.style.fontSize='12px';ta.dataset.null=(cur===null)?'1':'';
-  ta.oninput=()=>{ta.dataset.null='';};
+  // Only a field that was typed in, or given NULL, is written: a textarea hands back CRLF as LF,
+  // so reading every field back rewrote each untouched multi-line value on the row.
+  ta.oninput=()=>{ta.dataset.null='';ta.dataset.touched='1';};
   // No button beside a field that cannot hold NULL; the space is kept so the boxes still line up.
-  const nb=document.createElement('button');nb.className='sm nullbtn';nb.innerHTML='&empty;';nb.title='Set this field to NULL';nb.onclick=()=>{ta.value='';ta.dataset.null='1';};
-  if(!canNull(id,c))nb.style.visibility='hidden';
+  const nb=document.createElement('button');nb.className='sm nullbtn';nb.innerHTML='&empty;';nb.title='Set this field to NULL';nb.onclick=()=>{ta.value='';ta.dataset.null='1';ta.dataset.touched='1';};
+  if(!canNull(id,c)||isGenCol(id,c))nb.style.visibility='hidden';
+  if(isGenCol(id,c)){ta.readOnly=true;ta.title='Generated - the server computes this value';}
   w.appendChild(lb);w.appendChild(ta);w.appendChild(nb);box.appendChild(w);});
  show('mRowForm');}
-function rfSave(){if(!_rf)return;const t=T(_rf.id),ri=_rf.ri;if(!t.pending){hide('mRowForm');_rf=null;toast('This result is not editable (no primary key detected) - nothing was saved.',true);return;}t.cols.forEach((c,ci)=>{const ta=$('rf_'+ci);if(!ta)return;const v=(ta.dataset.null==='1')?null:ta.value;const orig=t.rows[ri][ci];const key=ri+':'+ci;if(v===orig){if(t.pending&&key in t.pending.upd)delete t.pending.upd[key];}else{if(v===null&&!canNull(_rf.id,t.cols[ci])){/* a key or NOT NULL column is not given NULL */}else if(t.pending){t.pending.upd[key]=v;}}});hide('mRowForm');renderGrid(_rf.id);_rf=null;}
+function rfSave(){if(!_rf)return;const t=T(_rf.id),ri=_rf.ri;if(!t.pending){hide('mRowForm');_rf=null;toast('This result is not editable (no primary key detected) - nothing was saved.',true);return;}t.cols.forEach((c,ci)=>{const ta=$('rf_'+ci);if(!ta||ta.dataset.touched!=='1')return;const orig=t.rows[ri][ci];const v=(ta.dataset.null==='1')?null:keepLineEnds(orig,ta.value);const key=ri+':'+ci;if(v===orig){if(t.pending&&key in t.pending.upd)delete t.pending.upd[key];}else{if(v===null&&!canNull(_rf.id,t.cols[ci])){/* a key or NOT NULL column is not given NULL */}else if(t.pending){t.pending.upd[key]=v;}}});hide('mRowForm');renderGrid(_rf.id);_rf=null;}
 function toggleDel(id,ri){const t=T(id);if(t.pending.del.has(ri))t.pending.del.delete(ri);else t.pending.del.add(ri);renderGrid(id);}
 function deleteSel(id){const t=T(id);if(!t.pk){toast('This result is not editable (no primary key).',true);return;}const ids=[...(t.selected||[])];if(!ids.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}ids.forEach(ri=>t.pending.del.add(ri));renderGrid(id);log(ids.length+' row(s) marked for deletion - click Apply to commit.');}
 function addRow(id){const t=T(id);t.pending.ins.push({});renderGrid(id);}
 function delIns(id,ii){const t=T(id);t.pending.ins.splice(ii,1);renderGrid(id);}
 async function editIns(td,id,ii,col){clearTimeout(clickTimer);const t=T(id);const cur=t.pending.ins[ii][col];
  const ew=await editWidgetFor(id,col,cur);
+ if(isGenCol(id,col)){toast(genColMsg(col),true);return;}
  viewText('New row - '+col,(cur==null?'':cur),{onSave:v=>{t.pending.ins[ii][col]=v;renderGrid(id);},onNull:canNullIns(id,col)?()=>{t.pending.ins[ii][col]=null;renderGrid(id);}:null,...ew});}
 async function insCellMenu(e,id,ii,col){e.preventDefault();const t=T(id);if(t.table)await colMeta(id);const cur=t.pending.ins[ii][col];
  const clip1=singleRowClipboard(),fitsHere=!!(clip1&&clip1.length===t.cols.length);
@@ -9126,7 +9350,7 @@ async function insCellMenu(e,id,ii,col){e.preventDefault();const t=T(id);if(t.ta
   ['Delete this new row',()=>delIns(id,ii)]];
  menu(e.clientX,e.clientY,items);}
 function pasteRowIntoIns(id,ii){const t=T(id);const vals=singleRowClipboard();if(!vals||!vals.length){toast(noSingleRowMsg('new'),true);return;}if(vals.length!==t.cols.length){toast('Copied row has '+vals.length+' column(s) but this table has '+t.cols.length+'. Cannot paste.',true);return;}
- t.cols.forEach((c,ci)=>{t.pending.ins[ii][c]=vals[ci];});
+ t.cols.forEach((c,ci)=>{if(!isGenCol(id,c))t.pending.ins[ii][c]=vals[ci];});
  renderGrid(id);log('Pasted copied row into new row. Review and click Apply to commit.');}
 function revertChanges(id){const t=T(id);t.pending={upd:{},del:new Set(),ins:[]};renderGrid(id);}
 // preview: build the statements exactly as Apply would, guards and all, and show them instead of
@@ -9342,18 +9566,18 @@ function zipStore(files){const enc=new TextEncoder(),parts=[],cen=[];let off=0;
 // way the CSV export reads one; a query gives the rows the grid holds; selOnly the ticked rows.
 async function exportRowsAs(id,fmt,selOnly){const t=T(id);if(!t||!t.cols)return;let cols=t.cols,rows;
  if(selOnly){rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}}
- else if(t.table){const info=await tableColumnsInfo(t.db,t.table);if(!info){toast('Could not read the columns of '+t.db+'.'+t.table+'.',true);return;}
+ else if(wholeTableShown(t)){const info=await tableColumnsInfo(t.db,t.table);if(!info){toast('Could not read the columns of '+t.db+'.'+t.table+'.',true);return;}
   const q=await api('/api/query',{sql:'SELECT '+info.map(c=>qid(c.name)).join(',')+' FROM '+qid(t.db)+'.'+qid(t.table),db:t.db});if(!q.ok){toast(q.error,true);return;}cols=q.columns;rows=q.rows;}
- else rows=t.rows;
+ else{const a=await allResultRows(id);if(!a)return;cols=a.cols;rows=a.rows;}
  const base=(t.table||'result')+(selOnly?'_selected':'');
  if(fmt==='json')await dl(bJSON(cols,rows),base+'.json');
  else if(fmt==='md')await dl(bMD(cols,rows),base+'.md');
  else await dlBinary(new Blob([bXLSX(cols,rows)],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}),base+'.xlsx');
  log('Exported '+rows.length+' row(s) to '+({json:'JSON',md:'Markdown',xlsx:'Excel'})[fmt]+'.');}
-function copyJson(id,selOnly){const t=T(id);if(!t.cols)return;const rows=selOnly?selRows(id):t.rows;if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}
- copyText(bJSON(t.cols,rows),'Copied '+rows.length+(selOnly?' selected':'')+' row(s) (JSON).');}
+async function copyJson(id,selOnly){const t=T(id);if(!t.cols)return;const a=selOnly?{cols:t.cols,rows:selRows(id)}:await allResultRows(id);if(!a)return;const rows=a.rows;if(selOnly&&!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}
+ copyText(bJSON(a.cols,rows),'Copied '+rows.length+(selOnly?' selected':'')+' row(s) (JSON).');}
 function selRows(id){const t=T(id);return viewIndices(id).filter(ri=>t.selected&&t.selected.has(ri)).map(ri=>t.rows[ri]);}
-function copyGrid(id){const t=T(id);if(!t.cols)return;copyText(bTSV(t.cols,t.rows),'Copied '+t.rows.length+' rows (TSV).').then(st=>{if(st!=='failed')tsvShapeHint(t.rows,'the text NULL');});}
+async function copyGrid(id){const t=T(id);if(!t.cols)return;const a=await allResultRows(id);if(!a)return;copyText(bTSV(a.cols,a.rows),'Copied '+a.rows.length+' rows (TSV).').then(st=>{if(st!=='failed')tsvShapeHint(a.rows,'the text NULL');});}
 function tsvGrid(id){const t=T(id);if(!t.cols)return;dl(bTSV(t.cols,t.rows),'result.tsv');}
 function openUserTransfer(){$('utResult').value='';$('utStatus').textContent='';show('mUserTransfer');}
 async function genUserTransfer(){
@@ -9365,16 +9589,21 @@ async function genUserTransfer(){
 }
 function copyUserTransfer(){const v=$('utResult').value;if(!v){toast('Nothing to copy yet - click Generate first.',true);return;}copyText(v,'Copied user transfer script.');}
 function saveUserTransferFile(){const v=$('utResult').value;if(!v){toast('Nothing to save yet - click Generate first.',true);return;}dl(v,'user_transfer.sql');}
-async function copyCsv(id){const t=T(id);if(!t.cols)return;let cols=t.cols,rows=t.rows;
+async function copyCsv(id){const t=T(id);if(!t.cols)return;const a=await allResultRows(id);if(!a)return;const cols=a.cols,rows=a.rows;
  copyText(bCSV(cols,rows),'Copied '+rows.length+' rows (CSV).').then(st=>{if(st!=='failed')csvNullHint(rows);});}
-function copyMd(id){const t=T(id);if(!t.cols)return;copyText(bMD(t.cols,t.rows),'Copied '+t.rows.length+' rows (Markdown).');}
+async function copyMd(id){const t=T(id);if(!t.cols)return;const a=await allResultRows(id);if(!a)return;copyText(bMD(a.cols,a.rows),'Copied '+a.rows.length+' rows (Markdown).');}
 function copyMdSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}copyText(bMD(t.cols,rows),'Copied '+rows.length+' selected row(s) (Markdown).');}
 function toggleSel(id,ri,ch){const t=T(id);if(!t.selected)t.selected=new Set();if(ch)t.selected.add(ri);else t.selected.delete(ri);updateEditBar(id);}
 function selAll(id,ch){const t=T(id);if(!t.selected)t.selected=new Set();const view=viewIndices(id);view.forEach(ri=>{if(ch)t.selected.add(ri);else t.selected.delete(ri);});renderBody(id);updateEditBar(id);}
 function copySel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}copyText(bTSV(t.cols,rows),'Copied '+rows.length+' selected row(s) (TSV).').then(st=>{if(st!=='failed')tsvShapeHint(rows,'the text NULL');});}
 function copySelCsv(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}copyText(bCSV(t.cols,rows),'Copied '+rows.length+' selected row(s) (CSV).').then(st=>{if(st!=='failed')csvNullHint(rows);});}
-function csvGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'csv');return;}dl(bCSV(t.cols,t.rows),'result.csv');}
-async function insGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'inserts');return;}const bc=await gridBinCols(id);const s=t.rows.map(r=>insertSkipExisting('`table`',t.cols,'('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+')')).join('\n');dl(s,'result_inserts.sql');log('Exported '+t.rows.length+' row(s) as INSERTs.');}
+async function csvGrid(id){const t=T(id);if(!t.cols)return;if(wholeTableShown(t)){exportFull(t.db,t.table,'csv');return;}const a=await allResultRows(id);if(!a)return;dl(bCSV(a.cols,a.rows),(t.table||'result')+'.csv');log('Exported '+a.rows.length+' row(s) to CSV.');}
+async function insGrid(id){const t=T(id);if(!t.cols)return;if(wholeTableShown(t)){exportFull(t.db,t.table,'inserts');return;}const a=await allResultRows(id);if(!a)return;const bc=await gridBinCols(id);
+ // A result bound to one table is written as INSERTs into that table, without its generated
+ // columns, which cannot be given a value.
+ const info=t.table?await tableColumnsInfo(t.db,t.table):null;const gen=new Set((info||[]).filter(c=>c.generated).map(c=>c.name.toLowerCase()));
+ const keep=a.cols.map((c,i)=>i).filter(i=>!gen.has(String(a.cols[i]).toLowerCase()));const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';
+ const s=a.rows.map(r=>insertSkipExisting(tbl,keep.map(i=>a.cols[i]),'('+keep.map(i=>litAs(r[i],bc?bc[i]:null)).join(',')+')')).join('\n');dl(s,(t.table||'result')+'_inserts.sql');log('Exported '+a.rows.length+' row(s) as INSERTs.');}
 async function csvSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&!t.exact&&await refuseNulTextExport(t.db,t.table))return;dl(bCSV(t.cols,rows),(t.table||'result')+'_selected.csv');log('Exported '+rows.length+' selected row(s) to CSV.');}
 async function insSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&!t.exact&&await refuseNulTextExport(t.db,t.table))return;const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';const bc=await gridBinCols(id);
  // A generated column cannot be given a value, so it is left out.
@@ -9404,7 +9633,14 @@ async function dlBinary(blob,name){
 
 // ---- history ----
 function hist(){try{return JSON.parse(localStorage.getItem('history')||'[]');}catch(e){return[];}}
-function addHistory(sql){sql=sql.trim();if(!sql)return;let h=hist().filter(x=>x!==sql);h.unshift(sql);h=h.slice(0,200);localStorage.setItem('history',JSON.stringify(h));}
+// A statement that carries a password - CREATE/ALTER USER ... IDENTIFIED BY '...', SET PASSWORD,
+// a replication password - is not kept: history lives in plain text in the browser's storage, and
+// a copy with the password masked would set that mask as the password if it were run again.
+// Writing can fail once the storage is full; that used to throw before the query was even sent,
+// and the tab sat at "Running..." for good.
+function addHistory(sql){sql=sql.trim();if(!sql)return;
+ if(/\b(identified\b[\s\S]*?\b(by|as|using)|set\s+password\b[^;]*?=|password\s*(\(|=)|master_password\s*=)\s*'/i.test(sql))return;
+ try{let h=hist().filter(x=>x!==sql);h.unshift(sql);h=h.slice(0,200);localStorage.setItem('history',JSON.stringify(h));}catch(e){}}
 function codeBlockStartHeight(text){const lines=String(text||'').split('\n').length;return Math.min(140,Math.max(40,lines*17+13))+'px';}
 // max-width:100% keeps a drag-resize from ever growing wider than the box it's already filling
 // (effectively horizontal-only-if-there-was-room-to-begin-with, i.e. no overstretch past the
@@ -10324,7 +10560,14 @@ function colDef(c){
  // An untouched default is written back exactly as it was read - including an empty-string
  // default, which the form cannot tell apart from "no default" by looking at the box.
  if(k.defSql!=null&&c.def===k.defShown)s+=' DEFAULT '+k.defSql;
- else if(c.def!==''&&c.def!=null){s+=' DEFAULT '+(/^(CURRENT_TIMESTAMP(\(\d*\))?|NULL|TRUE|FALSE|-?\d+(\.\d+)?)$/i.test(c.def)?c.def:lit(c.def));}
+ // A typed default is SQL where it can only be SQL - NULL, an expression in brackets such as
+ // (CURDATE()) or (uuid()), and for a column that is not text a number, TRUE/FALSE, CURRENT_TIMESTAMP,
+ // b'101' or 0x41 - and a string otherwise. A text column's "007" used to go in as the number 7,
+ // stored as '7', and an expression or bit literal became a quoted string: an error on a DATE or
+ // BIT column, a wrong literal default on a VARCHAR.
+ else if(c.def!==''&&c.def!=null){const d=String(c.def),texty=D_TEXTY.test(c.type);
+  const asSql=/^NULL$/i.test(d)||/^\([\s\S]*\)$/.test(d)||(!texty&&/^(CURRENT_TIMESTAMP(\(\d*\))?|TRUE|FALSE|-?\d+(\.\d+)?([eE][+-]?\d+)?|[bB]'[01]*'|0x[0-9A-Fa-f]+)$/i.test(d));
+  s+=' DEFAULT '+(asSql?d:strLit(d));}
  if(k.onUpdate&&D_TEMPORAL.test(c.type))s+=' ON UPDATE '+k.onUpdate;
  if(k.invisible)s+=' INVISIBLE';
  if(c.comment)s+=' COMMENT '+strLit(c.comment);return s;}
@@ -10376,8 +10619,11 @@ function dAddCol(c){c=c||{name:'',type:'VARCHAR',len:'255',nn:false,ai:false,pk:
  if(c.keep){const hint=[c.keep.mods,c.keep.cs&&('CHARACTER SET '+c.keep.cs),c.keep.onUpdate&&('ON UPDATE '+c.keep.onUpdate),c.keep.invisible&&'INVISIBLE',c.keep.generated&&'GENERATED'].filter(Boolean).join(', ');if(hint)tr.title='Kept as is: '+hint;}
  $('dCols').appendChild(tr);tr.querySelectorAll('input,select').forEach(el=>el.addEventListener('change',dGen));}
 function dMark(){dEdited=true;$('dEditNote').textContent='✎ manually edited - auto-update paused; use Regenerate to rebuild';}
-function dReadCols(){return [...$('dCols').children].map(tr=>({name:tr.querySelector('.dn').value.trim(),type:tr.querySelector('.dt').value,len:tr.querySelector('.dl').value.trim(),nn:tr.querySelector('.dnn').checked,ai:tr.querySelector('.dai').checked,pk:tr.querySelector('.dpk').checked,def:tr.querySelector('.dd').value,comment:tr.querySelector('.dc').value.trim(),keep:tr._keep||null})).filter(c=>c.name);}
-function dGen(force){if(dEdited&&!force)return;const db=$('dSchema').value.trim(),name=$('dName').value.trim();const cols=dReadCols();const pk=cols.filter(c=>c.pk).map(c=>qid(c.name));
+// Names lose trailing spaces only - a name cannot end in one, but may begin with one, and trimming
+// both ends renamed a column called " a" to "a" on the next Apply. A comment is kept exactly as it
+// is: trimmed, it no longer matched the table's own, and any change to that column rewrote it.
+function dReadCols(){return [...$('dCols').children].map(tr=>({name:tr.querySelector('.dn').value.replace(/\s+$/,''),type:tr.querySelector('.dt').value,len:tr.querySelector('.dl').value.trim(),nn:tr.querySelector('.dnn').checked,ai:tr.querySelector('.dai').checked,pk:tr.querySelector('.dpk').checked,def:tr.querySelector('.dd').value,comment:tr.querySelector('.dc').value,keep:tr._keep||null})).filter(c=>c.name.trim());}
+function dGen(force){if(dEdited&&!force)return;const db=$('dSchema').value.replace(/\s+$/,''),name=$('dName').value.replace(/\s+$/,'');const cols=dReadCols();const pk=cols.filter(c=>c.pk).map(c=>qid(c.name));
  if(!name){$('dSql').value='-- enter a table name';return;}const tbl=qid(db)+'.'+qid(name);
  if(!dOrig){let s='CREATE TABLE '+tbl+' (\n  '+cols.map(colDef).join(',\n  ');if(pk.length)s+=',\n  PRIMARY KEY ('+pk.join(',')+')';s+='\n);';$('dSql').value=s;dEdited=false;$('dEditNote').textContent='';return;}
  $('dSql').value=dAlterSql(dOrig,cols,tbl);dEdited=false;$('dEditNote').textContent='';}
@@ -10518,7 +10764,7 @@ if(!dbs.length && tables.length){
  }
  $('expLog').textContent='';
  let label='Exporting '+dbs.length+' database'+(dbs.length===1?'':'s');
- if(mode==='table'){try{const cq=await api('/api/query',{sql:"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_SCHEMA IN ("+dbs.map(lit).join(',')+")"});if(cq.ok&&cq.rows.length){label+=' (~'+fmtCount(cq.rows[0][0])+' tables)';}}catch(e){}}
+ if(mode==='table'){try{const cq=await api('/api/query',{sql:"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_TYPE IN ('BASE TABLE','SYSTEM VERSIONED') AND TABLE_SCHEMA IN ("+dbs.map(lit).join(',')+")"});if(cq.ok&&cq.rows.length){label+=' (~'+fmtCount(cq.rows[0][0])+' tables)';}}catch(e){}}
  const jobId=(crypto.randomUUID?crypto.randomUUID():('j'+Date.now()+Math.random()));
  progStart('exp',label,jobId);
  const r=await api('/api/export',{dbs,options:o,folder:$('expFolder').value,mode:mode,filename:$('expFilename').value.trim(),stamp:$('expStamp').checked,excludes:excludes,jobId:jobId});
@@ -11467,6 +11713,14 @@ $RequestHandler = {
     param($client, $Token, $Html)
     try {
         $req = Read-Request $client
+        # Only a request addressed to this machine by its own name is answered. A web page on
+        # another site can make its own host name resolve to 127.0.0.1 (DNS rebinding) and then
+        # read this page like a page of its own - the token in it included, and with the token,
+        # every saved connection and its password (/api/conn-get). The browser still sends that
+        # site's name as the Host, which is what this refuses.
+        if ([string]$req.host -notmatch '^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$') {
+            Send-Http $client '403 Forbidden' 'text/plain; charset=utf-8' ([Text.Encoding]::UTF8.GetBytes('Forbidden')); return
+        }
         if ($req.path -eq '/api/ping') {
             # Token-checked like every other /api/* route. Ping refreshes LastPing, which is what
             # the idle-shutdown check below reads - so while this was unauthenticated, any web

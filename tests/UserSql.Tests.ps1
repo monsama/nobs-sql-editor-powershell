@@ -341,8 +341,8 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
   const CHECK = (c, l, d) => eq(c, true, l + (c ? '' : ' -> ' + d));
   const names = ['topLevelFromAt', 'exactTextQuery', 'strLit'];
   const body = names.map(n => extractFunction(src, n)).join('\n');
-  const make = (cols) => new Function('qid', 'tableTextCols', body + '\nreturn {topLevelFromAt, exactTextQuery};')(
-    s => '`' + s + '`', async () => cols);
+  const make = (cols, vec = []) => new Function('qid', 'tableTextCols', 'tableVectorCols', body + '\nreturn {topLevelFromAt, exactTextQuery};')(
+    s => '`' + s + '`', async () => cols, async () => vec);
   const f = make(['name', 'note']);
   const at = s => f.topLevelFromAt(s);
   CHECK(at('SELECT * FROM t') === 9, 'FROM is found', at('SELECT * FROM t'));
@@ -362,6 +362,11 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
   CHECK(none && none.sql === 'SELECT * FROM t' && none.cols.length === 0, 'a table without text columns is sent as it is', JSON.stringify(none));
   CHECK(await make(null).exactTextQuery('SELECT * FROM t', 'SELECT * FROM t', { db: 'd', table: 't' }) === null, 'unknown text columns: not exact', '');
   CHECK(await f.exactTextQuery('SELECT * FROM t', 'SELECT * FROM u', { db: 'd', table: 't' }) === null, 'SQL not ending in the statement: not exact', '');
+  // A VECTOR (MySQL 9) is asked for as 0x-hex every time, after the text columns.
+  const v = await make(['name'], ['e']).exactTextQuery('SELECT * FROM t', 'SELECT * FROM t', { db: 'd', table: 't' });
+  CHECK(v && v.sql.includes(", CONCAT('0x', HEX(`e`)) AS `__nobs_exact_1` FROM t") && v.cols.join() === 'name,e', 'a VECTOR column is asked for as its bytes', v && v.sql);
+  const onlyVec = await make([], ['e']).exactTextQuery('SELECT * FROM t', 'SELECT * FROM t', { db: 'd', table: 't' });
+  CHECK(onlyVec && onlyVec.cols.join() === 'e', 'also in a table with no text columns', JSON.stringify(onlyVec));
 
   // Apply from a grid that was not read that way: saved only when the table holds no such value.
   const applyNames = ['applyChanges', 'keyWhere', 'oneRowGuard', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];

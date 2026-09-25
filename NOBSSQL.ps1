@@ -348,9 +348,26 @@ function Get-Endpoint { param($conn)
         return @{ host = '127.0.0.1'; port = [string]$t.Port }
     } finally { [System.Threading.Monitor]::Exit($script:Tunnels) }
 }
+# The local port is found free, let go of and handed to ssh, and something else can take it in
+# between. ssh then gives up on the forward (ExitOnForwardFailure), but a program listening on that
+# port answered the check all the same, and the connection - password and all - would have gone to
+# it. So ssh has to be still running after the port answers, and a port lost that way is tried again
+# with another, up to three times.
 function Open-Tunnel { param([string]$SshHost, [string]$SshPort, [string]$SshUser, [string]$Key, [string]$DbHost, [string]$DbPort, [string]$Password)
     Initialize-DumpDb
-    $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0); $l.Start(); $local = $l.LocalEndpoint.Port; $l.Stop()
+    $last = $null
+    for ($try = 0; $try -lt 3; $try++) {
+        $l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0); $l.Start(); $local = $l.LocalEndpoint.Port; $l.Stop()
+        $r = Open-TunnelOn $local $SshHost $SshPort $SshUser $Key $DbHost $DbPort $Password
+        if ($r.Tunnel) { return $r.Tunnel }
+        $last = $r.Error
+        if (-not $r.PortLost) { throw $last }
+    }
+    throw $last
+}
+# One try on one local port: @{Tunnel} when it is up, @{Error; PortLost} when it is not - PortLost
+# when it was the port, worth another try.
+function Open-TunnelOn { param([int]$local, [string]$SshHost, [string]$SshPort, [string]$SshUser, [string]$Key, [string]$DbHost, [string]$DbPort, [string]$Password)
     $exe = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'; if (-not (Test-Path $exe)) { $exe = 'ssh' }
     $target = if ($DbHost.Contains(':')) { "[$DbHost]" } else { $DbHost }
     $a = @('-N', '-T', '-o', 'ExitOnForwardFailure=yes', '-o', 'StrictHostKeyChecking=accept-new',
@@ -377,22 +394,33 @@ function Open-Tunnel { param([string]$SshHost, [string]$SshPort, [string]$SshUse
     try { [void]$proc.Start() } catch { throw "Could not start ssh ($(Get-InnerMessage $_)). SSH tunnels use the OpenSSH client; on Windows it is the optional feature ""OpenSSH Client""." }
     # Read as it comes, so a chatty tunnel never fills the pipe and stalls.
     $said = New-Object NobsLineSink $proc.StandardError
-    # ssh listens on the local port once it has signed in, so a connection there means the tunnel is up.
+    # ssh listens on the local port once it has signed in, so a connection there means the tunnel is
+    # up - if ssh is still running a moment later. Had the port been taken, ssh has exited by then.
+    $why = { @(([string]$said.Drain(50, 300)) -split "`n" | Where-Object { $_.Trim() -and $_ -notmatch '^Warning: Permanently added' }) | Select-Object -Last 1 }
     $deadline = (Get-Date).AddSeconds(25)
     while ($true) {
         if ($proc.HasExited) {
-            $why = @(([string]$said.Drain(50, 300)) -split "`n" | Where-Object { $_.Trim() -and $_ -notmatch '^Warning: Permanently added' }) | Select-Object -Last 1
-            throw "Could not establish SSH tunnel to ${SshHost}: $(if ($why) { $why.Trim() } else { 'ssh exited.' })"
+            $w = & $why
+            return @{ Error = "Could not establish SSH tunnel to ${SshHost}: $(if ($w) { $w.Trim() } else { 'ssh exited.' })"; PortLost = ([string]$w -match '(?i)address already in use|cannot listen|local forwarding|bind') }
         }
         $c = New-Object System.Net.Sockets.TcpClient
-        try { if ($c.ConnectAsync('127.0.0.1', $local).Wait(200) -and $c.Connected) { break } } catch { } finally { $c.Close() }
+        $up = $false
+        try { $up = ($c.ConnectAsync('127.0.0.1', $local).Wait(200) -and $c.Connected) } catch { } finally { $c.Close() }
+        if ($up) {
+            Start-Sleep -Milliseconds 400
+            if ($proc.HasExited) {
+                $w = & $why
+                return @{ Error = "Could not establish SSH tunnel to ${SshHost}: another program took its local port ($(if ($w) { $w.Trim() } else { 'ssh exited' }))"; PortLost = $true }
+            }
+            break
+        }
         if ((Get-Date) -gt $deadline) {
             try { $proc.Kill() } catch { }
             throw "SSH tunnel to $SshHost timed out after 25 seconds."
         }
         Start-Sleep -Milliseconds 100
     }
-    [pscustomobject]@{ Process = $proc; Port = $local; Said = $said }
+    @{ Tunnel = [pscustomobject]@{ Process = $proc; Port = $local; Said = $said } }
 }
 # MariaDB's client has no setting that insists on TLS without also checking the certificate. With
 # "ssl" and "skip-ssl-verify-server-cert" - which "required" needs, since the certificate a server
@@ -1256,12 +1284,13 @@ function Api-Objects { param($conn,$db)
     $dbl=SqlLit $db
     $sql="SELECT 'table' t,TABLE_NAME n,ENGINE e FROM information_schema.TABLES WHERE TABLE_SCHEMA=$dbl AND TABLE_TYPE IN ('BASE TABLE','SYSTEM VERSIONED') " +
          "UNION ALL SELECT 'view',TABLE_NAME,NULL FROM information_schema.TABLES WHERE TABLE_SCHEMA=$dbl AND TABLE_TYPE IN ('VIEW','SYSTEM VIEW') " +
+         "UNION ALL SELECT 'sequence',TABLE_NAME,NULL FROM information_schema.TABLES WHERE TABLE_SCHEMA=$dbl AND TABLE_TYPE='SEQUENCE' " +
          "UNION ALL SELECT IF(ROUTINE_TYPE='PROCEDURE','procedure','function'),ROUTINE_NAME,NULL FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=$dbl " +
          "UNION ALL SELECT 'trigger',TRIGGER_NAME,NULL FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=$dbl " +
          "UNION ALL SELECT 'event',EVENT_NAME,NULL FROM information_schema.EVENTS WHERE EVENT_SCHEMA=$dbl ORDER BY 1,2"
     $r=Run-Query2 $conn $sql $null
     if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
-    $g=@{ table=@(); view=@(); procedure=@(); function=@(); trigger=@(); event=@() }
+    $g=@{ table=@(); view=@(); sequence=@(); procedure=@(); function=@(); trigger=@(); event=@() }
     # Each table's storage engine, for what its menu offers: REPAIR TABLE works on MyISAM, Aria, CSV
     # and Archive, and InnoDB only answers that it does not support it.
     $engines=New-Object System.Collections.Generic.List[string]
@@ -1281,7 +1310,7 @@ function Api-Objects { param($conn,$db)
         }
     }
 
-    '{"ok":true,"tables":'+(J-Arr $g.table)+',"views":'+(J-Arr $g.view)+',"procedures":'+(J-Arr $g.procedure)+',"functions":'+(J-Arr $g.function)+',"triggers":'+(J-Arr $g.trigger)+',"events":'+(J-Arr $g.event)+',"triggerTables":'+$trigTablesJson+',"tableEngines":{'+($engines -join ',')+'}}'
+    '{"ok":true,"tables":'+(J-Arr $g.table)+',"views":'+(J-Arr $g.view)+',"procedures":'+(J-Arr $g.procedure)+',"functions":'+(J-Arr $g.function)+',"triggers":'+(J-Arr $g.trigger)+',"events":'+(J-Arr $g.event)+',"sequences":'+(J-Arr $g.sequence)+',"triggerTables":'+$trigTablesJson+',"tableEngines":{'+($engines -join ',')+'}}'
 }
 # Return the CREATE statement (DDL) for a chosen object.
 function Api-Ddl { param($conn,$db,$type,$name)
@@ -6336,7 +6365,7 @@ function toggleAllDbs(){if(allDbs){leaveAllDbs();renderObjects();return;}allDbs=
 function leaveAllDbs(){if(!allDbs)return;allDbs=null;allDbsSeq++;clearTimeout(allDbsTimer);setAllDbsBtn();}
 // A schema with thousands of objects rebuilt its whole list on every key typed; it waits for a pause.
 let objFilterTimer=null;
-function objFilterInput(){if(!allDbs){const r=objData&&objData.r,n=r?['tables','views','procedures','functions','triggers','events'].reduce((a,k)=>a+((r[k]||[]).length),0):0;
+function objFilterInput(){if(!allDbs){const r=objData&&objData.r,n=r?['tables','views','sequences','procedures','functions','triggers','events'].reduce((a,k)=>a+((r[k]||[]).length),0):0;
   if(n<2000){renderObjects();return;}clearTimeout(objFilterTimer);objFilterTimer=setTimeout(renderObjects,150);return;}clearTimeout(allDbsTimer);allDbsTimer=setTimeout(searchAllSchemas,300);}
 async function searchAllSchemas(){
   if(!allDbs)return;
@@ -6630,6 +6659,9 @@ function findScrollTo(ta,pos){const cs=getComputedStyle(ta),lh=parseFloat(cs.lin
  const x=(parseFloat(cs.paddingLeft)||0)+col*(c.measureText('M').width||8);
  if(x<ta.scrollLeft||x>ta.scrollLeft+ta.clientWidth-40)ta.scrollLeft=Math.max(0,x-ta.clientWidth/2);}
 // Puts text in place of [s, e) the way typing would, so it can be undone.
+// The whole editor text replaced as typing would replace it, so Ctrl+Z brings the old text back -
+// assigning the value directly threw the undo history away. The focus stays where it was.
+function edSetAll(id,text){const ta=$('ed_'+id);if(!ta||ta.value===text)return;const a=document.activeElement;edReplaceRange(id,0,ta.value.length,text);if(a&&a!==ta&&typeof a.focus==='function')a.focus();}
 function edReplaceRange(id,s,e,text){const ta=$('ed_'+id),before=ta.value;ta.focus();ta.setSelectionRange(s,e);let ok=false;
  try{ok=text===''?document.execCommand('delete'):document.execCommand('insertText',false,text);}catch(_){}
  if(!ok||ta.value===before&&e>s)ta.setRangeText(text,s,e,'end');
@@ -7216,7 +7248,8 @@ function updateStatusLine(id){const t=T(id);if(!t||!t.rows)return;const st=$('st
   // The grid itself is a single continuous virtualized list over everything loaded so far - no
   // "page" to move to - so this just says more is available; scrolling near the bottom (see
   // maybePrefetchNextBatch) is what actually goes and gets it, automatically.
-  const moreLabel=t.hasMore?'  |  more rows available - keep scrolling to load more':'';
+  // Sorting by a column header sorts what is loaded; with more to come, that is said.
+  const moreLabel=t.hasMore?((t.sortCol!=null?'  |  sorted: the '+fmtCount(t.rows.length)+' rows loaded so far':'')+'  |  more rows available - keep scrolling to load more'):'';
   // A LIMIT the query set itself, and reached: every row is loaded, yet "994 row(s)" alone reads as
   // the whole table. Only a LIMIT in the SQL that was run counts - the app pages with a cursor and
   // never writes one.
@@ -7308,7 +7341,7 @@ async function cancelJob(prefix){
   try{await fetch('/api/cancel-job',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN,jobId})});}catch(e){}
   log('Cancel requested for '+prefix+' job.');
 }
-const OBJ_TYPES=[['table','Tables'],['view','Views'],['procedure','Procedures'],['function','Functions'],['trigger','Triggers'],['event','Events']];
+const OBJ_TYPES=[['table','Tables'],['view','Views'],['sequence','Sequences'],['procedure','Procedures'],['function','Functions'],['trigger','Triggers'],['event','Events']];
 window._objTypeFilter=window._objTypeFilter||new Set(OBJ_TYPES.map(t=>t[0]));
 function setObjTypeVis(type,visible){const s=window._objTypeFilter;if(visible)s.add(type);else s.delete(type);renderObjects();}
 function showAllObjTypes(){window._objTypeFilter=new Set(OBJ_TYPES.map(t=>t[0]));renderObjects();const btn=$('objTypeBtn');if(btn)openObjTypePicker(btn);}
@@ -7345,7 +7378,7 @@ function renderObjects(){if(allDbs){renderAllDbs();return;}const box=$('objects'
       d.onclick=()=>{[...box.querySelectorAll('.item')].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');objOpen(db,'table',n);};
       d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,'table',n);};box.appendChild(d);});}
  }
- const groups=[['Tables',r.tables,'table'],['Views',r.views,'view'],['Procedures',r.procedures,'procedure'],['Functions',r.functions,'function'],['Triggers',r.triggers,'trigger'],['Events',r.events,'event']];
+ const groups=[['Tables',r.tables,'table'],['Views',r.views,'view'],['Sequences',r.sequences||[],'sequence'],['Procedures',r.procedures,'procedure'],['Functions',r.functions,'function'],['Triggers',r.triggers,'trigger'],['Events',r.events,'event']];
  groups.forEach(([label,items,type])=>{if(!tf.has(type))return;const fil=(items||[]).filter(n=>!f||n.toLowerCase().includes(f));if(!fil.length)return;if(!objGroupHdr(box,type,label+' ('+fil.length+(f?'/'+items.length:'')+')',folded.has(type)))return;
   // At most OBJ_CAP of a kind are drawn; the rest are counted, and the filter finds them. Ten
   // thousand rows in the sidebar made opening and filtering a large schema hang.
@@ -7732,7 +7765,7 @@ function toggleOverview() {
         ov.style.display = 'none';
     }
 }
-function objOpen(db,type,name){if(type==='table'){const _id=openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,false,name);openRun(_id);}else if(type==='view'){openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,true,null);}else{openDdl(db,type,name);}}
+function objOpen(db,type,name){if(type==='table'){const _id=openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,false,name);openRun(_id);}else if(type==='view'||type==='sequence'){openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,true,null);}else{openDdl(db,type,name);}}
 // A table's menu, in groups: reading it, its structure, its data in and out, its upkeep, and last
 // what changes or removes it. information_schema and performance_schema are the server's views of
 // itself - nothing in them is designed, filled, kept up, renamed or dropped - so their tables and
@@ -7754,6 +7787,8 @@ function objMenu(e,db,type,name){const b=[],virt=/^(information_schema|performan
   const _eng=(objData&&objData.db===db&&objData.r&&objData.r.tableEngines)||null,repairable=!_eng||!(name in _eng)||/^(myisam|aria|csv|archive)$/i.test(String(_eng[name]));
   b.push(!virt&&['Maintenance',[['Optimize',()=>maint(db,name,'OPTIMIZE')],['Analyze',()=>maint(db,name,'ANALYZE')],['Check',()=>maint(db,name,'CHECK')],repairable&&['Repair',()=>maint(db,name,'REPAIR')]]],'-');
   b.push(!virt&&['Rename...',()=>renameTable(db,name)],!virt&&['Duplicate table...',()=>duplicateTable(db,name)],!virt&&['Truncate...',()=>truncateTable(db,name)],!virt&&['Drop table...',()=>dropObject(db,type,name)]);}
+ // A MariaDB sequence reads as a one-row table of its state; SHOW CREATE SEQUENCE is its definition.
+ else if(type==='sequence'){b.push(['Open',()=>openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+';',db,true,null)],['Show CREATE',async()=>{const r=await api('/api/query',{sql:'SHOW CREATE SEQUENCE '+qid(db)+'.'+qid(name)});if(r.ok&&r.rows.length)viewText('Sequence '+db+'.'+name,String(r.rows[0][1]),{readonly:true});else toast(r.error||'No definition.',true);}],'-',!virt&&['Drop sequence...',()=>dropObject(db,type,name)]);}
  else if(type==='view'){b.push(['Open',()=>openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+';',db,true,null)],[virt?'Show CREATE':'Show CREATE / edit',()=>openDdl(db,type,name)],'-',!virt&&['Drop view...',()=>dropObject(db,type,name)]);}
  else {b.push(['Show CREATE / edit',()=>openDdl(db,type,name)],'-',['Drop '+type+'...',()=>dropObject(db,type,name)]);}
  menu(e.clientX,e.clientY,b);}
@@ -7801,7 +7836,7 @@ async function newTrigger(db,table){
  openTab('trigger: '+name,body,db,false,null,{type:'trigger',db,name});
 }
 async function dropSchema(db){if(!(await ask('DROP DATABASE '+db+' ? Deletes ALL its data.')))return;if(await exec('DROP DATABASE '+qid(db),'Dropped database')){[...tabs].forEach(t=>{if(t.db===db&&t.table)closeTab(t.id);});loadSchemas();$('objects').innerHTML='';}}
-async function dropObject(db,type,name){const kw={table:'TABLE',view:'VIEW',procedure:'PROCEDURE',function:'FUNCTION',trigger:'TRIGGER',event:'EVENT'}[type];if(!(await ask('DROP '+kw+' '+db+'.'+name+'?\n\nThis permanently removes the '+type+' and cannot be undone.')))return;if(await exec('DROP '+kw+' IF EXISTS '+qid(db)+'.'+qid(name),'Dropped '+type+' '+db+'.'+name)){[...tabs].forEach(t=>{if(t.db===db&&t.table===name)closeTab(t.id);});loadObjects(db);}}
+async function dropObject(db,type,name){const kw={table:'TABLE',view:'VIEW',sequence:'SEQUENCE',procedure:'PROCEDURE',function:'FUNCTION',trigger:'TRIGGER',event:'EVENT'}[type];if(!(await ask('DROP '+kw+' '+db+'.'+name+'?\n\nThis permanently removes the '+type+' and cannot be undone.')))return;if(await exec('DROP '+kw+' IF EXISTS '+qid(db)+'.'+qid(name),'Dropped '+type+' '+db+'.'+name)){[...tabs].forEach(t=>{if(t.db===db&&t.table===name)closeTab(t.id);});loadObjects(db);}}
 async function truncateTable(db,name){if(!(await ask('TRUNCATE TABLE '+db+'.'+name+'?\n\nThis permanently deletes ALL rows and cannot be undone.')))return;if(await exec('TRUNCATE TABLE '+qid(db)+'.'+qid(name),'Truncated '+db+'.'+name)){invalidateTableCache(db,name);[...tabs].forEach(t=>{if(t.table===name&&t.db===db)openRun(t.id);});}}
 async function renameTable(db,name){const res=await inputBox({title:'Rename table',okText:'Rename',fields:[{key:'name',label:'New table name',value:name}]});if(!res||!res.name.trim()||res.name.trim()===name)return;if(await exec('RENAME TABLE '+qid(db)+'.'+qid(name)+' TO '+qid(db)+'.'+qid(res.name.trim()),'Renamed')){[...tabs].forEach(t=>{if(t.db===db&&t.table===name)closeTab(t.id);});loadObjects(db);}}
 async function duplicateTable(db,name){
@@ -7926,7 +7961,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   lastBtn+selBtn+applyBtn+
   '<span class="tbsep"></span>'+
   '<span id="resultActions_'+id+'"'+(tab.ddl?'':' data-reserve')+' style="display:none;gap:9px;align-items:center" class="tbgroup">'+
-  '<button title="Copy the grid to the clipboard, as CSV or Markdown, all rows or just the selected (checked) ones (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="event.stopPropagation();toggleCopyMenu(\''+id+'\',this)" data-ic="copy" data-fit="3">Copy \u25BE</button>'+'<button class="sm" id="wrapbtn_'+id+'" title="Toggle text wrapping in the grid" onclick="toggleWrap(\''+id+'\')" data-ic="wrap" data-fit="2"><span class="stk"><span class="off">Wrap: On</span><span>Wrap: Off</span></span></button>'+'<button class="sm" id="colsbtn_'+id+'" title="Show or hide columns" onclick="event.stopPropagation();toggleColPicker(\''+id+'\',this)" data-ic="columns" data-fit="2">Columns</button>'+'<button class="sm" title="Chart the rows the grid shows, as bars or a line" onclick="chartOpen(\''+id+'\')" data-ic="chart" data-fit="2">Chart</button>'+'<input type="search" id="gsearch_'+id+'" placeholder="Search" title="Show only the rows holding this text in any column, and mark the cells that hold it (Ctrl+F from the grid; Enter / Shift+Enter: next / previous match; Esc clears). Searches the rows loaded so far, and says how many match in every result of a script." oninput="setGridSearch(\''+id+'\',this.value)" onkeydown="gsearchKey(event,\''+id+'\',this)" class="gsearch" style="width:170px;font-size:12px">'+'<button class="sm" id="clrflt_'+id+'" style="display:none" title="Clear the column filters and the search" onclick="clearGridFilters(\''+id+'\')" data-ic="clearf" data-fit="2">Clear filters</button>'+
+  '<button title="Copy the grid to the clipboard, as CSV or Markdown, all rows or just the selected (checked) ones (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="event.stopPropagation();toggleCopyMenu(\''+id+'\',this)" data-ic="copy" data-fit="3">Copy \u25BE</button>'+'<button class="sm" id="wrapbtn_'+id+'" title="Toggle text wrapping in the grid" onclick="toggleWrap(\''+id+'\')" data-ic="wrap" data-fit="2"><span class="stk"><span class="off">Wrap: On</span><span>Wrap: Off</span></span></button>'+'<button class="sm" id="colsbtn_'+id+'" title="Show or hide columns" onclick="event.stopPropagation();toggleColPicker(\''+id+'\',this)" data-ic="columns" data-fit="2">Columns</button>'+'<button class="sm" title="Chart the rows the grid shows, as bars or a line" onclick="chartOpen(\''+id+'\')" data-ic="chart" data-fit="2">Chart</button>'+'<input type="search" id="gsearch_'+id+'" placeholder="Search" title="Show only the rows holding this text in any column, and mark the cells that hold it (Ctrl+F from the grid; Enter / Shift+Enter: next / previous match; Esc clears). Searches the rows loaded so far, and says how many match in every result of a script." oninput="(v=>gridTypeSoon(\''+id+'\',()=>setGridSearch(\''+id+'\',v)))(this.value)" onkeydown="gsearchKey(event,\''+id+'\',this)" class="gsearch" style="width:170px;font-size:12px">'+'<button class="sm" id="clrflt_'+id+'" style="display:none" title="Clear the column filters and the search" onclick="clearGridFilters(\''+id+'\')" data-ic="clearf" data-fit="2">Clear filters</button>'+
   '</span>'+
   '<span style="flex:1 1 auto"></span>'+
   '<span id="edit_'+id+'"'+(tab.ddl?'':' data-reserve')+' style="display:none;align-items:center;gap:6px"></span>'+
@@ -8772,8 +8807,8 @@ function updatePager(id){const t=T(id);const p=$('pager_'+id);if(!p)return;const
  if(filtered&&loaded){p.innerHTML='<span class="muted">'+fmtCount(total)+' of '+fmtCount(loaded)+(t.hasMore?'+':'')+' loaded row(s) match'+at+'</span>';return;}
  // Unfiltered, the count is the status line's to give.
  p.innerHTML='';}
-function toggleLast(id){const t=T(id);const ta=$('ed_'+id);if(t.prevRun==null){log('No previous query to toggle to yet.');return;}ta.value=t.prevRun;if(typeof syncHl==='function')syncHl(id);runSql(id,t.prevRun);}
-function toggleAll(id){const t=T(id);if(!t.table)return;const ta=$('ed_'+id);const base='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+';';const cur=(ta.value||'').trim();if(cur!==base.trim()){t.beforeAll=ta.value;ta.value=base;}else if(t.beforeAll!=null){ta.value=t.beforeAll;}else{ta.value=base;}if(typeof syncHl==='function')syncHl(id);runSql(id,ta.value);}
+function toggleLast(id){const t=T(id);const ta=$('ed_'+id);if(t.prevRun==null){log('No previous query to toggle to yet.');return;}edSetAll(id,t.prevRun);runSql(id,t.prevRun);}
+function toggleAll(id){const t=T(id);if(!t.table)return;const ta=$('ed_'+id);const base='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+';';const cur=(ta.value||'').trim();if(cur!==base.trim()){t.beforeAll=ta.value;edSetAll(id,base);}else if(t.beforeAll!=null){edSetAll(id,t.beforeAll);}else{edSetAll(id,base);}runSql(id,ta.value);}
 function selBtnHtml(id,table){return table?'<button title="Toggle between your query and SELECT * (the whole table)" onclick="toggleAll(\''+id+'\')" data-ic="wholetable" data-fit="2">Show all</button>':'';}
 // t.table (and thus row-edit capability, export-as-table, quick filter, ...) used to be fixed
 // at whatever the tab was opened with and never revisited - so a tab opened as a non-editable
@@ -8863,7 +8898,7 @@ function sqlBlankStringsAndComments(s){let out='',q=null;
   if(c==='/'&&s[i+1]==='*'){let e=s.indexOf('*/',i+2);e=e<0?s.length:e+2;out+=s.slice(i,e).replace(/[^\n]/g,' ');i=e-1;continue;}
   out+=c;}
  return out;}
-async function openRun(id){const t=T(id);const where=combinedFilterWhere(t);const wh=where?(' WHERE '+where):'';const sql='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+wh+';';$('ed_'+id).value=sql;syncHl(id);await runSql(id,sql);updateFilterBar(id);}
+async function openRun(id){const t=T(id);const where=combinedFilterWhere(t);const wh=where?(' WHERE '+where):'';const sql='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+wh+';';t.genSql=sql;edSetAll(id,sql);syncHl(id);await runSql(id,sql);updateFilterBar(id);}
 
 // ---- editable grid with pending changes ----
 function clip(v,n){const s=String(v);return s.length>n?s.slice(0,n)+'\u2026':s;}
@@ -9073,7 +9108,7 @@ function widestCandidates(vals,limit){
 function renderGrid(id){const t=T(id);const ed=!!t.pk;if(!t.filters)t.filters={};if(t.sortCol===undefined){t.sortCol=-1;t.sortDir=1;}
  let h='<table class="grid">'+colgroupHtml(id)+'<thead><tr id="sortrow_'+id+'">'+sortHeader(id,ed)+'</tr><tr id="filterrow_'+id+'">';
  h+='<th style="top:24px"></th>';if(ed)h+='<th style="top:24px"></th>';
- t.cols.forEach((c,ci)=>{h+='<th style="top:24px;padding:1px"><input data-ci="'+ci+'" oninput="setFilter(\''+id+'\','+ci+',this.value)" value="'+esc(t.filters[ci]||'')+'" placeholder="filter" style="width:100%;font-weight:400;font-size:11px"></th>';});
+ t.cols.forEach((c,ci)=>{h+='<th style="top:24px;padding:1px"><input data-ci="'+ci+'" oninput="(v=>gridTypeSoon(\''+id+'\',()=>setFilter(\''+id+'\','+ci+',v)))(this.value)" value="'+esc(t.filters[ci]||'')+'" placeholder="filter" style="width:100%;font-weight:400;font-size:11px"></th>';});
  h+='<th style="top:24px"></th>';
  h+='</tr></thead><tbody id="tbody_'+id+'"></tbody></table>';
  $('res_'+id).innerHTML=h;renderBody(id);syncFilterRowTop(id);requestAnimationFrame(()=>autofitAll(id));wireColResize(id);updateStatusLine(id);refreshTabDirty(id);syncFilterUi(id);
@@ -9169,6 +9204,10 @@ function syncFilterRowTop(id){
 // neighbour that paints earlier - the whole band is there, centred on the line, at 100%, 125% and
 // 150% display scaling alike. The last column's handle goes on the filler cell at the end.
 function sortHeader(id,ed){const t=T(id);const H=28;let h='<th style="width:22px;height:'+H+'px;padding:0"><span style="display:flex;align-items:center;justify-content:center;height:'+H+'px"><input type="checkbox" title="Select/clear all shown rows" onclick="selAll(\''+id+'\',this.checked)"></span></th>'+(ed?'<th></th>':'');t.cols.forEach((c,ci)=>{const ar=t.sortCol===ci?(t.sortDir>0?' \u25B2':' \u25BC'):'';const isPk=t.pk&&t.pk.indexOf(c)>=0;const isFk=t.fk&&t.fk.indexOf(c)>=0;const kb=(isPk?' <span class="muted" style="font-size:10px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-pk,#5dcaa5)" title="Primary key">PK</span>':'')+(isFk?' <span class="muted" style="font-size:10px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-line,#7aa8d8)" title="Foreign key">FK</span>':'');h+='<th style="cursor:pointer;height:'+H+'px;padding:0 8px" title="'+esc(c)+' - click to sort (drag edge to resize, double-click edge to auto-fit)" onclick="sortBy(\''+id+'\','+ci+')">'+(ci?'<span class="rz" data-ci="'+(ci-1)+'"></span>':'')+'<span style="display:flex;align-items:center;gap:4px;height:'+H+'px;min-width:0"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0">'+esc(c)+'</span>'+kb+ar+'</span></th>';});return h+'<th>'+(t.cols.length?'<span class="rz" data-ci="'+(t.cols.length-1)+'"></span>':'')+'</th>';}
+// Typed into a column filter or the search box: a result of thousands of rows is filtered again once
+// the typing pauses, not at every key, which made each key wait for a pass over all of it. A small
+// result follows the typing at once.
+function gridTypeSoon(id,fn){const t=T(id);if(!t||!t.rows||t.rows.length<5000){fn();return;}clearTimeout(t._typeTimer);t._typeTimer=setTimeout(fn,150);}
 function setFilter(id,ci,v){const t=T(id);t.filters[ci]=v;t._hitAt=null;syncFilterUi(id);renderBody(id);updatePager(id);updateStatusLine(id);}
 // The toolbar's search box. It belongs to the tab, not to one result, so it keeps applying when
 // another result of a script is picked or the query is run again - the box still shows it.
@@ -12441,15 +12480,22 @@ async function impAppend(paths,sizes){const have=new Set(_impFiles.map(f=>f.path
 function impAddFiles(){browse({title:'Select SQL files',filter:'*.sql',mode:'files',onPick:async ps=>{const n=await impAppend(ps);log('Added '+n+' file(s).');}});}
 function impAddFolder(){browse({title:'Select a folder (imports all .sql inside)',mode:'folder',onPick:async folder=>{const r=await api('/api/browse',{path:folder,filter:'*.sql',dirsOnly:false});if(r.ok){const ps=r.files.map(f=>f.path),sizes={};r.files.forEach(f=>{sizes[f.path]=f.size;});const n=await impAppend(ps,sizes);log('Added '+n+' .sql file(s) from '+folder);}else toast(r.error,true);}});}
 // ---- close tabs ----
-async function closeAll(){const dirty=tabs.filter(t=>pendingCount(t)>0||t.txDirty);if(dirty.length){if(!(await ask(dirty.length+' tab(s) have unsaved changes. Close all and discard them?')))return;}
+// What closing a tab would lose: grid edits not applied, a transaction not committed, or the edit of
+// a routine, trigger or view not applied - the last lives only in its tab. Closing one tab asked about
+// all three; Close all and Close others looked at the first (and Close others not at transactions).
+function tabUnsaved(t){if(!t)return false;if(pendingCount(t)>0||t.txDirty)return true;
+ if(t.ddl){const ed=$('ed_'+t.id),cur=ed?ed.value:'';return cur!==(t.ddlApplied!=null?t.ddlApplied:t.genSql);}return false;}
+async function closeAll(){const dirty=tabs.filter(tabUnsaved);if(dirty.length){if(!(await ask(dirty.length+' tab(s) have work that is not saved - grid edits, a transaction not committed, or a routine not applied. Close all and lose it?')))return;}
  await Promise.all(tabs.filter(t=>t.runningReqId).map(t=>cancelQuery(t.id)));
- tabs.forEach(t=>closeCursorFor(t));
+ // Each tab's transaction is ended as closing the one tab ends it: left open, it held its locks on
+ // the server - and its mysql.exe - with no tab left to commit it.
+ tabs.forEach(t=>{closeCursorFor(t);txClose(t);});
  [...tabs].forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=[];activeTab=null;saveSession();toggleOverview();markRunSchema(null);}
-async function closeOthers(id){const dirty=tabs.filter(t=>t.id!==id&&pendingCount(t)>0);if(dirty.length){if(!(await ask(dirty.length+' other tab(s) have unsaved changes. Close them and discard the changes?')))return;}
+async function closeOthers(id){const dirty=tabs.filter(t=>t.id!==id&&tabUnsaved(t));if(dirty.length){if(!(await ask(dirty.length+' other tab(s) have work that is not saved - grid edits, a transaction not committed, or a routine not applied. Close them and lose it?')))return;}
  const others=tabs.filter(t=>t.id!==id);
  await Promise.all(others.filter(t=>t.runningReqId).map(t=>cancelQuery(t.id)));
- others.forEach(t=>closeCursorFor(t));
- others.forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=tabs.filter(t=>t.id===id);activate(id);}
+ others.forEach(t=>{closeCursorFor(t);txClose(t);});
+ others.forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=tabs.filter(t=>t.id===id);activate(id);saveSession();}
 
 // ---- keyboard navigation for side lists ----
 // The sidebar folds like the Action Output panel: a click on the header's button, and the divider
@@ -12588,7 +12634,10 @@ function acMove(dir){acIdx=(acIdx+dir+acItems.length)%acItems.length;acRender();
 // here) - otherwise accepting while the cursor sits right before leftover, un-separated text
 // (e.g. from an earlier accepted suggestion that wasn't fully cleared first) mashes the new
 // suggestion and that old text together with no separator between them.
-function acAccept(id){const ta=acTa||$('ed_'+id);const pos=ta.selectionStart;const before=ta.value.slice(0,pos);const after=ta.value.slice(pos);const m=before.match(/[A-Za-z_][A-Za-z0-9_]*$/);const start=pos-(m?m[0].length:0);const mAfter=after.match(/^[A-Za-z0-9_]+/);const end=pos+(mAfter?mAfter[0].length:0);const val=acItems[acIdx]||'';
+function acAccept(id){const ta=acTa||$('ed_'+id);const pos=ta.selectionStart;const before=ta.value.slice(0,pos);const after=ta.value.slice(pos);// A name begun with a backtick is replaced from the backtick, and up to its closing one if it has
+ // it: the backtick used to stay in front of the suggestion, doubled by its own quoting or left open.
+ const m=before.match(/\x60[^\x60\n]*$|[A-Za-z_][A-Za-z0-9_$]*$/);const start=pos-(m?m[0].length:0);const quoted=!!(m&&m[0][0]==='\x60');
+ const mAfter=quoted?(after.match(/^[^\x60\n]*\x60/)||after.match(/^[A-Za-z0-9_$]+/)):after.match(/^[A-Za-z0-9_$]+/);const end=pos+(mAfter?mAfter[0].length:0);const val=acItems[acIdx]||'';
  edReplaceRange(id,start,end,val);const np=start+val.length;ta.selectionStart=ta.selectionEnd=np;acHide();syncHl(id);ta.focus();}
 
 let csvTarget={db:null,table:null};

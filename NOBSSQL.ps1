@@ -389,6 +389,28 @@ function Open-Tunnel { param([string]$SshHost, [string]$SshPort, [string]$SshUse
     }
     [pscustomobject]@{ Process = $proc; Port = $local; Said = $said }
 }
+# MariaDB's client has no setting that insists on TLS without also checking the certificate. With
+# "ssl" and "skip-ssl-verify-server-cert" - which "required" needs, since the certificate a server
+# generates for itself is self-signed - it carried on in plaintext when the server offered no TLS
+# (MariaDB 12.3's client against 10.2 without TLS: connected, Ssl_cipher empty). Run on connecting,
+# this statement fails such a session with a message that names the reason, and leaves an
+# encrypted one as it was. It checks the server's side of the connection: what it cannot catch is
+# someone in between who speaks TLS to the server - only the verify modes can. Where the status is
+# kept differs by server; $null when it is not yet known which this is.
+function Get-TlsGuardSql { param($ServerIsMariaDB)
+    if ($null -eq $ServerIsMariaDB) { return $null }
+    $status = if ($ServerIsMariaDB) { 'information_schema.SESSION_STATUS' } else { 'performance_schema.session_status' }
+    "SET SESSION sql_mode = IF((SELECT COUNT(*) FROM $status WHERE VARIABLE_NAME = 'Ssl_cipher' AND VARIABLE_VALUE <> '') = 0, 'NOT_ENCRYPTED_BUT_SSL_MODE_IS_REQUIRED', @@SESSION.sql_mode)"
+}
+# The guard for MariaDB's client on a "required" connection. The server's flavor comes from what
+# connecting found out (Get-ServerIsMariaDB) and is not asked here - asking goes through New-Cnf.
+# Until it is known, which is only the very first question connecting asks, there is no guard.
+function Get-TlsGuardFor { param($conn, $ClientIsMariaDB)
+    if ($ClientIsMariaDB -ne $true -or [string]$conn.ssl -ne 'required' -or $null -eq $script:ServerFlavor) { return $null }
+    $known = $null
+    if (-not $script:ServerFlavor.TryGetValue((Get-ServerFlavorKey $conn), [ref]$known)) { return $null }
+    Get-TlsGuardSql $known
+}
 function New-Cnf {
     param($conn, [string]$Tool)
     $tmp = Join-Path $env:TEMP ("mysqlcnf_" + [Guid]::NewGuid().ToString('N') + ".cnf")
@@ -421,6 +443,9 @@ function New-Cnf {
     # "loose-" because 5.7's mysqldump has no init-command (and asks in a way 5.7 understands).
     $names = if ($maria -eq $false) { "SET NAMES $(if ($browseCs) { $browseCs } else { 'utf8mb4' })" } else { $null }
     if ($names) { [void]$sb.AppendLine("loose-init-command=$names") }
+    # "loose-", as mariadb-dump has no init-command: an export checks first (Test-TlsGuard).
+    $guard = Get-TlsGuardFor $conn $(if ($null -ne $maria) { $maria } else { Test-ClientIsMariaDB })
+    if ($guard) { [void]$sb.AppendLine("loose-init-command=$guard") }
     # A PAM or LDAP account wants its password as typed. MySQL's client sends it only when told to,
     # and it is told only on a connection that is encrypted. (MariaDB's sends it when asked, and
     # answers PAM's dialog plugin as well.)
@@ -433,6 +458,7 @@ function New-Cnf {
     # (Compare's connections), this and the SET NAMES above share the statement when wanted.
     $initParts = @()
     if ($names -and ($conn.utc -or $browseCs)) { $initParts += $names }
+    if ($guard -and ($conn.utc -or $browseCs)) { $initParts += $guard }
     if ($conn.utc) { $initParts += "SET time_zone='+00:00'" }
     if ($browseCs) { $initParts += 'SET SESSION TRANSACTION READ ONLY' }
     if ($initParts.Count) {
@@ -1137,6 +1163,15 @@ function Api-Connect { param($conn)
     if ($null -ne $v.version) {
         $maria = [bool]($v.version -match 'MariaDB')
         $script:ServerFlavor[(Get-ServerFlavorKey $conn)] = $maria
+        # The question above went without the TLS guard, since which one to use was not known yet
+        # (Get-TlsGuardFor). Now it is: a "required" connection the server does not encrypt is
+        # refused here, at Connect, rather than on the first query after it.
+        $my = Get-Mysql $conn
+        if (Get-TlsGuardFor $conn (Test-ClientIsMariaDB $my)) {
+            $gc = New-Cnf $conn -Tool $my
+            try { $gr = Run-Proc $my @("--defaults-extra-file=$gc","-N","-e","DO 1") } finally { Remove-Item $gc -Force -ErrorAction SilentlyContinue }
+            if ($gr.exit -ne 0) { return '{"ok":false,"error":'+(J-Str (FirstErr $gr.err))+'}' }
+        }
         return '{"ok":true,"version":'+(J-Str $v.version)+',"mariadb":'+$maria.ToString().ToLower()+',"client":'+(J-Str (Get-Mysql $conn))+'}'
     }
     return '{"ok":false,"error":'+(J-Str ("Connection failed: "+(Friendly-TlsErr (Friendly-AuthErr (FirstErr $v.err)) $conn)))+'}'
@@ -2096,6 +2131,16 @@ function Api-Export { param($conn,$data)
     $folder=[string]$data.folder
     if(-not (Test-Path $folder)){ try { New-Item -ItemType Directory -Path $folder -Force|Out-Null } catch { return '{"ok":false,"error":'+(J-Str ("Cannot create folder: "+$_.Exception.Message))+'}' } }
     $o=$data.options; $cnf=New-Cnf $conn -Tool $dump; $log=New-Object System.Collections.ArrayList
+    # mariadb-dump has no init-command, so the TLS guard (Get-TlsGuardSql) is run by mysql.exe just
+    # before, on the same settings: a "required" connection the server does not encrypt stops here.
+    if ((Test-ClientIsMariaDB $dump) -and [string]$conn.ssl -eq 'required') {
+        $probe = Get-Mysql $conn
+        if ((Test-ClientIsMariaDB $probe) -and (Get-TlsGuardFor $conn $true)) {
+            $pc = New-Cnf $conn -Tool $probe
+            try { $pr = Run-Proc $probe @("--defaults-extra-file=$pc","-N","-e","DO 1") } finally { Remove-Item $pc -Force -ErrorAction SilentlyContinue }
+            if ($pr.exit -ne 0) { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; return '{"ok":false,"error":'+(J-Str ("Not exported: " + (FirstErr $pr.err)))+'}' }
+        }
+    }
     $excl=@{}; if($data.excludes){ foreach($e in @($data.excludes)){ $excl[[string]$e]=$true } }
     # mode: 'table' (one file per table, the default), 'db' (one file per database), 'single' (one combined file)
     $mode=[string]$data.mode; if(-not $mode){ if($data.single){$mode='single'}else{$mode='table'} }
@@ -3048,7 +3093,8 @@ function Api-Import { param($conn,$data)
             # exported with a larger packet size fails with "MySQL server has gone away".
             $maxPacket = ([string]$data.maxpacket).Trim()
             # Replaces the options file's init-command, so it repeats its SET NAMES (see New-Cnf).
-            $fkNames = $(if (Test-ClientIsMariaDB $mysql) { '' } else { 'SET NAMES utf8mb4; ' }) + 'SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'
+            $fkGuard = Get-TlsGuardFor $conn (Test-ClientIsMariaDB $mysql)
+            $fkNames = $(if (Test-ClientIsMariaDB $mysql) { if ($fkGuard) { "$fkGuard; " } else { '' } } else { 'SET NAMES utf8mb4; ' }) + 'SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'
             $a=@("--defaults-extra-file=$cnf","--show-warnings"); if($data.force){$a+='--force'}; if($binMode){$a+='--binary-mode'}; if($maxPacket){$a+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a+="--init-command=$fkNames"}; if($target){$a+=$target}
             $short = [IO.Path]::GetFileName($f)
             Initialize-DumpDb

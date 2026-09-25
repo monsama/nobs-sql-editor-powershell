@@ -113,6 +113,14 @@ try {
     $inv = if ($caps.invisible) { ' INVISIBLE' } else { '' }
     "  (server $verText; without: $(@($caps.Keys | Where-Object { -not $caps[$_] } | Sort-Object) -join ', '))"
 
+    # ssl=required at Connect: encrypted where the server has TLS, refused where it has none.
+    # MariaDB's client went on in plaintext there (see Get-TlsGuardSql in the app).
+    $req = $conn.Clone(); $req.ssl = 'required'
+    $rc = Api '/api/connect' @{ conn = $req }
+    if ($caps.tls) { Check ($rc.ok -eq $true) 'Connect with ssl=required works on a server with TLS' ($rc | ConvertTo-Json -Compress) }
+    else { Check ((-not $rc.ok) -and "$($rc.error)" -match 'NOT_ENCRYPTED|SSL') 'Connect with ssl=required is refused by a server without TLS' ($rc | ConvertTo-Json -Compress) }
+    $null = Api '/api/connect' @{ conn = $conn }
+
     # --- 1. the keepalive ping must require the token ------------------------------------------
     # LastPing drives the idle shutdown. While this was unauthenticated, any page the user had
     # open could hold the server - and the live database connections it owns - open forever.
@@ -985,6 +993,9 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
                 ForEach-Object { Invoke-Expression $_.Extent.Text }
             $script:ToolsDir  = Split-Path -Parent $caClient
             $script:MysqlPath = $caClient
+            # What connecting would have found out, so New-Cnf writes the TLS guard it writes then.
+            $script:ServerFlavor = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+            $script:ServerFlavor[(Get-ServerFlavorKey $conn)] = $srvMaria
             $try = {
                 param($mode, $ca)
                 $c = [pscustomobject]@{ host=$conn.host; port=$conn.port; user=$conn.user; password=$conn.password; ssl=$mode; sslCa=$ca }
@@ -1004,7 +1015,10 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
         }
         Check (-not $caOk.verify)   'ssl=verify refuses a CA that did not sign the server certificate'
         Check (-not $caOk.verifyCa) 'ssl=verify-ca refuses it too - it relaxes the host name, not the chain'
-        Check $caOk.required        'ssl=required ignores the CA and still connects'
+        # ...and where the server has no TLS at all, "required" is refused rather than going on in
+        # plaintext, which MariaDB's client did before the guard (Get-TlsGuardSql).
+        if ($caps.tls) { Check $caOk.required 'ssl=required ignores the CA and still connects' }
+        else { Check (-not $caOk.required) 'ssl=required is refused by a server without TLS, not carried on in plaintext' }
         # See the Tauri repo's docs/TESTING.md for pulling the server's CA off the wire with openssl.
         if ($null -eq $caOk.rightCa) { "  skip  NOBS_TEST_SERVER_CA not set - the right-CA check did not run" }
         else { Check $caOk.rightCa 'ssl=verify-ca connects with the server''s own CA' }

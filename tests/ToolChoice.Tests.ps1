@@ -16,7 +16,7 @@ $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $Sc
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $n.Name -in @('Get-MysqlServerBinDirs','Select-Tool','Get-MysqlDownloadInfo','Get-MysqlZipMember','Get-PluginDir','New-Cnf','Get-Endpoint','Open-Tunnel','Format-OneArg','Format-Args','Get-InnerMessage','Initialize-DumpDb','Get-CnfSafe','Get-SslLines',
-                  'Test-ClientIsMariaDB','Test-ToolIsMariaDB','Test-DumpIsMariaDB','Get-BrowseCharset')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
+                  'Test-ClientIsMariaDB','Test-ToolIsMariaDB','Test-DumpIsMariaDB','Get-BrowseCharset','Get-TlsGuardSql','Get-TlsGuardFor','Get-ServerFlavorKey')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 # The list Get-BrowseCharset matches against: a script-level value, not a function, so it is
 # evaluated by name rather than picked up with the definitions above.
@@ -105,6 +105,22 @@ try {
         # A PAM password goes as typed, so MySQL's client may send it only over TLS (ssl=required here).
         Check ($b1 -match '(?m)^loose-enable-cleartext-plugin\s*$') 'MySQL''s tool may answer PAM on an encrypted connection' $b1
     } finally { Remove-Item $f1, $f2 -Force -ErrorAction SilentlyContinue }
+    # MariaDB's client on "required" went on in plaintext against a server without TLS; once the
+    # server's flavor is known, its options file carries the statement that refuses that.
+    $script:ServerFlavor = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+    $fg0 = New-Cnf $conn -Tool $ours
+    $script:ServerFlavor['h:3306'] = $true
+    $fg1 = New-Cnf $conn -Tool $ours
+    $fg2 = New-Cnf ($conn + @{ utc = $true }) -Tool $ours
+    $fg3 = New-Cnf @{ host = 'h'; port = '3306'; user = 'u'; ssl = 'verify' } -Tool $ours
+    try {
+        $g0 = Get-Content -Raw $fg0; $g1 = Get-Content -Raw $fg1; $g2 = Get-Content -Raw $fg2; $g3 = Get-Content -Raw $fg3
+        Check ($g0 -notmatch 'NOT_ENCRYPTED') 'no guard until the server is known' $g0
+        Check ($g1 -match "(?m)^loose-init-command=SET SESSION sql_mode = IF\(\(SELECT COUNT\(\*\) FROM information_schema\.SESSION_STATUS .*NOT_ENCRYPTED_BUT_SSL_MODE_IS_REQUIRED") 'a MariaDB server: the guard asks information_schema' $g1
+        Check ($g2 -match '(?s)\[mysql\]\r?\ninit-command="SET SESSION sql_mode = IF.*NOT_ENCRYPTED.*; SET time_zone') 'and it stays when [mysql] has its own init-command' $g2
+        Check ($g3 -notmatch 'NOT_ENCRYPTED') 'verify needs no guard: it insists on TLS already' $g3
+        Check ((Get-TlsGuardSql $false) -match 'performance_schema\.session_status') 'a MySQL server: performance_schema' (Get-TlsGuardSql $false)
+    } finally { Remove-Item $fg0, $fg1, $fg2, $fg3 -Force -ErrorAction SilentlyContinue; $script:ServerFlavor = $null }
     # Compare's connections run in UTC, set only for mysql.exe: mysqldump reads the same file and
     # rejects options it does not know.
     $utc = @{ host = 'h'; port = '3306'; user = 'u'; password = 'p'; ssl = 'required'; utc = $true }

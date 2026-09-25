@@ -60,6 +60,11 @@ Check ((Rw "USE ``other``;`n") -ceq "USE ``other``;`n") 'another database is lef
 Check ((Rw 'USE `shop`;' 'shop' 'a`b') -ceq 'USE `a``b`;') 'a backtick in the target is escaped'
 $raw = [byte[]](0x49,0x4E,0x53,0x20,0xFF,0xFE,0x0A)
 Check ([Convert]::ToBase64String([NobsDumpDb]::RewriteLine($raw,$raw.Length,'shop','x')) -eq [Convert]::ToBase64String($raw)) 'bytes that are not UTF-8 pass through'
+# A view's tables, and a routine that names its own database, go along with the rename; rows do not.
+$view = Rw '/*!50001 VIEW `v` AS select `shop`.`t`.`id` AS `id` from `shop`.`t` */;'
+Check ($view -ceq '/*!50001 VIEW `v` AS select `shop_copy`.`t`.`id` AS `id` from `shop_copy`.`t` */;') 'a view names the renamed database' $view
+$row = 'INSERT INTO `t` VALUES (1,''`shop`.`t` in a value'');'
+Check ((Rw $row) -ceq $row) 'a row that holds the name is left as it is'
 
 "`n-- the plan follows what the file contains --"
 Check ((Get-DumpPlan @('shop') '').Kind -eq 'AsIs')          'no target: restore where the file says'

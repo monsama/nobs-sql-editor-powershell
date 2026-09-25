@@ -2241,13 +2241,19 @@ function Api-Export { param($conn,$data)
                 if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
                 [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
             }
-            elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ $dn = Strip-DefinerFile $file; if($dn){ [void]$log.Add("NOTE $file : DEFINER could not be left out - $dn") } }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $singleBase : "+(Friendly-DumpErr (FirstErr $r.err))) }
+            elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ $dn = Strip-DefinerFile $file; if($dn){ [void]$log.Add("NOTE $file : DEFINER could not be left out - $dn") } }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { $pk=''; if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force; $pk=" (the unfinished file is kept as $([IO.Path]::GetFileName($file)).partial)" }catch{} }; [void]$log.Add("FAILED ($($r.exit)) $singleBase : "+(Friendly-DumpErr (FirstErr $r.err))+$pk) }
         }
         elseif($mode -eq 'db'){
-            # One file per database (includes routines/events/create-db as chosen).
+            # One file per database (includes routines/events/create-db as chosen), and never the same
+            # file for two: names that differ only in case, or only in characters a file name cannot
+            # hold ("a b" and "a_b"), used to write the same file, the second over the first. The
+            # hashtable ignores case, as Windows' file names do.
+            $usedDb=@{}
             foreach($d in $dbs){
                 if($job.Cancelled){ [void]$log.Add("CANCELLED (remaining databases skipped)"); break }
-                $safe=($d -replace '[^\w\.\-]','_'); $file=Join-Path $folder "$safe$stamp.sql"
+                $safe=($d -replace '[^\w\.\-]','_'); $base=$safe; $dbn=2
+                while($usedDb.ContainsKey($base)){ $base="$($safe)_$dbn"; $dbn++ }
+                $usedDb[$base]=1; $file=Join-Path $folder "$base$stamp.sql"
                 $a=@()+$common+@('--databases')
                 if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
                 if($o.adddropdb){$a+='--add-drop-database'}; if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
@@ -2260,7 +2266,7 @@ function Api-Export { param($conn,$data)
                     [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
                     break
                 }
-                if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ $dn = Strip-DefinerFile $file; if($dn){ [void]$log.Add("NOTE $file : DEFINER could not be left out - $dn") } }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d : "+(Friendly-DumpErr (FirstErr $r.err))) }
+                if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ $dn = Strip-DefinerFile $file; if($dn){ [void]$log.Add("NOTE $file : DEFINER could not be left out - $dn") } }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { $pk=''; if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force; $pk=" (the unfinished file is kept as $([IO.Path]::GetFileName($file)).partial)" }catch{} }; [void]$log.Add("FAILED ($($r.exit)) $d : "+(Friendly-DumpErr (FirstErr $r.err))+$pk) }
             }
         }
         else {
@@ -2326,7 +2332,7 @@ function Api-Export { param($conn,$data)
                         [void]$log.Add("CANCELLED (routines/events for $d stopped)")
                     }
                     elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ $dn = Strip-DefinerFile $file; if($dn){ [void]$log.Add("NOTE $file : DEFINER could not be left out - $dn") } }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB, routines/events)") }
-                    else { [void]$log.Add("FAILED ($($r.exit)) $d routines/events : "+(Friendly-DumpErr (FirstErr $r.err))) }
+                    else { $pk=''; if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force; $pk=" (the unfinished file is kept as $([IO.Path]::GetFileName($file)).partial)" }catch{} }; [void]$log.Add("FAILED ($($r.exit)) $d routines/events : "+(Friendly-DumpErr (FirstErr $r.err))+$pk) }
                 }
             }
         }
@@ -2796,8 +2802,24 @@ public static class NobsDumpDb {
             o.Write(q, 0, q.Length);
             o.Write(l, end, n - end);
         } else o.Write(l, 0, n);
-        return o.ToArray();
+        // On a line that is not row data, every name qualified with the database (`from`.`t`) is
+        // renamed too: mysqldump writes a view's tables that way, and a routine or trigger that names
+        // its own database keeps it. Only the CREATE DATABASE and USE lines used to be renamed, which
+        // left those pointing at the old database. Rows are never touched.
+        byte[] r = o.ToArray();
+        int k = 0; while (k < r.Length && (r[k] == 32 || r[k] == 9)) k++;
+        if (RwStarts(r, k, "INSERT ") || RwStarts(r, k, "REPLACE ")) return r;
+        byte[] nd = Encoding.UTF8.GetBytes("`" + from.Replace("`", "``") + "`.");
+        byte[] rp = Encoding.UTF8.GetBytes("`" + to.Replace("`", "``") + "`.");
+        var o2 = new MemoryStream(); bool any = false; int x = 0;
+        while (x < r.Length) {
+            if (x + nd.Length <= r.Length && RwAt(r, x, nd)) { o2.Write(rp, 0, rp.Length); x += nd.Length; any = true; }
+            else { o2.WriteByte(r[x]); x++; }
+        }
+        return any ? o2.ToArray() : r;
     }
+    static bool RwStarts(byte[] b, int at, string s) { if (at + s.Length > b.Length) return false; for (int i = 0; i < s.Length; i++) if (b[at + i] != (byte)s[i]) return false; return true; }
+    static bool RwAt(byte[] b, int at, byte[] p) { for (int i = 0; i < p.Length; i++) if (b[at + i] != p[i]) return false; return true; }
     // Copies a dump to a process's stdin with the database renamed. Stops quietly when the reader
     // goes away - a failed statement ends mysql.exe, and that failure is reported from its stderr.
     // Splits a whole-database dump into one file per table or view, each with the dump's own
@@ -7862,10 +7884,10 @@ async function openDdl(db,type,name){const r=await api('/api/ddl',{db,type,name}
  if(type==='procedure'||type==='function'||type==='trigger'){const kw={procedure:'PROCEDURE',function:'FUNCTION',trigger:'TRIGGER'}[type];
   if(window.mariadb){
    // MariaDB: CREATE OR REPLACE is atomic - no window where the routine is missing, and no separate DROP.
-   body='-- Edit then "Apply (recreate)". (MariaDB CREATE OR REPLACE - atomic)\n'+modeHead+'DELIMITER $$\n'+body.replace(/^CREATE/i,'CREATE OR REPLACE')+'$$\nDELIMITER ;\n'+modeTail;
+   body='-- Edit then "Apply (recreate)". (MariaDB CREATE OR REPLACE - atomic)\n'+modeHead+'DELIMITER $$\n'+body.replace(/^CREATE/i,'CREATE OR REPLACE')+'\n$$\nDELIMITER ;\n'+modeTail;
   } else {
    // MySQL has no CREATE OR REPLACE for routines/triggers, so drop then create.
-   body='-- Edit then "Apply (recreate)".\n'+modeHead+'DROP '+kw+' IF EXISTS '+qid(db)+'.'+qid(name)+';\nDELIMITER $$\n'+body+'$$\nDELIMITER ;\n'+modeTail;
+   body='-- Edit then "Apply (recreate)".\n'+modeHead+'DROP '+kw+' IF EXISTS '+qid(db)+'.'+qid(name)+';\nDELIMITER $$\n'+body+'\n$$\nDELIMITER ;\n'+modeTail;
   }}
  else if(type==='view'){body='-- Edit then "Apply (recreate)".\n'+body.replace(/^CREATE/i,'CREATE OR REPLACE')+';\n';}
  openTab(type+': '+name,body,db,false,null,{type,db,name,orig:r.ddl,sqlMode:r.sqlMode});}
@@ -8177,7 +8199,10 @@ function splitStmts(sql,withPos){let out=[],cur='',curStart=0,i=0,q=null,delim='
  if(cur.trim())out.push(withPos?{text:cur.trim(),start:curStart,end:sql.length}:cur.trim());
  return out;}
 
-async function runTab(id){await runSql(id,$('ed_'+id).value);}
+// On the tab of a procedure, function or trigger, Run is Apply: its SQL drops the object and creates
+// it again, and Apply puts the previous version back when the new one fails. Run went straight to the
+// server, and on MySQL a CREATE that failed after the DROP left the routine gone.
+async function runTab(id){const t=T(id);if(t&&t.ddl&&/^(procedure|function|trigger)$/.test(t.ddl.type)){await applyDdl(id);return;}await runSql(id,$('ed_'+id).value);}
 async function explainTab(id){
  const ta=$('ed_'+id);const sel=ta.value.substring(ta.selectionStart,ta.selectionEnd).trim();
  // Without a selection, the statement the cursor is in, as Run at the cursor takes it - it used to
@@ -8540,7 +8565,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
       const scriptR=await api('/api/script',{sql:leadingSql,db:dbOf(t),session:sessOf(t)},t.abortCtrl.signal);
       if(scriptR.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
       if(stale())return;
-      if(!scriptR.ok){st.className='status err';st.textContent=scriptR.error;$('res_'+id).innerHTML='';log('ERROR: '+scriptR.error);return;}
+      if(!scriptR.ok){st.className='status err';st.textContent=scriptR.error;$('res_'+id).innerHTML='';log('ERROR: '+scriptR.error);if(t.ddl){const _rn=await ddlRestoreIfDropped(t.ddl);if(_rn){st.textContent+=_rn;log(_rn.trim());}}return;}
     }
     const _q=(leadingAreAllUse&&stmts.length>1?sql:lastStmt).trim().replace(/;+\s*$/,'');
     // The database a bare table name in the query refers to: the last leading USE, which runs in
@@ -8553,7 +8578,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     t.lastRunQ={sql:exact?exact.sql:_q,db:runDb,exactText:exact&&exact.cols.length?exact.cols:undefined};const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,requestId:reqId,pageSize:PAGE_BATCH,browse:true,exactText:exact&&exact.cols.length?exact.cols:undefined,session:sessOf(t)},t.abortCtrl.signal);
     if(r.aborted){if(!stale()){st.className='status';st.textContent='Query cancelled.';}return;}
     if(stale())return;
-    if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log(logErr(r.error));await schemaGoneNote(id,r.error);return;}
+    if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log(logErr(r.error));await schemaGoneNote(id,r.error);if(t.ddl){const _rn=await ddlRestoreIfDropped(t.ddl);if(_rn){st.textContent+=_rn;log(_rn.trim());}}return;}
     t.cols=r.columns;t.binCols=r.binaryCols||[];t.rows=r.rows;t.exact=!!exact;t.pk=null;t.pending=null;t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();
     // Direct clear (not updateEditBar) since a fresh query's table-ness isn't known yet - gives
     // instant feedback instead of showing stale buttons from whatever was loaded before while
@@ -8906,7 +8931,12 @@ function decodeCtrlCharCell(hexStr,maxChars){
 // renderer and print the marker itself, the one value in a grid shown as its own wire format. It is
 // only said for a column the server declared binary (binCols), because a VARCHAR can perfectly
 // well hold the two characters "0x" and that is exactly what should be shown for it.
-function cellHtml(v,isBit,isBin){if(v===null)return '<span class="cellmark" style="color:#999;font-style:italic">(NULL)</span>';if(v==='')return '<span class="cellmark" style="color:#999;font-style:italic;opacity:.6">(empty)</span>';if(v==='0x'&&isBin)return '<span class="cellmark" style="color:#999;font-style:italic;opacity:.6">(0 bytes)</span>';if(typeof v==='string'&&/^0x[0-9A-Fa-f]+$/.test(v))return isBit?esc(hexToBitNumber(v)):decodeCtrlCharCell(v,300);return textCellHtml(v,300);}
+function cellHtml(v,isBit,isBin){if(v===null)return '<span class="cellmark" style="color:#999;font-style:italic">(NULL)</span>';if(v==='')return '<span class="cellmark" style="color:#999;font-style:italic;opacity:.6">(empty)</span>';if(v==='0x'&&isBin)return '<span class="cellmark" style="color:#999;font-style:italic;opacity:.6">(0 bytes)</span>';if(typeof v==='string'&&/^0x[0-9A-Fa-f]+$/.test(v)){if(isBit)return esc(hexToBitNumber(v));
+ // A column known not to be binary is sent as hex only when its bytes are not UTF-8. Hex that does
+ // decode as UTF-8 is therefore text someone stored - "0x41" - and is shown as it is, not as "A".
+ if(isBin===false&&hexIsUtf8(v))return textCellHtml(v,300);
+ return decodeCtrlCharCell(v,300);}return textCellHtml(v,300);}
+function hexIsUtf8(v){if(v.length>20002||v.length%2)return false;try{new TextDecoder('utf-8',{fatal:true}).decode(hexToBytes(v));return true;}catch(e){return false;}}
 function colgroupHtml(id){const t=T(id);const ed=!!t.pk;const hidden=t.hiddenCols||new Set();let h='<colgroup><col style="width:30px">'+(ed?'<col style="width:34px">':'');t.cols.forEach((c,ci)=>{h+='<col style="width:150px'+(hidden.has(ci)?';display:none':'')+'">';});return h+'<col></colgroup>';}
 // wireColResize(): drag a column edge to resize, double-click to auto-fit (widths saved per table).
 function wireColResize(id){const wrap=$('res_'+id);if(!wrap)return;const table=wrap.querySelector('table.grid');if(!table)return;const cg=table.querySelector('colgroup');if(!cg)return;const t=T(id);const off=(!!t.pk)?2:1;
@@ -9222,7 +9252,7 @@ function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=
    h+='<td '+attr+' title="'+esc(clip(val,300))+'">'+cellHtml(val,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci])+'</td>';});h+='</tr>';});
  if(botH>0)h+='<tr class="vpad" style="height:'+botH+'px"><td colspan="'+nCols+'" style="padding:0;border:none"></td></tr>';
  if(ed)t.pending.ins.forEach((row,ii)=>{h+='<tr class="insrow"><td></td><td class="delcell" onclick="delIns(\''+id+'\','+ii+')">\u00D7</td>';
-   t.cols.forEach((c,ci)=>{const v=row[c];const cAttr=esc(c).replace(/\x27/g,'\\x27');h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+cAttr+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+cAttr+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+cAttr+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci])+'</td>';});h+='</tr>';});
+   t.cols.forEach((c,ci)=>{const v=row[c];const cAttr=esc(c).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27');h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+cAttr+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+cAttr+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+cAttr+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci])+'</td>';});h+='</tr>';});
  $('tbody_'+id).innerHTML=h;
  if(wrap&&slice.length){const sampleTr=wrap.querySelector('tbody tr[data-r]');if(sampleTr){const mh=sampleTr.getBoundingClientRect().height;if(mh>4)t._rowH=mh;}}
  updateEditBar(id);}
@@ -9510,7 +9540,11 @@ function viewText(title,text,opts){opts=opts||{};$('vTitle').textContent=title;c
   // string goes unquoted via litForCol's existing BIT-integer path, a "0x.." string goes unquoted
   // via lit()'s existing hex-literal passthrough. Neither needs re-encoding here.
   if(opts.bitNumeric)return ta.value;
-  if(opts.hexText)return hexCellValueForSave(_vHexState.mode, ta.value);
+  // Bytes edited as text keep their line endings too: a text box turns every CR LF into LF, and a
+  // value that had CR LF lost each 0x0D on save.
+  if(opts.hexText){if(_vHexState.mode==='text'&&/^0x/i.test(String(text||''))){let orig='';try{orig=new TextDecoder().decode(hexToBytes(String(text)));}catch(e){}
+   return hexCellValueForSave('text',keepLineEnds(orig,ta.value));}
+   return hexCellValueForSave(_vHexState.mode, ta.value);}
   return opts.options?sel.value:keepLineEnds(text,ta.value);
  };
  if(!opts.options&&!opts.multiOptions&&!opts.dateType){
@@ -10108,7 +10142,11 @@ function qfSub(id,col,val){const q=qid(col);const lv=lit(val);
  const lvd="'"+(sv.length>16?sv.slice(0,16)+'\u2026':sv)+"'";const dv=isNum?lv:lvd;
  sub.push([q+' = '+dv,cmp('=')]);sub.push([q+' != '+dv,cmp('<>')]);
  if(isNum||isDate){sub.push('-');sub.push([q+' > '+dv,cmp('>')]);sub.push([q+' >= '+dv,cmp('>=')]);sub.push([q+' < '+dv,cmp('<')]);sub.push([q+' <= '+dv,cmp('<=')]);}
- if(!isNum){sub.push('-');sub.push([q+" LIKE '%"+ld+"%'",()=>addFilterClause(id,q+" LIKE '%"+esc(like)+"%'")]);sub.push([q+" LIKE '"+ld+"%'",()=>addFilterClause(id,q+" LIKE '"+esc(like)+"%'")]);if(!isDate)sub.push([q+" LIKE '%"+ld+"'",()=>addFilterClause(id,q+" LIKE '%"+esc(like)+"'")]);}
+ if(!isNum){sub.push('-');// The pattern is built as a value - %, _ and \ escaped for LIKE - and only then written as SQL, by
+ // strLit, with the escape character said out loud: escaped once for LIKE and not again for the
+ // string, a backslash in the value was taken as an escape and the filter matched nothing.
+ const likeSql=p=>' LIKE '+strLit(p)+' ESCAPE '+strLit('\\'),lk=String(like).replace(/([%_\\])/g,'\\$1');
+ sub.push([q+" LIKE '%"+ld+"%'",()=>addFilterClause(id,q+likeSql('%'+lk+'%'))]);sub.push([q+" LIKE '"+ld+"%'",()=>addFilterClause(id,q+likeSql(lk+'%'))]);if(!isDate)sub.push([q+" LIKE '%"+ld+"'",()=>addFilterClause(id,q+likeSql('%'+lk))]);}
  sub.push('-');sub.push([q+' IS NULL',()=>addFilterClause(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>addFilterClause(id,q+' IS NOT NULL')]);return sub;}
 // Adds one more ANDed condition to the table tab's active quick filter (does not replace the
 // existing ones) - lets right-clicking two different cells build up a compound WHERE, matching
@@ -10278,7 +10316,7 @@ async function ddlRestoreIfDropped(d){
  if(!d||!d.orig||!/^(procedure|function|trigger)$/.test(d.type))return '';
  if((await ddlExists(d.db,d.type,d.name))!==false)return '';
  // Put back under the sql_mode it was made with, as openDdl does.
- const script=(d.sqlMode!=null?'SET SESSION sql_mode = '+strLit(d.sqlMode)+';\n':'')+'DELIMITER $$\n'+d.orig+'$$\nDELIMITER ;\n';
+ const script=(d.sqlMode!=null?'SET SESSION sql_mode = '+strLit(d.sqlMode)+';\n':'')+'DELIMITER $$\n'+d.orig+'\n$$\nDELIMITER ;\n';
  const r=await api('/api/script',{sql:script,db:d.db});
  if(r.ok&&(await ddlExists(d.db,d.type,d.name))){
   loadObjects(d.db);
@@ -10467,7 +10505,10 @@ function hist(){try{return JSON.parse(localStorage.getItem('history')||'[]');}ca
 // Writing can fail once the storage is full; that used to throw before the query was even sent,
 // and the tab sat at "Running..." for good.
 function addHistory(sql){sql=sql.trim();if(!sql)return;
- if(/\b(identified\b[\s\S]*?\b(by|as|using)|set\s+password\b[^;]*?=|password\s*(\(|=)|master_password\s*=)\s*'/i.test(sql))return;
+ // A statement that carries a password is not kept: in single or double quotes, and in any
+ // ..._PASSWORD = (MASTER_, SOURCE_) or PASSWORD 'x' (CREATE SERVER) form. Double quotes and the
+ // newer names used to go into the history as typed.
+ if(/\b(identified\b[\s\S]*?\b(by|as|using)|set\s+password\b[^;]*?=|\w*password\s*(\(|=)?)\s*['"]/i.test(sql))return;
  try{let h=hist().filter(x=>x!==sql);h.unshift(sql);h=h.slice(0,200);localStorage.setItem('history',JSON.stringify(h));}catch(e){}}
 function codeBlockStartHeight(text){const lines=String(text||'').split('\n').length;return Math.min(140,Math.max(40,lines*17+13))+'px';}
 // max-width:100% keeps a drag-resize from ever growing wider than the box it's already filling
@@ -11001,7 +11042,7 @@ async function refreshProcessList(){
   // button at all rather than one that would only ever fail.
   const info=infoIdx>=0?String(row[infoIdx]||'').trim().toLowerCase():'';
   const isSelf=(info==='show full processlist'||info==='show processlist');
-  h+='<td style="padding:4px 6px;border-bottom:1px solid var(--bd2)">'+((pid!=null&&!isSelf)?'<button class="sm warn" onclick="killProcess(\''+esc(pid).replace(/\x27/g,'\\x27')+'\')">Kill</button>':'')+'</td>';
+  h+='<td style="padding:4px 6px;border-bottom:1px solid var(--bd2)">'+((pid!=null&&!isSelf)?'<button class="sm warn" onclick="killProcess(\''+esc(pid).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27')+'\')">Kill</button>':'')+'</td>';
   h+='</tr>';
  });
  h+='</tbody></table>';
@@ -11529,8 +11570,13 @@ function dColFromInfo(row,isMaria,tableColl){
    else{defShown=v;defSql=v;}
   } else {
    defShown=v;
-   if(/DEFAULT_GENERATED/i.test(extra))defSql=/^current_timestamp(\(\d*\))?$/i.test(v)?v:'('+v+')';
+   // information_schema escapes the quotes of a string inside an expression default -
+   // concat(_utf8mb4\'a\',...) - and written back like that the MODIFY failed.
+   if(/DEFAULT_GENERATED/i.test(extra))defSql=/^current_timestamp(\(\d*\))?$/i.test(v)?v:'('+v.replace(/\\(['\\])/g,'$1')+')';
    else if(/^b'[01]*'$/i.test(v)||/^0x[0-9a-f]*$/i.test(v))defSql=v;
+   // MySQL 5.7 has no DEFAULT_GENERATED: its CURRENT_TIMESTAMP default was quoted as text, and the
+   // MODIFY failed with "Invalid default value".
+   else if(/^(TIMESTAMP|DATETIME)$/.test(type)&&/^current_timestamp(\(\d*\))?$/i.test(v))defSql=v;
    else defSql=strLit(v);
   }
  }
@@ -11701,7 +11747,7 @@ function expOptsRestore(){
   el.addEventListener('change',expOptsSave);
  });
 }
-async function openExport(preselect){const r=await api('/api/schemas');const box=$('expDbs');box.innerHTML='';if(r.ok)r.schemas.forEach(s=>{const safe=s.name.replace(/[^A-Za-z0-9]/g,'_');const dbAttr=esc(s.name).replace(/\x27/g,'\\x27');box.innerHTML+='<div class="expdbrow"><span class="exptoggle" id="expx_'+safe+'" onclick="expTables(\''+dbAttr+'\',\''+safe+'\')" title="Show tables to exclude">\u25B8</span><label class="ck" style="display:inline-flex"><input type="checkbox" class="expdb" value="'+esc(s.name)+'" onchange="expDbToggle(\''+safe+'\',this.checked)"> '+esc(s.name)+'</label><div class="exptbls" id="expt_'+safe+'" style="display:none"></div></div>';});const ob=$('expOpts'),adv=$('expOptsAdv');
+async function openExport(preselect){const r=await api('/api/schemas');const box=$('expDbs');box.innerHTML='';if(r.ok)r.schemas.forEach(s=>{const safe=s.name.replace(/[^A-Za-z0-9]/g,'_');const dbAttr=esc(s.name).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27');box.innerHTML+='<div class="expdbrow"><span class="exptoggle" id="expx_'+safe+'" onclick="expTables(\''+dbAttr+'\',\''+safe+'\')" title="Show tables to exclude">\u25B8</span><label class="ck" style="display:inline-flex"><input type="checkbox" class="expdb" value="'+esc(s.name)+'" onchange="expDbToggle(\''+safe+'\',this.checked)"> '+esc(s.name)+'</label><div class="exptbls" id="expt_'+safe+'" style="display:none"></div></div>';});const ob=$('expOpts'),adv=$('expOptsAdv');
 const ck=([k,l,d,t,g,f])=>'<label class="ck" title="'+esc(t+(f?'\n(mysqldump '+f+')':''))+'"><input type="checkbox" id="eo_'+k+'" '+(d?'checked':'')+'> '+esc(l)+'</label>';
 ob.innerHTML=EXPOPTS.filter(o=>o[4]==='Include').map(ck).join('');
 adv.innerHTML=['Data','Performance','Compatibility'].map(g=>'<div class="xgrp">'+g+'</div>'+EXPOPTS.filter(o=>o[4]===g).map(ck).join('')).join('');
@@ -12276,7 +12322,7 @@ function renderImpDbPicker(){const inp=$('impDb');const f=inp.value.toLowerCase(
  showImpDbList(window._impDbSchemas.filter(n=>!f||n.toLowerCase().includes(f)));}
 function showImpDbList(matches){const p=$('impDbPicker');const inp=$('impDb');if(!p||!inp)return;
  if(!matches.length){p.style.display='none';return;}
- p.innerHTML=matches.map(n=>'<div class="item" onmousedown="event.preventDefault();impDbPick(\''+esc(n).replace(/\x27/g,'\\x27')+'\')">'+esc(n)+'</div>').join('');
+ p.innerHTML=matches.map(n=>'<div class="item" onmousedown="event.preventDefault();impDbPick(\''+esc(n).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27')+'\')">'+esc(n)+'</div>').join('');
  const r=inp.getBoundingClientRect();
  p.style.left=r.left+'px';p.style.top=r.bottom+2+'px';p.style.minWidth=r.width+'px';p.style.display='block';}
 function impDbPick(name){$('impDb').value=name;$('impDbPicker').style.display='none';}

@@ -1,7 +1,8 @@
 name: compat
 
 # The live suite and the GUI scenarios against servers the main suite (test.yml: current MariaDB
-# and MySQL) does not cover: MySQL 5.7, MariaDB 10.2, and MySQL 9.4 with lower_case_table_names=2.
+# and MySQL) does not cover: MySQL 5.7, 8.0 and 9.4 (with lower_case_table_names=2), and MariaDB
+# 10.2, 10.6 and 10.11.
 # The setup scripts, the fixture and the scenarios live in nobs-sql-editor, whose compat.yml runs
 # the same servers against the desktop edition (and PAM, which needs Linux). What these found in
 # this edition, each fixed and checked here:
@@ -34,6 +35,13 @@ jobs:
             spec: 'mysql57:mysql:5.7.44:3357'
           - name: maria102
             spec: 'maria102:mariadb:10.2.7:3102'
+          # The long-term releases most servers in use actually run.
+          - name: maria106
+            spec: 'maria106:mariadb:10.6.28:3106'
+          - name: maria1011
+            spec: 'maria1011:mariadb:10.11.19:3111'
+          - name: mysql80
+            spec: 'mysql80:mysql:8.0.46:3380'
           - name: mysql94-lctn2
             spec: 'mysql94:mysql:9.4.0:3394:lctn2'
     name: ${{ matrix.name }}

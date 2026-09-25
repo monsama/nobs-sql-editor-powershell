@@ -338,7 +338,9 @@ What the app protects, and where its limits are.
 - **Passwords** are kept encrypted with Windows DPAPI for your account; the temporary option
   files the command-line tools read are private to you and removed after use (and at the next start, if the app was
   killed). A password in SQL the app logs, shows in a message or keeps with your open tabs is
-  written as `'***'`.
+  written as `'***'`. A saved password never reaches the app's page at all: the page names
+  the saved connection and the password is filled in behind it - only for the host, port and user
+  it was saved for. Point a saved connection somewhere else and its password has to be typed again.
 - **The local server** listens on 127.0.0.1 only and answers only requests that carry the token
   it made at start. The token comes in the address the app window is opened with, after `#`,
   never in the page itself; requests from another web page are refused, and the page may not be

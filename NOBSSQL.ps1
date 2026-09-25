@@ -326,6 +326,7 @@ function Get-BrowseCharset {
 # ~/.ssh/config, which brings host aliases and ProxyJump with it. BatchMode means it never waits on
 # a password prompt nobody can see; a login that would need one fails, with ssh's own reason.
 function Get-Endpoint { param($conn)
+    $conn = Resolve-ConnSecrets $conn
     $h = ([string]$conn.host).Trim(); $p = ([string]$conn.port).Trim(); if (-not $p) { $p = '3306' }
     $sh = ([string]$conn.sshHost).Trim()
     if (-not $sh) { return @{ host = $h; port = $p } }
@@ -504,6 +505,7 @@ function Get-TlsGuardFor { param($conn, $ClientIsMariaDB)
 }
 function New-Cnf {
     param($conn, [string]$Tool)
+    $conn = Resolve-ConnSecrets $conn
     $tmp = Join-Path $env:TEMP ("mysqlcnf_" + [Guid]::NewGuid().ToString('N') + ".cnf")
     $sb = [System.Text.StringBuilder]::new()
     # Through the SSH tunnel when the connection has one (Get-Endpoint).
@@ -3587,7 +3589,6 @@ function Add-ConnObjs { param($x,$acc)
     if($x -is [System.Collections.IEnumerable]){ foreach($y in $x){ Add-ConnObjs $y $acc }; return }
     if($x.PSObject -and $x.PSObject.Properties['name']){ [void]$acc.Add($x) }
 }
-# Read saved connections (connections.json). Passwords are DPAPI-encrypted per Windows user.
 # Whether every saved connection to this account (host, port, user, SSH host) is marked read-only -
 # then a request for it is read-only whatever the page sent. A second saved connection to the same
 # account that is not read-only leaves it to the page.
@@ -3598,6 +3599,7 @@ function Test-SavedReadOnly { param($conn)
     $same = @(Load-Conns | Where-Object { (& $k $_) -eq $want })
     return ($same.Count -gt 0 -and -not @($same | Where-Object { -not $_.readonly }).Count)
 }
+# Read saved connections (connections.json). Passwords are DPAPI-encrypted per Windows user.
 function Load-Conns {
     if(-not (Test-Path $script:ConnFile)){ return @() }
     try {
@@ -4877,12 +4879,41 @@ function Api-CompareApply { param($data)
     '{"ok":true,"log":['+(($result|ForEach-Object{ J-Str $_ }) -join ',')+']}'
 }
 
+# The page never holds a saved connection's passwords: it names the connection (savedName) and they
+# are filled in here - but only for the address they were saved for. A page that could send savedName
+# "prod" with another host would otherwise have prod's password sent to that host. When they are
+# filled in, the connection's own SSL settings go with them, so the request cannot ask for less.
+function Get-EndpointKey { param($c)
+    $port = [string]$c.port; if (-not $port.Trim()) { $port = '3306' }
+    $sport = [string]$c.sshPort; if (-not $sport.Trim()) { $sport = '22' }
+    (([string]$c.host).Trim().ToLower() + '|' + $port.Trim() + '|' + [string]$c.user + '|' + ([string]$c.sshHost).Trim().ToLower() + '|' + $sport.Trim() + '|' + ([string]$c.sshUser).Trim())
+}
+function Get-SavedDbPw { param($c)
+    if (-not $c -or -not $c.pass) { return '' }
+    try { $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR((ConvertTo-SecureString $c.pass)); try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($b) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } } catch { '' }
+}
+function Resolve-ConnSecrets { param($conn)
+    if (-not $conn) { return $conn }
+    $name = [string]$conn.savedName
+    if (-not $name) { return $conn }
+    $p = Load-Conns | Where-Object { $_.name -eq $name } | Select-Object -First 1
+    if (-not $p -or (Get-EndpointKey $p) -ne (Get-EndpointKey $conn)) { return $conn }
+    $c = [pscustomobject]@{}
+    foreach ($pr in $conn.PSObject.Properties) { if ($pr.MemberType -in 'NoteProperty','Property') { $c | Add-Member -NotePropertyName $pr.Name -NotePropertyValue $pr.Value -Force } }
+    if ($conn -is [hashtable]) { foreach ($k in $conn.Keys) { $c | Add-Member -NotePropertyName $k -NotePropertyValue $conn[$k] -Force } }
+    $filled = $false
+    if (-not [string]$c.password) { $pw = Get-SavedDbPw $p; if ($pw) { $c | Add-Member -NotePropertyName password -NotePropertyValue $pw -Force; $filled = $true } }
+    if (-not [string]$c.sshPassword) { $pw = Unprotect-SshPw ([string]$p.sshPass); if ($pw) { $c | Add-Member -NotePropertyName sshPassword -NotePropertyValue $pw -Force; $filled = $true } }
+    if ($filled) {
+        foreach ($k in 'ssl','sslCa','sshKey') { $c | Add-Member -NotePropertyName $k -NotePropertyValue ([string]$p.$k) -Force }
+        $c | Add-Member -NotePropertyName clearPw -NotePropertyValue ([bool]$p.clearPw) -Force
+    }
+    return $c
+}
 function Api-ConnGet { param($data)
     $c = Load-Conns | Where-Object { $_.name -eq [string]$data.name } | Select-Object -First 1
     if(-not $c){ return '{"ok":false}' }
-    $pass=''
-    if($c.pass){ try { $sec=ConvertTo-SecureString $c.pass; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec); $pass=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($b); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } catch {} }
-    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"sslCa":'+(J-Str ([string]$c.sslCa))+',"clearPw":'+$(if($c.clearPw){'true'}else{'false'})+',"sshHost":'+(J-Str ([string]$c.sshHost))+',"sshPort":'+(J-Str ([string]$c.sshPort))+',"sshUser":'+(J-Str ([string]$c.sshUser))+',"sshKey":'+(J-Str ([string]$c.sshKey))+',"sshPassword":'+(J-Str (Unprotect-SshPw ([string]$c.sshPass)))+',"password":'+(J-Str $pass)+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
+    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"sslCa":'+(J-Str ([string]$c.sslCa))+',"clearPw":'+$(if($c.clearPw){'true'}else{'false'})+',"sshHost":'+(J-Str ([string]$c.sshHost))+',"sshPort":'+(J-Str ([string]$c.sshPort))+',"sshUser":'+(J-Str ([string]$c.sshUser))+',"sshKey":'+(J-Str ([string]$c.sshKey))+',"hasSshPassword":'+$(if(Unprotect-SshPw ([string]$c.sshPass)){'true'}else{'false'})+',"hasPassword":'+$(if(Get-SavedDbPw $c){'true'}else{'false'})+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
 }
 # A saved connection's SSH password, encrypted for this Windows user the way its database password is.
 function Protect-SshPw { param([string]$Pw) if (-not $Pw) { return '' }; ConvertFrom-SecureString (ConvertTo-SecureString $Pw -AsPlainText -Force) }
@@ -4896,12 +4927,20 @@ function Api-ConnSave { param($data)
     $before=@(Load-Conns)
     $savePw = $true
     if($data.PSObject.Properties['savepw']){ $savePw = [bool]$data.savepw }
+    # A password left empty keeps the one saved - under this name, or under keepFrom for a copy or a
+    # rename - but only while the address is the one it was saved for: a saved connection pointed at
+    # another host, port or user has its password typed again, never carried over to it.
+    $keepFrom = if ([string]$data.keepFrom) { [string]$data.keepFrom } else { $name }
+    $src = $before | Where-Object { $_.name -eq $keepFrom } | Select-Object -First 1
+    $samePlace = $src -and ((Get-EndpointKey $src) -eq (Get-EndpointKey $c))
+    $sshEnc = ''
     if(-not $savePw){
         $enc = ''   # explicitly do not store / remove the saved password
-    } elseif($c.password){
-        $sec=ConvertTo-SecureString ([string]$c.password) -AsPlainText -Force; $enc=ConvertFrom-SecureString $sec
     } else {
-        $prev = $before | Where-Object { $_.name -eq $name } | Select-Object -First 1; if($prev -and $prev.pass){ $enc = [string]$prev.pass }
+        if($c.password){ $sec=ConvertTo-SecureString ([string]$c.password) -AsPlainText -Force; $enc=ConvertFrom-SecureString $sec }
+        elseif($samePlace -and $src.pass){ $enc = [string]$src.pass }
+        if([string]$c.sshPassword){ $sshEnc = Protect-SshPw ([string]$c.sshPassword) }
+        elseif($samePlace -and $src.sshPass){ $sshEnc = [string]$src.sshPass }
     }
     $prevPrimary = $false
     $prevObj = $before | Where-Object { $_.name -eq $name } | Select-Object -First 1
@@ -4910,8 +4949,6 @@ function Api-ConnSave { param($data)
     if($data.PSObject.Properties['accent']){ $accent=[string]$data.accent } elseif($prevObj){ $accent=[string]$prevObj.accent } else { $accent='' }
     if($data.PSObject.Properties['env']){ $env=[string]$data.env } elseif($prevObj){ $env=[string]$prevObj.env } else { $env='' }
     if($data.PSObject.Properties['readonly']){ $ro=[bool]$data.readonly } elseif($prevObj -and $prevObj.readonly){ $ro=$true } else { $ro=$false }
-    # Saved with the database password, and only when that is: "type it each time" covers both.
-    $sshEnc = if ($savePw) { Protect-SshPw ([string]$c.sshPassword) } else { '' }
     $list=@($before | Where-Object { $_.name -ne $name })
     $list+=[pscustomobject]@{name=$name;host=$c.host;port=$c.port;user=$c.user;ssl=$c.ssl;sslCa=[string]$c.sslCa;clearPw=[bool]$c.clearPw;sshHost=[string]$c.sshHost;sshPort=[string]$c.sshPort;sshUser=[string]$c.sshUser;sshKey=[string]$c.sshKey;sshPass=$sshEnc;pass=$enc;primary=$prevPrimary;accent=$accent;env=$env;readonly=$ro}
     Save-Conns $list
@@ -5973,7 +6010,9 @@ function accSet(n,c){window._connMeta=window._connMeta||{};const cur=window._con
 function hexA(hex,a){hex=(hex||'').replace('#','');if(hex.length===3)hex=hex.split('').map(c=>c+c).join('');const v=parseInt(hex,16);if(isNaN(v)||hex.length!==6)return '';return 'rgba('+((v>>16)&255)+','+((v>>8)&255)+','+(v&255)+','+a+')';}
 function applyAccent(color){const bar=$('bar');if(!bar)return;if(!color){bar.style.borderTop='';bar.style.borderBottom='';bar.style.boxShadow='';return;}bar.style.borderTop='2px solid '+color;bar.style.borderBottom='';bar.style.boxShadow='';}
 window.curAccent='';
-function getConn(){return {host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value,sslCa:$('sslca').value,clearPw:$('clearpw').checked,
+// A saved connection's passwords never come to the page: a request names the connection
+// (savedName), and the backend fills them in for the address they were saved for.
+function getConn(){return {savedName:$('connlist')?$('connlist').value:'',host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value,sslCa:$('sslca').value,clearPw:$('clearpw').checked,
  sshHost:$('sshhost').value,sshPort:$('sshport').value,sshUser:$('sshuser').value,sshKey:$('sshkey').value,sshPassword:$('sshpass').value};}
 // ---- SSH tunnel ----
 // The tunnel's settings ride with the connection form in hidden fields, so everything that reads
@@ -5985,12 +6024,12 @@ function sshPaint(){const b=$('sshBtn');if(!b)return;const h=$('sshhost').value.
  b.title=h?'SSH tunnel: '+h+' (click to change)':'Configure SSH tunnel';}
 // grouped: behind a "Use SSH tunnel" checkbox, for the Save and Edit dialogs, where four
 // fields most connections never use would otherwise sit in the middle of the form.
-function sshFields(c,grouped){c=sshOf(c);const f=[
+function sshFields(c,grouped){const hasSshPw=!!(c&&c.hasSshPassword);c=sshOf(c);const f=[
  {key:'sshHost',label:'SSH host (or a host alias from ~/.ssh/config)',value:c.sshHost,placeholder:'bastion.example.com'},
  {key:'sshPort',label:'SSH port',value:c.sshPort,placeholder:'22'},
  {key:'sshUser',label:'SSH user',value:c.sshUser},
  {key:'sshKey',label:'Private key file (optional - defaults to the SSH agent and ~/.ssh)',type:'file',browseTitle:'Select private key file',placeholder:'e.g. C:\\Users\\me\\.ssh\\id_ed25519',value:c.sshKey},
- {key:'sshPassword',label:'SSH password (only if the server asks for one; a key is better)',type:'password',value:c.sshPassword}];
+ {key:'sshPassword',label:'SSH password (only if the server asks for one; a key is better)',type:'password',value:c.sshPassword,placeholder:hasSshPw?'saved - leave empty to keep it (while host, port and user stay the same)':''}];
  if(!grouped)return f;
  return [{key:'useSsh',label:'Use SSH tunnel',type:'checkbox',value:!!c.sshHost,reveals:'ssh'},...f.map(x=>({...x,group:'ssh'}))];}
 // What a dialog says about SSH: nothing at all when its box is not ticked.
@@ -7043,8 +7082,8 @@ async function pickConn() {
         $('sslca').value = r.conn.sslCa || ''; $('clearpw').checked = !!r.conn.clearPw;
         sslCaToggle();
         sshSet(r.conn);
-        const _pw = r.conn.password || '';
-        setPass(_pw);
+        setPass('');
+        const _pw = !!r.conn.hasPassword;
         window._connMeta = window._connMeta || {};
         window._connMeta[n] = {accent:r.conn.accent||'', env:r.conn.env||'', readonly:!!r.conn.readonly};
         // Persistent, tied only to which connection is currently selected - not to whether
@@ -7092,7 +7131,7 @@ async function saveConn(){
   {key:'host',label:'Host',value:$('host').value},
   {key:'port',label:'Port',value:$('port').value},
   {key:'user',label:'User',value:$('user').value},
-  {key:'password',label:'Password',type:'password',value:$('pass').value},
+  {key:'password',label:'Password',type:'password',value:$('pass').value,placeholder:n0&&(window._connPw||{})[n0]?'saved - leave empty to keep it (while host, port and user stay the same)':''},
   {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify (CA and host name)'},{value:'verify-ca',label:'verify-ca (CA only - for auto-generated server certificates)'}],value:$('ssl').value},
   {key:'sslCa',label:'CA certificate - only used by SSL "verify"; leave empty to use the system trust store',type:'file',filter:'*.pem',browseTitle:'Select CA certificate',placeholder:'e.g. C:\\certs\\server-ca.pem',value:$('sslca').value},
   {key:'clearPw',label:'PAM / LDAP sign-in: send the password as typed. Always allowed with SSL "verify"; with "required" or "default" only when this box is ticked - the certificate of the server is not checked there, so anyone in between could read it',type:'checkbox',value:$('clearpw').checked},
@@ -7100,14 +7139,14 @@ async function saveConn(){
   {key:'color',label:'Accent color (tell servers apart at a glance)',type:'color',value:n0?(accMap()[n0]||'#3b82f6'):'#3b82f6'},
   {key:'env',label:'Environment label (e.g. Production, Dev) - optional',value:m0.env||'',maxlength:40},
   {key:'ro',label:'Read-only / safe mode (block all writes)',type:'checkbox',value:!!m0.readonly},
-  {key:'savepw',label:'Save password (unchecked = type it each time)',type:'checkbox',value:n0?!!$('pass').value:true}
+  {key:'savepw',label:'Save password (unchecked = type it each time)',type:'checkbox',value:n0?!!($('pass').value||(window._connPw||{})[n0]):true}
  ]});
  if(!res||!res.name.trim())return;const n=res.name.trim();
- const r=await api('/api/conn-save',{name:n,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,clearPw:!!res.clearPw,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});
+ const r=await api('/api/conn-save',{name:n,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,clearPw:!!res.clearPw,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw,keepFrom:n0||''});
  if(!r.ok){toast(r.error,true);return;}
  window.curAccent=res.color;applyAccent(res.color);log('Saved connection: '+n);await refreshConns();$('connlist').value=n;applyEnv(n);
  $('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';$('clearpw').checked=!!res.clearPw;sslCaToggle();sshSet(sshRes(res));setPass(res.password);
- const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';
+ const pwc=$('pwChip');if(pwc)pwc.style.display=(window._connPw||{})[n]?'inline':'none';
 }
 // Edits a saved connection entirely within its own dialog - host/port/user/password/ssl are
 // fields here directly, fetched fresh from the actual saved data, rather than the dialog only
@@ -7122,7 +7161,7 @@ async function editConn(){const n0=$('connlist').value;if(!n0){toast('Select a s
   {key:'host',label:'Host',value:g.conn.host},
   {key:'port',label:'Port',value:g.conn.port},
   {key:'user',label:'User',value:g.conn.user},
-  {key:'password',label:'Password',type:'password',value:g.conn.password||''},
+  {key:'password',label:'Password',type:'password',value:'',placeholder:g.conn.hasPassword?'saved - leave empty to keep it (while host, port and user stay the same)':''},
   {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify (CA and host name)'},{value:'verify-ca',label:'verify-ca (CA only - for auto-generated server certificates)'}],value:g.conn.ssl},
   {key:'sslCa',label:'CA certificate - only used by SSL "verify"; leave empty to use the system trust store',type:'file',filter:'*.pem',browseTitle:'Select CA certificate',placeholder:'e.g. C:\\certs\\server-ca.pem',value:g.conn.sslCa||''},
   {key:'clearPw',label:'PAM / LDAP sign-in: send the password as typed. Always allowed with SSL "verify"; with "required" or "default" only when this box is ticked - the certificate of the server is not checked there, so anyone in between could read it',type:'checkbox',value:!!g.conn.clearPw},
@@ -7130,23 +7169,23 @@ async function editConn(){const n0=$('connlist').value;if(!n0){toast('Select a s
   {key:'color',label:'Accent color',type:'color',value:accMap()[n0]||'#3b82f6'},
   {key:'env',label:'Environment label (optional)',value:m0.env||'',maxlength:40},
   {key:'ro',label:'Read-only / safe mode (block all writes)',type:'checkbox',value:!!m0.readonly},
-  {key:'savepw',label:'Save password (uncheck to remove the saved password)',type:'checkbox',value:!!(g.ok&&g.conn.password)}
+  {key:'savepw',label:'Save password (uncheck to remove the saved password)',type:'checkbox',value:!!(g.ok&&g.conn.hasPassword)}
  ]});
  if(!res||!res.name.trim())return;const nn=res.name.trim();
- const r=await api('/api/conn-save',{name:nn,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,clearPw:!!res.clearPw,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});if(!r.ok){toast(r.error,true);return;}
+ const r=await api('/api/conn-save',{name:nn,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,clearPw:!!res.clearPw,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw,keepFrom:n0});if(!r.ok){toast(r.error,true);return;}
  if(nn!==n0){await api('/api/conn-delete',{name:n0});}
  window.curAccent=res.color;applyAccent(res.color);await refreshConns();$('connlist').value=nn;applyEnv(nn);
  // If this connection is the one currently loaded into the (largely internal, now rarely
  // shown) inline form, keep it in sync with what was just saved - otherwise a subsequent
  // Connect click would silently use stale values from before the edit.
- if($('connlist').value===nn){$('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';$('clearpw').checked=!!res.clearPw;sslCaToggle();sshSet(sshRes(res));setPass(res.password);const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';}
+ if($('connlist').value===nn){$('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';$('clearpw').checked=!!res.clearPw;sslCaToggle();sshSet(sshRes(res));setPass(res.password);const pwc=$('pwChip');if(pwc)pwc.style.display=(window._connPw||{})[nn]?'inline':'none';}
  log('Updated connection: '+nn);}
 async function cloneConn(){const n0=$('connlist').value;
- if(n0){const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('sslca').value=g.conn.sslCa||'';$('clearpw').checked=!!g.conn.clearPw;sslCaToggle();sshSet(g.conn);$('pass').value=g.conn.password;}}
+ if(n0){const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('sslca').value=g.conn.sslCa||'';$('clearpw').checked=!!g.conn.clearPw;sslCaToggle();sshSet(g.conn);$('pass').value='';}}
  const base=n0||($('user').value+'@'+$('host').value);
  const res=await inputBox({title:'Clone connection',okText:'Clone',fields:[{key:'name',label:'New connection name',value:base+' (copy)',maxlength:60}]});
  if(!res||!res.name.trim())return;const nn=res.name.trim();
- const r=await api('/api/conn-save',{name:nn,conn:getConn()});if(!r.ok){toast(r.error,true);return;}
+ const r=await api('/api/conn-save',{name:nn,conn:getConn(),keepFrom:n0||''});if(!r.ok){toast(r.error,true);return;}
  if(n0){const c=accMap()[n0];if(c)accSet(nn,c);const m=connMeta()[n0];if(m)connMetaSet(nn,m);}
  await refreshConns();$('connlist').value=nn;window.curAccent=accMap()[nn]||'';applyAccent(window.curAccent);applyEnv(nn);
  log('Cloned connection: '+nn);}

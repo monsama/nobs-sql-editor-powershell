@@ -11,7 +11,7 @@ $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-    $n.Name -in @('Test-ApiToken','Test-ToolPathName','Test-DataPathBad','Test-ReleasePageOk')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
+    $n.Name -in @('Test-ApiToken','Test-ToolPathName','Test-DataPathBad','Test-ReleasePageOk','Resolve-ConnSecrets','Load-Conns','Add-ConnObjs','Get-EndpointKey','Get-SavedDbPw','Unprotect-SshPw')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $fail = 0
 function Check($cond, $label, $detail) { if ($cond) { "  ok    $label" } else { "  FAIL  $label$(if($detail){" -> $detail"})"; $script:fail++ } }
@@ -46,5 +46,27 @@ Check (Test-ReleasePageOk 'https://github.com/owner/repo/releases/tag/v1.5.0') '
 Check (-not (Test-ReleasePageOk 'https://evil.example/owner/repo/releases/tag/v1.5.0')) 'not another host'
 Check (-not (Test-ReleasePageOk 'https://github.com/other/repo/releases/tag/v1.5.0')) 'not another project'
 Check (-not (Test-ReleasePageOk 'javascript:alert(1)')) 'not a script'
+
+"-- saved passwords --"
+# The page never holds them: a request names the connection, and they are filled in - only for the
+# address they were saved for, and with that connection's own SSL settings.
+$script:ConnFile = Join-Path ([IO.Path]::GetTempPath()) "nobs-sec-conns-$PID.json"
+try {
+    $enc = ConvertFrom-SecureString (ConvertTo-SecureString 'secret' -AsPlainText -Force)
+    @(@{ name = 'prod'; host = 'db.example'; port = '3306'; user = 'app'; ssl = 'verify-ca'; sslCa = 'C:\ca.pem'; pass = $enc; sshHost = ''; sshPort = ''; sshUser = '' }) |
+        ConvertTo-Json -Depth 3 -AsArray | Set-Content -LiteralPath $script:ConnFile
+    $asked = [pscustomobject]@{ savedName = 'prod'; host = 'DB.example '; port = 3306; user = 'app'; password = ''; ssl = 'disabled' }
+    $r = Resolve-ConnSecrets $asked
+    Check ($r.password -eq 'secret') 'the same address gets the saved password'
+    Check ($r.ssl -eq 'verify-ca') 'and the saved SSL setting, not the one the page sent'
+    Check (-not $asked.password) 'the request itself is not changed'
+    foreach ($k in 'host', 'port', 'user', 'sshHost') {
+        $o = $asked.PSObject.Copy(); $o | Add-Member -NotePropertyName $k -NotePropertyValue $(if ($k -eq 'port') { 3307 } else { 'evil' }) -Force
+        Check (-not (Resolve-ConnSecrets $o).password) "another $k gets no password"
+    }
+    $typed = [pscustomobject]@{ savedName = 'prod'; host = 'db.example'; port = '3306'; user = 'app'; password = 'typed' }
+    Check ((Resolve-ConnSecrets $typed).password -eq 'typed') 'a typed password is used as typed'
+    Check (-not (Resolve-ConnSecrets ([pscustomobject]@{ savedName = 'nope'; host = 'db.example'; port = '3306'; user = 'app' })).password) 'an unknown name gets nothing'
+} finally { Remove-Item -LiteralPath $script:ConnFile -Force -ErrorAction SilentlyContinue }
 
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }

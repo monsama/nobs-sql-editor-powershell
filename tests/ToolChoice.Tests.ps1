@@ -16,7 +16,7 @@ $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $Sc
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $n.Name -in @('Get-MysqlServerBinDirs','Select-Tool','Get-MysqlDownloadInfo','Get-MysqlZipMember','Get-PluginDir','New-Cnf','Get-Endpoint','Open-Tunnel','Open-TunnelOn','Format-OneArg','Format-Args','Get-InnerMessage','Initialize-DumpDb','Get-CnfSafe','Get-SslLines',
-                  'Test-ClientIsMariaDB','Test-ToolIsMariaDB','Test-DumpIsMariaDB','Get-BrowseCharset','Get-TlsGuardSql','Get-TlsGuardFor','Get-ServerFlavorKey')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
+                  'Test-ClientIsMariaDB','Test-ToolIsMariaDB','Resolve-ConnSecrets','Load-Conns','Add-ConnObjs','Get-EndpointKey','Get-SavedDbPw','Unprotect-SshPw','Test-DumpIsMariaDB','Get-BrowseCharset','Get-TlsGuardSql','Get-TlsGuardFor','Get-ServerFlavorKey')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 # The list Get-BrowseCharset matches against: a script-level value, not a function, so it is
 # evaluated by name rather than picked up with the definitions above.

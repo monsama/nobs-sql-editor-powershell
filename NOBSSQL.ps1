@@ -3500,6 +3500,26 @@ function Get-ToolVersionCacheFile { Join-Path (Split-Path -Parent $script:CfgFil
 function Get-ToolStamp { param([string]$Path)
     try { $i = Get-Item -LiteralPath $Path -ErrorAction Stop; return "$($i.Length):$([int64]($i.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds)" } catch { return $null }
 }
+# Whether a path Settings is about to save is the client tool its box asks for, and starts: a
+# mistyped path used to be saved without a word and found out at the next export.
+function Api-CheckTool { param($data)
+    $p = ([string]$data.path).Trim(); $kind = [string]$data.kind
+    if (-not $p) { return '{"ok":true}' }
+    $err = $null
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { $err = 'there is no file at this path' }
+    else {
+        $stem = [IO.Path]::GetFileNameWithoutExtension($p).ToLowerInvariant(); $isDump = $stem -match 'dump'
+        if ($kind -eq 'mysqldump' -and -not $isDump) { $err = 'this is not mysqldump.exe or mariadb-dump.exe' }
+        elseif ($kind -eq 'mysql' -and ($isDump -or ($stem -ne 'mysql' -and $stem -ne 'mariadb'))) { $err = 'this is not mysql.exe or mariadb.exe' }
+        else {
+            $v = Get-ToolVersion $p
+            if (-not $v) { $err = 'it does not answer as a MySQL or MariaDB client' }
+            elseif ($v -like 'cannot start*') { $err = $v }
+            else { return '{"ok":true,"version":'+(J-Str $v)+'}' }
+        }
+    }
+    return '{"ok":true,"error":'+(J-Str $err)+'}'
+}
 function Get-ToolVersion { param([string]$Path)
     if (-not $Path -or $Path -eq '(not found)' -or -not (Test-Path -LiteralPath $Path)) { return $null }
     $stamp = Get-ToolStamp $Path
@@ -5251,6 +5271,8 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  .setrow .setnote{margin-top:3px}
  .setrc{flex:none;margin-left:auto;display:flex;gap:6px;align-items:center}
  .setrc input[type=checkbox]{width:16px;height:16px;margin:0}
+ /* a path that did not pass the check before Save */
+ #mSettings input.bad{border-color:#e5534b;box-shadow:0 0 0 1px #e5534b}
  .setnote{font-size:11px;line-height:1.45;color:var(--muted);margin-top:6px}
  .setfoot{justify-content:flex-end;margin-top:14px;padding-top:10px;border-top:1px solid var(--bd2)}
 @media (max-width:760px){.toolcards{grid-template-columns:1fr}}
@@ -6384,7 +6406,19 @@ async function refreshToolsStatus(manual,quiet){const el=$('cfgStatus');if(!el)r
  if(r.mysqldump&&r.mysqldump!=='(not found)'&&!$('cfgDump').value)$('cfgDump').value=r.mysqldump;
  const pe=$('cfgPaths');if(pe)pe.innerHTML='Downloads: '+esc(r.download_dir)+'<br>Config: '+esc(r.config_file);}catch(e){el.textContent='';}}
 function resetDownloadUrl(){$('cfgDownloadUrl').value=window._mariadbDownloadUrlDefault||'';}
-async function saveSettings(){try{const r=await api('/api/save-config',{config:{mysql_bin:$('cfgMysql').value.trim(),mysqldump_bin:$('cfgDump').value.trim(),mysql_bin_mysql:$('cfgMysqlMy').value.trim(),mysqldump_bin_mysql:$('cfgDumpMy').value.trim(),mariadb_download_url_template:$('cfgDownloadUrl').value.trim()}});if(r&&r.ok){log('Saved client-tool paths.');refreshToolsStatus();hide('mSettings');}else toast('Save failed: '+(r?r.error:''),true);}catch(e){toast('Save failed: '+e,true);}}
+// Save tries each path it was given first: a file that is not there, is the other tool, or does not
+// start is outlined with the reason, and nothing is saved until they all work.
+const CFG_TOOLS=[['cfgMysql','mysql','mysql (MariaDB servers)'],['cfgDump','mysqldump','mysqldump (MariaDB servers)'],['cfgMysqlMy','mysql','mysql (MySQL servers)'],['cfgDumpMy','mysqldump','mysqldump (MySQL servers)']];
+async function saveSettings(){
+ const bad=[],found=[];
+ for(const [id,kind,label] of CFG_TOOLS){const el=$(id);if(!el)continue;el.classList.remove('bad');el.removeAttribute('data-err');const p=el.value.trim();if(!p)continue;
+  let r=null;try{r=await api('/api/check-tool',{path:p,kind});}catch(e){}
+  if(!r||!r.ok){bad.push([el,label,(r&&r.error)||'could not be checked']);}else if(r.error){bad.push([el,label,r.error]);}else if(r.version)found.push(label+': '+r.version);}
+ if(bad.length){setPage('tools');bad.forEach(([el,,msg])=>{el.classList.add('bad');el.title=msg;});bad[0][0].focus();
+  toast('Not saved - '+bad.map(([,label,msg])=>label+': '+msg).join('; ')+'.',true);return;}
+ CFG_TOOLS.forEach(([id])=>{const el=$(id);if(el)el.title='';});
+ return saveSettingsNow(found);}
+async function saveSettingsNow(found){try{const r=await api('/api/save-config',{config:{mysql_bin:$('cfgMysql').value.trim(),mysqldump_bin:$('cfgDump').value.trim(),mysql_bin_mysql:$('cfgMysqlMy').value.trim(),mysqldump_bin_mysql:$('cfgDumpMy').value.trim(),mariadb_download_url_template:$('cfgDownloadUrl').value.trim()}});if(r&&r.ok){log('Saved client-tool paths.');toast(found&&found.length?'Saved - '+found.join(', ')+'.':'Saved.','ok');refreshToolsStatus();hide('mSettings');}else toast('Save failed: '+(r?r.error:''),true);}catch(e){toast('Save failed: '+e,true);}}
 async function downloadTools(){try{await api('/api/save-config',{config:{mariadb_download_url_template:$('cfgDownloadUrl').value.trim()}});}catch(e){}$('cfgLog').textContent='Downloading MariaDB client tools (~90 MB). This can take a minute...';try{const r=await api('/api/download-tools');if(r&&r.ok){$('cfgLog').textContent=r.message;if(r.config){$('cfgMysql').value=r.config.mysql_bin||$('cfgMysql').value;$('cfgDump').value=r.config.mysqldump_bin||$('cfgDump').value;}log(r.message);refreshToolsStatus();}else{$('cfgLog').textContent='Failed: '+(r?r.error:'unknown');}}catch(e){$('cfgLog').textContent='Failed: '+e;}}
 // MySQL's archive is the whole server (~270 MB), and only two binaries are kept from it. The paths
 // it fills in are the "MySQL servers" ones, used only for MySQL servers.
@@ -12731,6 +12765,7 @@ $RequestHandler = {
                 '/api/tools-for-conn' { Send-Json $client (Api-ToolsForConn $conn) }
                 '/api/get-config'     { Send-Json $client (Api-GetConfig) }
                 '/api/save-config'    { Send-Json $client (Api-SaveConfig $data) }
+                '/api/check-tool'     { Send-Json $client (Api-CheckTool $data) }
                 '/api/download-tools' { Send-Json $client (Api-DownloadTools) }
                 '/api/download-mysql-tools' { Send-Json $client (Api-DownloadMysqlTools) }
                 '/api/update-check' { Send-Json $client (Api-UpdateCheck) }

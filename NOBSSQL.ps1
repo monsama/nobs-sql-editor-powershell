@@ -7235,6 +7235,7 @@ async function allResultRows(id){const t=T(id);
  const rs=t.resultSets&&t.resultSets[t.resultIdx||0];
  // The same request the grid's rows came from (in the PowerShell edition that can be the exact-text
  // form of the query), in the same session.
+ await sessFree(t);
  const q=await api('/api/query',Object.assign({},(!rs&&t.lastRunQ)||{sql,db:dbOf(t)},{session:sessOf(t)}));
  if(!q.ok){toast(q.error,true);return null;}
  return {cols:q.columns,rows:q.rows};}
@@ -8297,6 +8298,7 @@ function planHtml(json){let plan;try{plan=typeof json==='string'?JSON.parse(json
  const head=scans.length?'<div class="psum bad">'+scans.length+' table'+(scans.length===1?' is':'s are')+' read in full: '+esc(scans.join(', '))+'</div>':'<div class="psum good">No table is read in full.</div>';
  return head+'<ul class="plan">'+Object.keys(plan).map(k=>planNode(k,plan[k])).join('')+'</ul><details class="pjson"><summary>The plan as the server gave it (JSON)</summary><pre>'+esc(JSON.stringify(plan,null,2))+'</pre></details>';}
 async function planShow(id,stmt){const t=T(id);if(!t)return;
+ await sessFree(t);
  const r=await api('/api/query',{sql:'EXPLAIN FORMAT=JSON '+stmt,db:dbOf(t),session:sessOf(t)});
  $('planTitle').textContent='Query plan - '+t.title;
  $('planBody').innerHTML=r.ok&&r.rows&&r.rows.length?planHtml(r.rows[0][0]):'<div class="unone">'+esc(r.error||'The server gave no plan for this statement.')+'</div>';
@@ -8545,6 +8547,7 @@ function renderResultSetTabs(id){
 }
 // runSql(): send the editor SQL to the server and show the rows (or the error).
 async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sql!==t.curRun){t.prevRun=t.curRun;t.curRun=sql;}const st=$('st_'+id);st.className='status';st.textContent='Running\u2026';
+ if(sessOf(t))await sessFree(t); // in a transaction its one connection is held by the cursor: the close is waited for
  closeCursorFor(t);
  addHistory(sql);
  const stmts=splitStmts(sql).filter(s=>!isCommentOnly(s));
@@ -8767,7 +8770,7 @@ function txToggle(id,manual){const t=T(id);if(!t)return;
 async function txEnd(id,action){const t=T(id);if(!t||!t.txOn)return;
  if(action==='commit'&&pendingCount(t)>0){if(!(await applyChanges(id)))return;}
  if(action==='rollback'&&pendingCount(t)>0)revertChanges(id);
- closeCursorFor(t);
+ await sessFree(t);closeCursorFor(t);
  const m=action==='commit'?'Committed.':'Rolled back.';
  if(t.txSession){const r=await api('/api/session-end',{session:t.txSession,action});
   if(!r.ok){toast(r.error||'That did not work.',true);if(r.lost){t.txDirty=false;txPaint(id);}return;}}
@@ -8783,6 +8786,13 @@ function txPaint(id){const t=T(id),cb=$('txac_'+id),bar=$('txbar_'+id),cm=$('txc
  const lg=$('txlog_'+id),nl=(t&&t.txLog)?t.txLog.length:0;if(lg){lg.textContent=String(nl);lg.disabled=!on||!nl;lg.title=nl?nl+' run'+(nl===1?'':'s')+' not committed yet - click to see them':'What this transaction has run so far';}
  if(cm){cm.classList.toggle('go',dirty);cm.title=!on?'Turn Auto-commit off to keep a transaction open in this tab':dirty?'There are changes not committed yet - make them permanent':'Make this tab\'s changes permanent, including grid edits not applied yet';}
  const tb=$('tabbtn_'+id);if(tb)tb.classList.toggle('txopen',!!(t&&t.txDirty));}
+// A tab's open transaction has one connection, and a result still being read holds it until its
+// cursor closes. A statement sent in the transaction meanwhile - Apply, Explain, reading every row for
+// an export - waited for it, and after 15 seconds failed as "still busy with the statement before".
+// So the cursor is closed first, and the close waited for: the rows already read stay, and what was
+// not read yet comes with the next run.
+async function sessFree(t){if(!t||!sessOf(t)||!t.cursorId)return;const c=t.cursorId;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;
+ try{await api('/api/close-cursor',{cursorId:c});}catch(e){}if(typeof updateStatusLine==='function')updateStatusLine(t.id);}
 function closeCursorFor(t){if(!t||!t.cursorId)return;const cid=t.cursorId;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;
  try{api('/api/close-cursor',{cursorId:cid});}catch(e){}}
 // fetchNextBatch(): pulls the next page of rows from the SAME still-open server-side cursor (not
@@ -10332,6 +10342,7 @@ async function applyChanges(id,preview){if(roBlock())return;const t=T(id);const 
  // Foreign keys are NOT disabled here: they were, which let an edit point a row at a
  // parent that does not exist and silently break referential integrity the schema was
  // written to guarantee.
+ await sessFree(t);
  const r=await api('/api/script',{sql:S.join('\n'),transaction:true,session:sessOf(t)});
  // true once saved, so Commit (txEnd) can tell whether to go on; it waits for the grid to show what
  // was saved, since until then the reload is still reading on the tab's connection.

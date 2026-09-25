@@ -27,7 +27,7 @@ edition on machines where you can't, or would rather not, install anything.
 | **Interface** | a Chrome or Edge app window, or your default browser |
 | **Local server** | 127.0.0.1 only; its API needs a token that is new for every start |
 | **Passwords** | encrypted with Windows DPAPI for your user account |
-| **Your data** | `%APPDATA%\NOBSSQL` (connections, settings, query library, client tools) |
+| **Your data** | `%APPDATA%\NOBSSQL` (connections, settings, query library); downloaded client tools in `%LOCALAPPDATA%\NOBSSQL` |
 | **Network** | Only your database servers, plus what is listed under [Network access](#network-access) |
 | **License** | GPL-2.0-or-later |
 
@@ -108,12 +108,18 @@ without opening a browser.
 - Charts: a result as bars or a line.
 - Read the same rows in another character set, to tell text stored wrong from text read wrong.
 
-**Schema**
-- Browse schemas, tables, views, procedures, functions, triggers and events, with quick filtering
-  and search across all schemas.
+**Databases**
+- Browse databases, tables, views, procedures, functions, triggers and events, with quick filtering
+  and search across all databases.
 - Table designer and DDL view and edit; routines and triggers edited and recreated in place.
-- ER diagrams, and table maintenance (check, analyze, optimize, repair).
-- Server overview (databases, sizes, row counts, character sets) and the process list, with kill.
+- Inspect a table: its details and sizes, its indexes with their columns in order, its foreign
+  keys, and the tables that point at it.
+- ER diagrams, and table maintenance (check, analyze, optimize; repair where the table's engine
+  supports it).
+- Server overview: the server's figures, with what is worth a look marked, and every database with
+  its size, row count and character set - yours first. The process list, with kill.
+- Right-click menus offer what fits: nothing is created in or dropped from the server's own
+  databases, and several picked cells or rows get the commands for all of them.
 
 **Compare DB**
 - Schema sync between two databases, on the same server or two different ones: columns with
@@ -124,15 +130,20 @@ without opening a browser.
 **Import and export**
 - Tables or query results to CSV, INSERT statements, Excel, JSON or Markdown.
 - Strict CSV import.
+- A file browser to pick files and folders: type or paste a path, sizes and dates, and each kind
+  of pick opens where the last one was made.
 - Database export and import through the MySQL/MariaDB command-line tools: structure and data,
   structure only or data only, as a file per table, per database or one file.
 
 **Users and privileges**
+- Each account at a glance: how it signs in, its privileges as a table of where they apply, and
+  its roles - each with its own Edit.
 - Privileges as a checklist per server, database or table, with the GRANT and REVOKE shown
   before they run.
-- Roles and default roles; clone an account; sign-in method, SSL, password expiry and limits.
-- Who has access to a database, and a transfer script that recreates accounts and roles on
-  another server.
+- Roles and default roles; create, rename, clone and lock accounts; sign-in method, SSL, password
+  expiry and limits.
+- Who has access to a database, account by account, and a transfer script that recreates
+  accounts and roles on another server.
 
 ## Keeping data exact
 
@@ -217,8 +228,10 @@ answers PAM either way it asks. PAM sign-in in this edition is not covered by th
 
 Export and Import use the official MySQL/MariaDB command-line tools, which are
 **not bundled**. On first use, point the app at an existing install in
-Settings, or let it download the official MariaDB client tools from
-mariadb.org. The archive is checked against the SHA-256 that MariaDB's own
+**Settings → Client tools** - Save checks that each path is the tool its box asks
+for and that it starts - or let it download the official MariaDB client tools from
+mariadb.org, into `%LOCALAPPDATA%\NOBSSQL\bin`. **Settings → Local data** shows
+where the settings and the tools are kept, and opens either folder. The archive is checked against the SHA-256 that MariaDB's own
 release API publishes for it before anything is unpacked, and a mismatch
 installs nothing - the checksum comes from the API, not from the mirror the
 bytes came from, so a redirected or altered download fails the check. If the
@@ -280,7 +293,7 @@ A few seconds after it starts, the app asks GitHub (`api.github.com`) for the la
 notice with a link appears in the bottom-left corner. Nothing is downloaded or installed.
 
 Hide the notice with its **×** and it stays hidden until the next version. Switch the check off,
-or run it by hand, under **Settings → Updates**.
+or run it by hand, under **Settings → General**.
 
 ## Network access
 

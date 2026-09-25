@@ -102,8 +102,17 @@ try {
         # MySQL 8's client asks for utf8mb4 with a collation 5.7 does not know, and 5.7 falls back to latin1.
         Check ($b1 -match '(?m)^loose-init-command=SET NAMES utf8mb4\s*$') 'MySQL''s tool says SET NAMES itself' $b1
         Check ($b2 -notmatch 'init-command') 'MariaDB''s asks in a way every server knows' $b2
-        # A PAM password goes as typed, so MySQL's client may send it only over TLS (ssl=required here).
-        Check ($b1 -match '(?m)^loose-enable-cleartext-plugin\s*$') 'MySQL''s tool may answer PAM on an encrypted connection' $b1
+        # A PAM password goes as typed, so MySQL's client may send it only over TLS that checks the
+        # server, or where the connection says so (ssl=required here, which checks nothing).
+        Check ($b1 -notmatch 'cleartext') 'MySQL''s tool does not answer PAM over TLS that checks nothing, unless asked' $b1
+        Check ($b1 -match '(?m)^loose-local-infile=0\s*$') 'and refuses LOAD DATA LOCAL' $b1
+        $f3 = New-Cnf (@{} + $conn + @{ clearPw = $true }) -Tool $theirs
+        $c4 = @{} + $conn; $c4.ssl = 'verify-ca'; $c4.sslCa = 'C:\ca.pem'
+        $f4 = New-Cnf $c4 -Tool $theirs
+        try {
+            Check ((Get-Content -Raw $f3) -match '(?m)^loose-enable-cleartext-plugin\s*$') 'with clearPw it may answer PAM on "required"'
+            Check ((Get-Content -Raw $f4) -match '(?m)^loose-enable-cleartext-plugin\s*$') 'and on a verify mode without asking'
+        } finally { Remove-Item $f3, $f4 -Force -ErrorAction SilentlyContinue }
     } finally { Remove-Item $f1, $f2 -Force -ErrorAction SilentlyContinue }
     # MariaDB's client on "required" went on in plaintext against a server without TLS; once the
     # server's flavor is known, its options file carries the statement that refuses that.

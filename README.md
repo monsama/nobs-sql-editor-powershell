@@ -220,9 +220,11 @@ echo | openssl s_client -starttls mysql -connect HOST:PORT -showcerts
 
 The CA is the last certificate printed (for MariaDB, the only one).
 
-**PAM and LDAP accounts** sign in through `mysql.exe` like everything else. MySQL's client sends
-such a password only on an encrypted connection (`required` or a verifying mode); MariaDB's
-answers PAM either way it asks. PAM sign-in in this edition is not covered by the automated tests.
+**PAM and LDAP accounts** sign in through `mysql.exe` like everything else. MySQL's client is allowed to
+send such a password only where the server has been verified (a verifying mode) or, on a network
+you trust, on `required` when the saved connection has **PAM / LDAP sign-in** ticked - `required`
+checks no certificate, so whoever sits in between could pose as the server and read it. MariaDB's
+client answers PAM whenever it is asked; it has no setting to refuse. PAM sign-in in this edition is not covered by the automated tests.
 
 ## Client tools (mysql / mysqldump)
 
@@ -238,8 +240,9 @@ bytes came from, so a redirected or altered download fails the check. If the
 API lists no checksum, nothing is installed at all.
 
 Auto-detection checks, in order: saved configuration, the system PATH, then
-common install folders (`Program Files\MariaDB*`, `Program Files\MySQL`,
-XAMPP).
+common install folders (`Program Files\MariaDB*`, `Program Files\MySQL`).
+WAMP and XAMPP are not searched: they live in folders under C:\ that any user
+of the computer can write to. Pick their tools in Settings instead.
 
 **MySQL servers get MySQL's own tools** when there are any: the two optional
 "MySQL servers" paths in Settings, or else the newest MySQL Server installation
@@ -308,6 +311,38 @@ token of the page it opened. Apart from your database servers and SSH hosts, the
 
 None of these requests carries anything beyond what any web request does: your IP address and a
 user agent. There is no telemetry.
+
+## Security notes
+
+What the app protects, and where its limits are.
+
+- **Read-only / safe mode** refuses every statement that writes, before it is sent - in the
+  backend, not only in the interface - and a connection saved as read-only stays read-only even
+  if the page asks otherwise (unless another saved connection to the same account is not
+  read-only). It judges statements, not what they call: a SELECT that calls a stored function
+  which writes, `GET_LOCK()`, `SLEEP()` or `SELECT ... FOR UPDATE` still has its effect. For
+  a guarantee, give the account only the SELECT privilege.
+- **Import is not a sandbox.** "Into database" is where the files go, but a statement in a file
+  that names another database or table, or grants rights, still does what it says, with your
+  rights. The client runs the files in binary mode, so client commands in them (`system`, `tee`,
+  `source`, `\!`) are refused. Import only files you trust.
+- **SSL `default`** encrypts when the server offers TLS and falls back to unencrypted when it does
+  not - so someone who can block the server's TLS offer gets an unencrypted connection. Use
+  `required` or a verifying mode where that matters. `required` checks no certificate.
+- **The MariaDB dump tool on `required`** is pinned to the certificate the server presented a
+  moment before - trusted on first sight, like `required` itself.
+- **SSH tunnels** accept a host's key the first time they see it (`StrictHostKeyChecking=accept-new`)
+  and refuse a changed one afterwards. The tunnel's local end listens on 127.0.0.1, where other
+  programs and users of the same computer can reach it too - they still need the database
+  password.
+- **Passwords** are kept encrypted with Windows DPAPI for your account; the temporary option
+  files the command-line tools read are private to you and removed after use (and at the next start, if the app was
+  killed). A password in SQL the app logs, shows in a message or keeps with your open tabs is
+  written as `'***'`.
+- **The local server** listens on 127.0.0.1 only and answers only requests that carry the token
+  it made at start. The token comes in the address the app window is opened with, after `#`,
+  never in the page itself; requests from another web page are refused, and the page may not be
+  shown inside another site.
 
 ## How it's tested
 

@@ -31,7 +31,7 @@ function extractFunction(src, name) {
 
 const src = readFileSync(process.argv[2], 'utf8');
 const NAMES = ['strLit', 'lit', 'newUser', 'dropUser', 'grantUser', 'revokeUser', 'lockUser',
-  'uRef', 'uName', 'uKey', 'authPlugins', 'identifiedBy', 'acctExpiry', 'acctSettingFields', 'acctSettingSql', 'logNoSecrets', 'srvSince', 'acctHasExpiry', 'acctHasLock'];
+  'uRef', 'uName', 'uKey', 'authPlugins', 'identifiedBy', 'acctExpiry', 'acctSettingFields', 'acctSettingSql', 'logNoSecrets', 'sqlNoSecrets', 'srvSince', 'acctHasExpiry', 'acctHasLock'];
 const bundle = NAMES.map(n => extractFunction(src, n)).join('\n');
 
 function harness({ dialog = {}, selected = null } = {}) {
@@ -238,7 +238,7 @@ eq(G({ cols:['id','note'], binCols:[false,false], pending:{ upd:{ '0:1': gHex + 
    '', 'a text column is not screened - 0x.. is not the display encoding there');
 
 // The logic above can be perfect and still never run, so pin the wiring too.
-const applyBody = extractFunction(src, 'applyChanges');
+const applyBody = extractFunction(src, 'applyChangesRun');
 eq(applyBody.indexOf('pastedHexColumns(') >= 0, true, 'applyChanges calls the screen');
 eq(applyBody.indexOf('pastedHexColumns(') < applyBody.indexOf('UPDATE '), true,
    'the screen runs before any SQL is built');
@@ -273,7 +273,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
 // editor hands over '' for it - while text in a binary column is still refused. The GUI pass found
 // the first one refused ("These are binary/BIT columns and only accept a 0x value: b = ''").
 {
-  const names = ['applyChanges', 'keyWhere', 'oneRowGuard', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];
+  const names = ['applyChanges', 'applyChangesRun', 'keyWhere', 'oneRowGuard', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];
   const body = names.map(n => extractFunction(src, n)).join('\n');
   const run = async (upd, ins) => {
     const sent = [], toasts = [];
@@ -281,7 +281,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
                 pending: { upd, del: new Set(), ins } };
     const env = {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
-      openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, tableColTypes: async () => ({}), gridBinCols: async () => [false, true, false],
+      openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, sessFree: async () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, true, false],
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
     };
@@ -369,7 +369,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
   CHECK(onlyVec && onlyVec.cols.join() === 'e', 'also in a table with no text columns', JSON.stringify(onlyVec));
 
   // Apply from a grid that was not read that way: saved only when the table holds no such value.
-  const applyNames = ['applyChanges', 'keyWhere', 'oneRowGuard', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];
+  const applyNames = ['applyChanges', 'applyChangesRun', 'keyWhere', 'oneRowGuard', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];
   const applyBody = applyNames.map(n => extractFunction(src, n)).join('\n');
   const run = async (exact, nulRows) => {
     const sent = [], toasts = [];
@@ -377,7 +377,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
                 pending: { upd: { '0:1': 'y' }, del: new Set(), ins: [] } };
     const env = {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
-      openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, tableColTypes: async () => ({}), gridBinCols: async () => [false, false],
+      openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, sessFree: async () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, false],
       tableNulTextCount: async () => nulRows, fmtCount: n => String(n),
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },

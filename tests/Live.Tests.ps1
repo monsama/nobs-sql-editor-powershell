@@ -58,11 +58,10 @@ try {
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline -and -not $token) {
         $said = try { Get-Content -Raw -LiteralPath $outFile -ErrorAction Stop } catch { '' }
-        if ($said -match 'Open:\s+(http://127\.0\.0\.1:\d+)/') {
-            try {
-                $html = Invoke-WebRequest -Uri "$($Matches[1])/" -TimeoutSec 2 -UseBasicParsing
-                if ($html.Content -match 'const TOKEN="([a-f0-9]+)"') { $base = ($said | Select-String 'Open:\s+(http://127\.0\.0\.1:\d+)/').Matches[0].Groups[1].Value; $token = $Matches[1] }
-            } catch { }
+        # The token is in the address the app prints (after #), not in the page.
+        if ($said -match 'Open:\s+(http://127\.0\.0\.1:\d+)/#t=([0-9a-f]+)') {
+            $b = $Matches[1]; $t = $Matches[2]
+            try { $null = Invoke-WebRequest -Uri "$b/" -TimeoutSec 2 -UseBasicParsing; $base = $b; $token = $t } catch { }
         }
         if ($proc.HasExited) { break }
         if (-not $token) { Start-Sleep -Milliseconds 500 }

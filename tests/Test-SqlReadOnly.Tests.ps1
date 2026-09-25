@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
-$ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($n.Name -eq 'Test-SqlReadOnly' -or $n.Name -eq 'Test-SqlReadOnlyAs' -or $n.Name -eq 'Remove-SqlComments' -or $n.Name -eq 'Test-HasClientCommand' -or $n.Name -eq 'Split-OffKeyword' -or $n.Name -eq 'Strip-Parens')},$true) |
+$ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($n.Name -eq 'Test-SqlReadOnly' -or $n.Name -eq 'Test-SqlReadOnlyAs' -or $n.Name -eq 'Remove-SqlComments' -or $n.Name -eq 'Test-HasClientCommand' -or $n.Name -eq 'Split-OffKeyword' -or $n.Name -eq 'Strip-Parens' -or $n.Name -eq 'Get-UnquotedWords')},$true) |
   ForEach-Object { Invoke-Expression $_.Extent.Text }
 $fail = 0
 function Check($sql, $expected, $label) {
@@ -117,4 +117,25 @@ Check 'SELECT 1 \. C:/x.sql' $false 'a client command after a SELECT runs a file
 Check "SELECT 1;`n\. C:/x.sql" $false 'a client command on a line of its own'
 Check "SELECT 'C:\temp' AS p" $true 'a backslash inside a string is not a command'
 Check 'SELECT `a\b` FROM t' $true 'nor inside a backticked name'
+# The gaps a security review found.
+Check 'SELECT /*+ \. C:/x.sql */ 1' $false 'a client command inside an optimizer hint (mysql.exe does not read it as a comment)'
+Check 'SELECT /* \. C:/x.sql */ 1' $true 'inside an ordinary comment it is nothing'
+Check 'SET @a = 1, GLOBAL max_connections = 1' $false 'GLOBAL in a later assignment'
+Check 'SET SESSION wait_timeout = 10, PERSIST max_connections = 1' $false 'PERSIST in a later assignment'
+Check 'SET @a = 1, PERSIST_ONLY max_connections = 1' $false 'PERSIST_ONLY in a later assignment'
+Check 'SET RESOURCE GROUP rg FOR 12' $false 'SET RESOURCE GROUP moves another thread'
+Check "SET @a = 'GLOBAL', @b = 2" $true 'GLOBAL inside a string is a value'
+Check 'EXPLAIN ANALYZE DELETE t1 FROM t1 JOIN t2 ON t1.id = t2.id' $false 'EXPLAIN ANALYZE runs a multi-table DELETE'
+Check 'EXPLAIN ANALYZE FORMAT=TREE UPDATE t1, t2 SET t1.a = 1' $false 'EXPLAIN ANALYZE FORMAT=TREE runs an UPDATE'
+Check 'DESCRIBE ANALYZE DELETE t1 FROM t1, t2' $false 'DESCRIBE ANALYZE as well'
+Check 'EXPLAIN ANALYZE' $false 'EXPLAIN ANALYZE of nothing'
+Check 'EXPLAIN ANALYZE SELECT * FROM t' $true 'EXPLAIN ANALYZE of a SELECT'
+Check 'EXPLAIN DELETE FROM t' $true 'EXPLAIN without ANALYZE runs nothing'
+Check "SELECT a INTO @x FROM t UNION SELECT b FROM t INTO OUTFILE '/tmp/x'" $false 'INTO OUTFILE after an INTO @var'
+Check "SELECT 'INTO OUTFILE' AS a" $true 'INTO OUTFILE inside a string'
+$r = Split-OffKeyword 'SET STATEMENT `a\`=1 FOR DELETE FROM t' 'FOR' $true
+if ($r -ne 'DELETE FROM t') { "  FAIL  a backslash does not escape inside backticks -> $r"; $fail++ } else { "  ok    a backslash does not escape inside backticks" }
+$r = Split-OffKeyword "SET STATEMENT x='\' FOR DELETE FROM t" 'FOR' $false
+if ($r -ne 'DELETE FROM t') { "  FAIL  nor in a string under NO_BACKSLASH_ESCAPES -> $r"; $fail++ } else { "  ok    nor in a string under NO_BACKSLASH_ESCAPES" }
+if ((Strip-Parens "WITH x AS (SELECT '\') DELETE FROM t" $false) -notmatch 'DELETE') { "  FAIL  Strip-Parens under NO_BACKSLASH_ESCAPES"; $fail++ } else { "  ok    Strip-Parens under NO_BACKSLASH_ESCAPES" }
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }

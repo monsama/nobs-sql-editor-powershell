@@ -35,6 +35,10 @@ jobs:
         shell: pwsh
         run: ./tests/Get-CnfSafe.Tests.ps1 ./NOBSSQL.ps1
 
+      - name: Run the local server's security checks
+        shell: pwsh
+        run: ./tests/Security.Tests.ps1 ./NOBSSQL.ps1
+
       # Several tests here run real code by lifting named functions out of the script. When one of
       # those grows a call to another, the test keeps passing and prints an error instead - so what
       # they lift is checked against what they call.

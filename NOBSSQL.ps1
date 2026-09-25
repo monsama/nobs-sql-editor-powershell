@@ -142,11 +142,12 @@ function Resolve-Tools {
     #    Tauri build's tool_search_dirs: under each base, any child named MariaDB*/MySQL*
     #    contributes its own bin and each of its children's bin. That covers both layouts these
     #    products use - "Program Files\MariaDB 11.4\bin" with the version in the folder name, and
-    #    "Program Files\MySQL\MySQL Server 8.0\bin" one level deeper - plus WAMP. XAMPP keeps
-    #    its bin directly at "xampp\mysql\bin", so it is listed as-is.
+    #    "Program Files\MySQL\MySQL Server 8.0\bin" one level deeper. Not C:\wamp64 or C:\xampp:
+    #    any user of the computer can create those, and a mysql.exe put there would be run as
+    #    whoever uses the app. Their tools are used when picked in Settings.
     if (-not $script:MysqlPath -or -not $script:MysqldumpPath) {
         $dirs = New-Object System.Collections.Generic.List[string]
-        foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, 'C:\wamp64\bin')) {
+        foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
             if (-not $base) { continue }
             foreach ($kid in (Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
                 if ($kid.Name -notmatch '^(?i)(mariadb|mysql)') { continue }
@@ -156,7 +157,6 @@ function Resolve-Tools {
                 }
             }
         }
-        $dirs.Add('C:\xampp\mysql\bin')
         foreach ($d in $dirs) {
             if ($script:MysqlPath -and $script:MysqldumpPath) { break }
             $m = Join-Path $d 'mysql.exe'; $dp = Join-Path $d 'mysqldump.exe'
@@ -384,12 +384,26 @@ function Open-TunnelOn { param([int]$local, [string]$SshHost, [string]$SshPort, 
     $psi.FileName = $exe; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
     $psi.RedirectStandardInput = $true; $psi.RedirectStandardError = $true; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
     $psi.Arguments = Format-Args $a
+    # The password is in a file of the user's own that lasts until the tunnel is up or has failed,
+    # not in ssh's environment, where it stayed readable for as long as the tunnel ran. The script
+    # that hands it over has a name of its own each time, so no other file can stand in for it.
+    $pwFiles = @()
     if ($Password) {
-        $ask = Join-Path $env:TEMP 'nobs-ssh-askpass.cmd'
-        $body = '@powershell.exe -NoProfile -NonInteractive -Command "[Console]::Out.Write($env:NOBS_SSH_PW)"' + [char]13 + [char]10
-        if (-not (Test-Path $ask) -or (Get-Content -Raw $ask) -ne $body) { [IO.File]::WriteAllText($ask, $body) }
-        $psi.EnvironmentVariables['SSH_ASKPASS'] = $ask; $psi.EnvironmentVariables['SSH_ASKPASS_REQUIRE'] = 'force'; $psi.EnvironmentVariables['NOBS_SSH_PW'] = $Password
+        $stem = Join-Path $env:TEMP ('nobs-ssh-' + [Guid]::NewGuid().ToString('N'))
+        $ask = "$stem.cmd"; $pwf = "$stem.pw"; $pwFiles = @($ask, $pwf)
+        foreach ($f in $pwFiles) {
+            [IO.File]::WriteAllText($f, '')
+            try {
+                $acl = Get-Acl $f; $acl.SetAccessRuleProtection($true, $false)
+                $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule([System.Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow')))
+                Set-Acl -Path $f -AclObject $acl
+            } catch { $pwFiles | ForEach-Object { Remove-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue }; throw "Could not make the SSH password file private to you: $($_.Exception.Message)" }
+        }
+        [IO.File]::WriteAllText($pwf, $Password, (New-Object System.Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($ask, '@powershell.exe -NoProfile -NonInteractive -Command "[Console]::Out.Write([IO.File]::ReadAllText($env:NOBS_SSH_PWFILE))"' + [char]13 + [char]10)
+        $psi.EnvironmentVariables['SSH_ASKPASS'] = $ask; $psi.EnvironmentVariables['SSH_ASKPASS_REQUIRE'] = 'force'; $psi.EnvironmentVariables['NOBS_SSH_PWFILE'] = $pwf
     }
+    try {
     $proc = New-Object System.Diagnostics.Process; $proc.StartInfo = $psi
     try { [void]$proc.Start() } catch { throw "Could not start ssh ($(Get-InnerMessage $_)). SSH tunnels use the OpenSSH client; on Windows it is the optional feature ""OpenSSH Client""." }
     # Read as it comes, so a chatty tunnel never fills the pipe and stalls.
@@ -421,6 +435,7 @@ function Open-TunnelOn { param([int]$local, [string]$SshHost, [string]$SshPort, 
         Start-Sleep -Milliseconds 100
     }
     @{ Tunnel = [pscustomobject]@{ Process = $proc; Port = $local; Said = $said } }
+    } finally { foreach ($f in $pwFiles) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } }
 }
 # MariaDB's client has no setting that insists on TLS without also checking the certificate. With
 # "ssl" and "skip-ssl-verify-server-cert" - which "required" needs, since the certificate a server
@@ -525,7 +540,12 @@ function New-Cnf {
     # A PAM or LDAP account wants its password as typed. MySQL's client sends it only when told to,
     # and it is told only on a connection that is encrypted. (MariaDB's sends it when asked, and
     # answers PAM's dialog plugin as well.)
-    if ($maria -eq $false -and $conn.ssl -in 'required', 'verify', 'verify-ca') { [void]$sb.AppendLine('loose-enable-cleartext-plugin') }
+    # Only where the server's certificate is checked, or where the connection says so (PAM / LDAP on
+    # "required"): over TLS that checks nothing, whoever sits in between could read the password.
+    if ($maria -eq $false -and ($conn.ssl -in 'verify', 'verify-ca' -or ($conn.ssl -eq 'required' -and [bool]$conn.clearPw))) { [void]$sb.AppendLine('loose-enable-cleartext-plugin') }
+    # LOAD DATA LOCAL INFILE lets the SERVER ask the client for any file it names. The app never uses
+    # it, so the client tools are told to refuse (loose-: mysqldump has no such option).
+    [void]$sb.AppendLine('loose-local-infile=0')
     # Only mysql.exe reads [mysql]; mysqldump shares this file and would reject the option. It
     # writes TIMESTAMP values in UTC on its own (--tz-utc). Set for Compare's connections.
     # A browsing connection is refused by the SERVER, not only by the gate in front of these
@@ -551,7 +571,11 @@ function New-Cnf {
         $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')
         $acl.AddAccessRule($rule)
         Set-Acl -Path $tmp -AclObject $acl
-    } catch { }
+    } catch {
+        # A file others may read gets no password: it is removed, and the connection fails.
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw "Could not make the temporary options file private to you: $($_.Exception.Message)"
+    }
     [IO.File]::WriteAllText($tmp, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
     return $tmp
 }
@@ -1134,7 +1158,12 @@ function Open-QueryCursor {
     # human-readable server messages, not row data.
     $psi.StandardOutputEncoding=$script:RawEnc; $psi.StandardErrorEncoding=[System.Text.Encoding]::UTF8
     $psi.Arguments=Format-Args $a
-    $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi; [void]$p.Start()
+    $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi
+    try { [void]$p.Start() } catch {
+        Remove-Item -LiteralPath $cnf -Force -ErrorAction SilentlyContinue
+        if ($sqlArg.file) { Remove-Item -LiteralPath $sqlArg.file -Force -ErrorAction SilentlyContinue }
+        return @{ ok=$false; err="Could not start mysql.exe: $(Get-InnerMessage $_)" }
+    }
     $entry=[pscustomobject]@{ Process=$p; Cancelled=$false; Sql=$sql; Conn=$conn }
     if ($RequestId) { $script:RunningQueries[$RequestId] = $entry }
     $cursor=[pscustomobject]@{
@@ -1393,7 +1422,7 @@ function Run-Exec { param($conn,$sql)
 # never gets mistaken for a real paren or a real keyword). Used by Test-SqlReadOnly to see past a
 # CTE's own body (or a subquery's) to the keyword actually driving the statement. Each removed
 # group leaves a single space behind so words on either side don't get glued together.
-function Strip-Parens { param([string]$s)
+function Strip-Parens { param([string]$s, [bool]$BackslashEscapes = $true)
     $out = New-Object System.Text.StringBuilder
     $depth = 0
     $quote = $null
@@ -1403,7 +1432,8 @@ function Strip-Parens { param([string]$s)
         $c = $chars[$i]
         if($quote){
             if($escaped){ $escaped = $false; continue }
-            if($c -eq '\'){ $escaped = $true; continue }
+            # A backslash escapes only in '...' and "...", and only without NO_BACKSLASH_ESCAPES.
+            if($c -eq '\' -and $BackslashEscapes -and $quote -ne '`'){ $escaped = $true; continue }
             if($c -eq $quote){
                 if(($i + 1) -lt $chars.Length -and $chars[$i + 1] -eq $quote){ $i++ }
                 else { $quote = $null }
@@ -1422,7 +1452,7 @@ function Strip-Parens { param([string]$s)
 # where the part after FOR is a whole statement that really executes. A FOR inside a string literal
 # - SET STATEMENT x='FOR' FOR SELECT 1 - is not the separator and must not be taken for one.
 function Split-OffKeyword {
-    param([string]$Sql, [string]$Keyword)
+    param([string]$Sql, [string]$Keyword, [bool]$BackslashEscapes = $true)
     if (-not $Sql) { return $null }
     $up = $Sql.ToUpper()
     $kw = $Keyword.ToUpper()
@@ -1433,7 +1463,7 @@ function Split-OffKeyword {
         $c = $Sql[$i]
         if ($null -ne $quote) {
             if ($escaped) { $escaped = $false }
-            elseif ($c -eq '\') { $escaped = $true }
+            elseif ($c -eq '\' -and $BackslashEscapes -and $quote -ne '`') { $escaped = $true }
             elseif ($c -eq $quote) { $quote = $null }
             $i++
             continue
@@ -1452,6 +1482,16 @@ function Split-OffKeyword {
     return $null
 }
 
+# The words of a statement outside its quoted strings and identifiers, upper-cased: letters, digits
+# and _ @ $ . - so @@GLOBAL.x is one word. The quotes follow the server's rules, as above.
+function Get-UnquotedWords { param([string]$Sql, [bool]$BackslashEscapes)
+    $sq = if ($BackslashEscapes) { '''(?:[^''\\]|\\[\s\S]|'''')*''?' } else { '''(?:[^'']|'''')*''?' }
+    $dq = if ($BackslashEscapes) { '"(?:[^"\\]|\\[\s\S]|"")*"?' } else { '"(?:[^"]|"")*"?' }
+    $words = New-Object System.Collections.Generic.List[string]
+    foreach ($m in [regex]::Matches($Sql, '(?<s>' + $sq + '|' + $dq + '|`(?:[^`]|``)*`?)|[\w@$.]+')) { if (-not $m.Groups['s'].Success) { $words.Add($m.Value.ToUpperInvariant()) } }
+    return ,$words.ToArray()
+}
+
 # The text with its comments taken out the way the server reads them, strings left as they are.
 # "--" is a comment only when a space or control character follows it - "SELECT 1--1" is one
 # minus minus one - and nothing inside quotes is a comment. Patterns that ignored both let
@@ -1461,11 +1501,15 @@ function Split-OffKeyword {
 # contents stay. One pattern reads the text from the left, so a quote met first starts a string
 # and a comment marker inside it is only text. Whether a backslash escapes a quote depends on the
 # server's sql_mode, which is why the caller asks both ways.
-function Remove-SqlComments { param([string]$sql, [bool]$BackslashEscapes)
+# -KeepHints keeps what a /*+ ... */ optimizer hint holds as well: mysql.exe does not read one as a
+# comment, and acts on a client command inside it - "SELECT /*+ \. x.sql */ 1" sourced x.sql,
+# measured with MariaDB's 12.2 and MySQL's 8.4 client.
+function Remove-SqlComments { param([string]$sql, [bool]$BackslashEscapes, [switch]$KeepHints)
     $sq = if ($BackslashEscapes) { '''(?:[^''\\]|\\[\s\S]|'''')*''?' } else { '''(?:[^'']|'''')*''?' }
     $dq = if ($BackslashEscapes) { '"(?:[^"\\]|\\[\s\S]|"")*"?' } else { '"(?:[^"]|"")*"?' }
     $bq = '`(?:[^`]|``)*`?'
-    $re = [regex]('(?<s>' + $sq + '|' + $dq + '|' + $bq + ')|/\*M?!\d*(?<v>[\s\S]*?)(?:\*/|$)|/\*[\s\S]*?(?:\*/|$)|#[^\n]*|--(?=[\s\x00-\x1f]|$)[^\n]*')
+    $keep = if ($KeepHints) { '/\*(?:M?!\d*|\+)' } else { '/\*M?!\d*' }
+    $re = [regex]('(?<s>' + $sq + '|' + $dq + '|' + $bq + ')|' + $keep + '(?<v>[\s\S]*?)(?:\*/|$)|/\*[\s\S]*?(?:\*/|$)|#[^\n]*|--(?=[\s\x00-\x1f]|$)[^\n]*')
     return $re.Replace($sql, [System.Text.RegularExpressions.MatchEvaluator]{ param($m)
         if ($m.Groups['s'].Success) { $m.Value } elseif ($m.Groups['v'].Success) { ' ' + $m.Groups['v'].Value + ' ' } else { ' ' } })
 }
@@ -1489,7 +1533,7 @@ function Test-SqlReadOnlyAs { param([string]$sql, [bool]$BackslashEscapes)
     # This edition hands the text to mysql.exe, which acts on its own backslash commands wherever
     # they stand outside a string - "SELECT 1 \. C:/x.sql" ran that file, measured on both clients,
     # and the file could hold anything while the text read as one SELECT. None is read-only here.
-    if (Test-HasClientCommand $s $BackslashEscapes) { return $false }
+    if (Test-HasClientCommand (Remove-SqlComments $sql $BackslashEscapes -KeepHints) $BackslashEscapes) { return $false }
     $allow = 'SELECT','SHOW','DESCRIBE','DESC','EXPLAIN','USE','WITH','SET','HELP','VALUES','TABLE','ANALYZE','CHECK','CHECKSUM'
     foreach($stmt in ($s -split ';')){
         $t = $stmt.Trim()
@@ -1504,11 +1548,10 @@ function Test-SqlReadOnlyAs { param([string]$sql, [bool]$BackslashEscapes)
         # on disk. Only the OUTFILE/DUMPFILE forms are refused; SELECT ... INTO @var is an ordinary
         # variable assignment, and an INTO inside a string literal is not a clause at all - which
         # is why this looks for the keyword outside quotes.
-        $afterInto = Split-OffKeyword $t 'INTO'
-        if ($null -ne $afterInto) {
-            $head = (($afterInto -split '\s+')[0]).ToUpper()
-            if ($head -eq 'OUTFILE' -or $head -eq 'DUMPFILE') { return $false }
-        }
+        # Every INTO, not only the first: "SELECT a INTO @x FROM t UNION SELECT b INTO OUTFILE ..."
+        # has its file behind the second.
+        $words = Get-UnquotedWords $t $BackslashEscapes
+        for ($k = 0; $k -lt $words.Length - 1; $k++) { if ($words[$k] -eq 'INTO' -and ($words[$k+1] -eq 'OUTFILE' -or $words[$k+1] -eq 'DUMPFILE')) { return $false } }
         # SET is allowed because a session variable is harmless, but SET GLOBAL / SET PERSIST -
         # and their @@GLOBAL. / @@PERSIST. spellings - reconfigure the server for every
         # connection, which a read-only connection should not be able to do.
@@ -1516,6 +1559,10 @@ function Test-SqlReadOnlyAs { param([string]$sql, [bool]$BackslashEscapes)
             $up = $t.ToUpper()
             $second = ($up -split '\s+')[1]
             if($second -match '^(GLOBAL|PERSIST)' -or $up -match '@@(GLOBAL|PERSIST)'){ return $false }
+            # In any of the assignments, not only the first: "SET @a = 1, GLOBAL x = 1" is two.
+            foreach($wd in $words){ if($wd -eq 'GLOBAL' -or $wd -eq 'PERSIST' -or $wd -eq 'PERSIST_ONLY'){ return $false } }
+            # SET RESOURCE GROUP g FOR <thread> moves another connection's thread (MySQL).
+            if($second -eq 'RESOURCE'){ return $false }
             # SET is allow-listed for session variables, but several SET forms are not variable
             # assignments at all. These three write, and were reaching the server on a connection
             # the user had marked read-only:
@@ -1529,7 +1576,7 @@ function Test-SqlReadOnlyAs { param([string]$sql, [bool]$BackslashEscapes)
             if($second -eq 'PASSWORD'){ return $false }
             if($second -eq 'DEFAULT' -and ($up -split '\s+')[2] -eq 'ROLE'){ return $false }
             if($second -eq 'STATEMENT'){
-                $inner = Split-OffKeyword $t 'FOR'
+                $inner = Split-OffKeyword $t 'FOR' $BackslashEscapes
                 # No FOR at all is not a form we recognise; refuse rather than guess.
                 if($null -eq $inner){ return $false }
                 if(-not (Test-SqlReadOnly $inner)){ return $false }
@@ -1543,7 +1590,7 @@ function Test-SqlReadOnlyAs { param([string]$sql, [bool]$BackslashEscapes)
         if($w -eq 'WITH'){
             $verbs = 'SELECT','INSERT','UPDATE','DELETE','REPLACE','TABLE','VALUES'
             $verb = $null
-            foreach($tok in ((Strip-Parens $t) -split '\s+')){
+            foreach($tok in ((Strip-Parens $t $BackslashEscapes) -split '\s+')){
                 $tu = $tok.ToUpper()
                 if($verbs -contains $tu){ $verb = $tu; break }
             }
@@ -1553,6 +1600,16 @@ function Test-SqlReadOnlyAs { param([string]$sql, [bool]$BackslashEscapes)
         # EXECUTES the wrapped statement while profiling it - bare "ANALYZE" was allow-listed for
         # the genuinely read-only ANALYZE TABLE form, which would otherwise let "ANALYZE DELETE
         # FROM t" straight through untouched.
+        # EXPLAIN ANALYZE (MySQL 8.0.18+, and DESCRIBE/DESC ANALYZE with it) runs the statement it
+        # profiles, and from 8.0.19 that can be a multi-table UPDATE or DELETE - which then changes
+        # the data. What follows ANALYZE (and a FORMAT=) is judged as a statement of its own, and
+        # has to be a query. EXPLAIN without ANALYZE runs nothing.
+        if(($w -eq 'EXPLAIN' -or $w -eq 'DESCRIBE' -or $w -eq 'DESC') -and $words.Length -gt 1 -and $words[1] -eq 'ANALYZE'){
+            $inner = [regex]::Replace([string](($t -split '\s+', 3)[2]),'(?i)^FORMAT\s*=\s*\w+\s+', '')
+            $innerW = (($inner.Trim() -split '\s+')[0]).ToUpper()
+            if(@('SELECT','WITH','TABLE','VALUES') -notcontains $innerW -and -not $inner.Trim().StartsWith('(')){ return $false }
+            if(-not (Test-SqlReadOnlyAs $inner $BackslashEscapes)){ return $false }
+        }
         if($w -eq 'ANALYZE'){
             $parts = $t -split '\s+', 2
             $rest = if($parts.Length -gt 1){ $parts[1].TrimStart() } else { '' }
@@ -2210,6 +2267,7 @@ function Api-Export { param($conn,$data)
     $job=[pscustomobject]@{ Cancelled=$false; CurrentProcess=$null }
     if($jobId){ $script:RunningJobs[$jobId]=$job }
     $folder=[string]$data.folder
+    if(Test-DataPathBad $folder){ return '{"ok":false,"error":"Not a folder that can be exported to."}' }
     if(-not (Test-Path $folder)){ try { New-Item -ItemType Directory -Path $folder -Force|Out-Null } catch { return '{"ok":false,"error":'+(J-Str ("Cannot create folder: "+$_.Exception.Message))+'}' } }
     $o=$data.options; $cnf=New-Cnf $conn -Tool $dump; $log=New-Object System.Collections.ArrayList
     # mariadb-dump has no init-command, so the TLS guard (Get-TlsGuardSql) cannot run in its session.
@@ -2264,7 +2322,8 @@ function Api-Export { param($conn,$data)
             if($o.adddropdb){$a+='--add-drop-database'}; if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
             if(-not $o.createdb){$a+='--no-create-db'}
             foreach($k in $excl.Keys){ $a+=("--ignore-table="+$k) }
-            $a+=$dbs; $a+="--result-file=$file"
+            # The names after "--", so one that starts with "-" is a name and not another option.
+            $a+="--result-file=$file"; $a+='--'; $a+=$dbs
             $r=Run-Proc $dump $a $null $jobId
             if($job.Cancelled){
                 if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
@@ -2288,7 +2347,7 @@ function Api-Export { param($conn,$data)
                 if($o.adddropdb){$a+='--add-drop-database'}; if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
                 if(-not $o.createdb){$a+='--no-create-db'}
                 foreach($k in $excl.Keys){ if($k -like ($d+'.*')){ $a+=("--ignore-table="+$k) } }
-                $a+=$d; $a+="--result-file=$file"
+                $a+="--result-file=$file"; $a+='--'; $a+=$d
                 $r=Run-Proc $dump $a $null $jobId
                 if($job.Cancelled){
                     if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
@@ -2321,8 +2380,8 @@ function Api-Export { param($conn,$data)
                     if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
                     # The excluded tables are left out; when they are most of the database, the
                     # wanted ones are named instead, which keeps the command line short.
-                    if($skipped.Count -gt $wanted.Count){ $a+=$d; $a+=$wanted } else { foreach($t in $skipped){ $a+=("--ignore-table=$d.$t") }; $a+=$d }
                     $a+="--result-file=$whole"
+                    if($skipped.Count -gt $wanted.Count){ $a+='--'; $a+=$d; $a+=$wanted } else { foreach($t in $skipped){ $a+=("--ignore-table=$d.$t") }; $a+='--'; $a+=$d }
                     $r=Run-Proc $dump $a $null $jobId
                     try {
                         if($job.Cancelled){ [void]$log.Add("CANCELLED $d"); break dbloop }
@@ -2349,7 +2408,7 @@ function Api-Export { param($conn,$data)
                     $file=Join-Path $folder "$dsafe.routines_events$stamp.sql"
                     $a=@()+$common+@('--no-create-info','--no-data','--no-create-db','--skip-triggers')
                     if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
-                    $a+=$d; $a+="--result-file=$file"
+                    $a+="--result-file=$file"; $a+='--'; $a+=$d
                     $r=Run-Proc $dump $a $null $jobId
                     # Cancelling kills mysqldump, which comes back as exit -1 with nothing on
                     # stderr. Without this check that fell through to the generic FAILED branch
@@ -2984,7 +3043,7 @@ public static class NobsDumpDb {
     // when it is mariadb-dump's "/*M!999999\- enable the sandbox mode */", which neither MySQL's
     // client nor an older MariaDB one (10.2) knows - a dump restored with it failed at line 1
     // ("Unknown command '\-'"). The line only asks the client to refuse shell commands, and the
-    // Windows client has none (\!), so it is left out for every client.
+    // import runs mysql.exe with --binary-mode, which refuses every client command already.
     public static void CopyForClient(string path, Stream dst, string from, string to, bool skipSandbox) {
         byte[] sandbox = Encoding.ASCII.GetBytes("/*M!999999\\- enable the sandbox mode */");
         using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16)) {
@@ -3167,6 +3226,7 @@ function Test-DumpFileIsView { param([string]$Path)
 }
 function Api-Import { param($conn,$data)
     $files=@($data.files); if($files.Count -eq 0){ return '{"ok":false,"error":"No files."}' }
+    foreach($f in $files){ if(Test-DataPathBad ([string]$f)){ return '{"ok":false,"error":'+(J-Str ("Not a file: "+$f))+'}' } }
     # A per-table export folder holds each view in a file of its own, and files went in by name:
     # "active_customers" ran before "customers" and failed with 1146, leaving the view out of the
     # restore. Views go after everything else; the order within each is kept.
@@ -3187,7 +3247,6 @@ function Api-Import { param($conn,$data)
         foreach($f in $files){
             if($job.Cancelled){ [void]$log.Add("CANCELLED (remaining files skipped)"); break }
             if(-not (Test-Path $f)){ [void]$log.Add("SKIP (missing): $f"); continue }
-            $binMode = [bool]$data.binaryMode
             # Export lets you raise mysqldump's --max-allowed-packet (needed for extended-insert
             # with large rows/BLOBs), but the mysql client re-importing that exact file has its
             # own, separate default (16M) - without a matching bump here, re-importing a dump
@@ -3196,7 +3255,12 @@ function Api-Import { param($conn,$data)
             # Replaces the options file's init-command, so it repeats its SET NAMES (see New-Cnf).
             $fkGuard = Get-TlsGuardFor $conn (Test-ClientIsMariaDB $mysql)
             $fkNames = $(if (Test-ClientIsMariaDB $mysql) { if ($fkGuard) { "$fkGuard; " } else { '' } } else { 'SET NAMES utf8mb4; ' }) + 'SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'
-            $a=@("--defaults-extra-file=$cnf","--show-warnings"); if($data.force){$a+='--force'}; if($binMode){$a+='--binary-mode'}; if($maxPacket){$a+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a+="--init-command=$fkNames"}; if($target){$a+=$target}
+            # --binary-mode, always: a dump file is data, and without it mysql.exe carries out the client
+            # commands in it - MySQL's runs "system <anything>" and "tee <file>" (measured with 8.0 and
+            # 8.4), which a file someone sends you can hold. In binary mode both clients refuse every
+            # client command but DELIMITER and \C in piped input; a raw NUL goes through as well. The
+            # database is named with --database=, so a name cannot be read as another option.
+            $a=@("--defaults-extra-file=$cnf","--binary-mode","--show-warnings"); if($data.force){$a+='--force'}; if($maxPacket){$a+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a+="--init-command=$fkNames"}; if($target){$a+="--database=$target"}
             $short = [IO.Path]::GetFileName($f)
             Initialize-DumpDb
             $plan = Get-DumpPlan ([NobsDumpDb]::Names($f)) $target
@@ -3206,13 +3270,6 @@ function Api-Import { param($conn,$data)
             $skipSb = $true
             $r=Run-Stdin $mysql $a $null $f $jobId -Rename $rename -Warnings -SkipSandbox:$skipSb
             if($job.Cancelled){ [void]$log.Add("CANCELLED"); break }
-            $autoRetried = $false
-            if ($r.exit -ne 0 -and -not $binMode -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
-                $a2=@("--defaults-extra-file=$cnf","--binary-mode","--show-warnings"); if($data.force){$a2+='--force'}; if($maxPacket){$a2+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a2+="--init-command=$fkNames"}; if($target){$a2+=$target}
-                $r=Run-Stdin $mysql $a2 $null $f $jobId -Rename $rename -Warnings -SkipSandbox:$skipSb
-                $autoRetried = $true
-            }
-            $retryNote = $(if($autoRetried){" (auto-retried with --binary-mode)"}else{""})
             if($r.exit -eq 0){
                 # "Continue on error" passes --force, and mysql then exits 0 even when every statement
                 # failed, reporting what went wrong on stderr instead. Taking the exit code at face value
@@ -3221,18 +3278,17 @@ function Api-Import { param($conn,$data)
                 $skipped = @(($r.err -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "ERROR" })
                 $warns = @(Get-ImportWarnings $r.out)
                 if($skipped.Count -eq 0 -and $warns.Count -eq 0){
-                    [void]$log.Add("OK  $short$retryNote")
+                    [void]$log.Add("OK  $short")
                 } elseif($skipped.Count -eq 0){
                     $more = $(if($warns.Count -gt 1){" (+"+($warns.Count-1)+" more)"}else{""})
-                    [void]$log.Add("OK with $($warns.Count) warning(s)  $short : "+$warns[0]+$more+$retryNote)
+                    [void]$log.Add("OK with $($warns.Count) warning(s)  $short : "+$warns[0]+$more)
                 } else {
                     $errorsSkipped += $skipped.Count
                     $more = $(if($skipped.Count -gt 1){" (+"+($skipped.Count-1)+" more)"}else{""})
-                    [void]$log.Add("OK with $($skipped.Count) error(s) SKIPPED  $short : "+$skipped[0]+$more+$retryNote)
+                    [void]$log.Add("OK with $($skipped.Count) error(s) SKIPPED  $short : "+$skipped[0]+$more)
                 }
             } else {
-                $failNote = $(if($autoRetried){" (retried with --binary-mode, still failed)"}else{""})
-                [void]$log.Add("FAILED ($($r.exit)) $short : "+(Friendly-DumpErr (FirstErr $r.err))+$failNote)
+                [void]$log.Add("FAILED ($($r.exit)) $short : "+(Friendly-DumpErr (FirstErr $r.err)))
             }
         }
         if($job.Cancelled){ '{"ok":true,"cancelled":true,"errorsSkipped":'+$errorsSkipped+',"log":'+(J-Arr $log)+'}' } else { '{"ok":true,"errorsSkipped":'+$errorsSkipped+',"log":'+(J-Arr $log)+'}' }
@@ -3260,15 +3316,30 @@ function Read-Request { param($client)
                 if($cl -gt 0){ $take=[Math]::Min($cl,$arr.Length-$bodyStart); $body=[Text.Encoding]::UTF8.GetString($arr,$bodyStart,$take) }
                 $first=($htext -split "`r`n")[0]; $parts=$first -split ' '
                 $hostHdr = if($htext -match '(?im)^Host:[ \t]*([^\r\n]*)'){ $Matches[1].Trim() } else { '' }
-                return @{ method=$parts[0]; path=$parts[1]; body=$body; host=$hostHdr }
+                $originHdr = if($htext -match '(?im)^Origin:[ \t]*([^\r\n]*)'){ $Matches[1].Trim() } else { $null }
+                $ctypeHdr = if($htext -match '(?im)^Content-Type:[ \t]*([^\r\n]*)'){ $Matches[1].Trim() } else { '' }
+                return @{ method=$parts[0]; path=$parts[1]; body=$body; host=$hostHdr; origin=$originHdr; ctype=$ctypeHdr }
             }
         }
     } catch { }
     return @{ method='GET'; path='/'; body='' }
 }
+# The token check for every /api/* route. The token has to be a string: -ne against an array filters
+# the array instead of comparing, and {"token":[]} used to pass. Compared in constant time.
+function Test-ApiToken { param($data)
+    if (-not $data) { return $false }
+    $t = $data.token
+    if ($t -isnot [string] -or $t.Length -ne $Token.Length) { return $false }
+    $d = 0; for ($i = 0; $i -lt $t.Length; $i++) { $d = $d -bor ([int][char]$t[$i] -bxor [int][char]$Token[$i]) }
+    return ($d -eq 0)
+}
 # Write a raw HTTP response back to the browser.
 function Send-Http { param($client,[string]$status,[string]$ctype,[byte[]]$body)
-    $head="HTTP/1.1 $status`r`nContent-Type: $ctype`r`nContent-Length: $($body.Length)`r`nCache-Control: no-store`r`nConnection: close`r`n`r`n"
+    # Every response: never shown inside another site's frame (a page could otherwise lay the app under
+    # its own buttons), never read as another type, and the page may load and send nothing anywhere
+    # but here. Inline script and style are the page's own.
+    $sec="X-Frame-Options: DENY`r`nX-Content-Type-Options: nosniff`r`nReferrer-Policy: no-referrer`r`nContent-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`r`n"
+    $head="HTTP/1.1 $status`r`nContent-Type: $ctype`r`nContent-Length: $($body.Length)`r`nCache-Control: no-store`r`n$sec" + "Connection: close`r`n`r`n"
     $hb=[Text.Encoding]::ASCII.GetBytes($head); $ns=$client.GetStream(); $ns.Write($hb,0,$hb.Length); if($body.Length){ $ns.Write($body,0,$body.Length) }; $ns.Flush()
 }
 # Shortcut: send a JSON response (200 OK).
@@ -3284,7 +3355,7 @@ function Api-ImportCsv { param($conn,$data)
     # already draws this distinction - its unwrap_or only applies when the field is missing.
     $nullMarker = if($null -ne $data.nullValue){[string]$data.nullValue}else{'\N'}
     $file=[string]$data.file
-    if(-not $file -or -not (Test-Path $file)){ return '{"ok":false,"error":"CSV file not found."}' }
+    if(-not $file -or (Test-DataPathBad $file) -or -not (Test-Path -LiteralPath $file -PathType Leaf)){ return '{"ok":false,"error":"CSV file not found."}' }
     $fsz = (Get-Item $file).Length
     if ($fsz -gt 200MB -and -not [bool]$data.forceLarge) {
         return '{"ok":false,"error":"This CSV is '+([math]::Round($fsz/1MB,0))+' MB. The built-in CSV import loads the whole file into memory and is not recommended above ~200 MB - use mysqlimport or LOAD DATA INFILE for very large files instead. Pass forceLarge to proceed anyway."}'
@@ -3427,7 +3498,7 @@ function Api-Browse { param($data)
             $dj=($roots | ForEach-Object { '{"name":'+(J-Str $_.name)+',"path":'+(J-Str $_.path)+'}' }) -join ','
             return '{"ok":true,"path":"","parent":"ROOT","dirs":['+$dj+'],"files":[]}'
         }
-        if(-not (Test-Path $path)){ return '{"ok":false,"error":"path not found"}' }
+        if((Test-DataPathBad $path) -or -not (Test-Path $path)){ return '{"ok":false,"error":"path not found"}' }
         $item=$null
         try { $item=Get-Item -LiteralPath $path -Force -ErrorAction Stop } catch { return '{"ok":false,"error":'+(J-Str ("Could not access this path: "+$_.Exception.Message))+'}' }
         if(-not $item){ return '{"ok":false,"error":"Could not access this path (unknown reason)."}' }
@@ -3505,7 +3576,7 @@ function Api-ConnSetPrimary { param($data)
     $name=[string]$data.name
     $list = Load-Conns | ForEach-Object {
         $pass = if($_.pass){ [string]$_.pass } else { '' }
-        [pscustomobject]@{name=$_.name;host=$_.host;port=$_.port;user=$_.user;ssl=$_.ssl;sslCa=[string]$_.sslCa;sshHost=[string]$_.sshHost;sshPort=[string]$_.sshPort;sshUser=[string]$_.sshUser;sshKey=[string]$_.sshKey;sshPass=[string]$_.sshPass;pass=$pass;primary=($name -ne '' -and $_.name -eq $name);accent=[string]$_.accent;env=[string]$_.env;readonly=[bool]$_.readonly}
+        [pscustomobject]@{name=$_.name;host=$_.host;port=$_.port;user=$_.user;ssl=$_.ssl;sslCa=[string]$_.sslCa;clearPw=[bool]$_.clearPw;sshHost=[string]$_.sshHost;sshPort=[string]$_.sshPort;sshUser=[string]$_.sshUser;sshKey=[string]$_.sshKey;sshPass=[string]$_.sshPass;pass=$pass;primary=($name -ne '' -and $_.name -eq $name);accent=[string]$_.accent;env=[string]$_.env;readonly=[bool]$_.readonly}
     }
     Save-Conns @($list); '{"ok":true}'
 }
@@ -3517,6 +3588,16 @@ function Add-ConnObjs { param($x,$acc)
     if($x.PSObject -and $x.PSObject.Properties['name']){ [void]$acc.Add($x) }
 }
 # Read saved connections (connections.json). Passwords are DPAPI-encrypted per Windows user.
+# Whether every saved connection to this account (host, port, user, SSH host) is marked read-only -
+# then a request for it is read-only whatever the page sent. A second saved connection to the same
+# account that is not read-only leaves it to the page.
+function Test-SavedReadOnly { param($conn)
+    if (-not $conn) { return $false }
+    $k = { param($c) ([string]$c.host).Trim().ToLower() + '|' + ([string]$c.port).Trim() + '|' + [string]$c.user + '|' + ([string]$c.sshHost).Trim().ToLower() }
+    $want = & $k $conn
+    $same = @(Load-Conns | Where-Object { (& $k $_) -eq $want })
+    return ($same.Count -gt 0 -and -not @($same | Where-Object { -not $_.readonly }).Count)
+}
 function Load-Conns {
     if(-not (Test-Path $script:ConnFile)){ return @() }
     try {
@@ -3566,21 +3647,34 @@ function Api-OpenFolder { param($data)
           Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $dir + '"') | Out-Null; return '{"ok":true}' }
     catch { return '{"ok":false,"error":'+(J-Str $_.Exception.Message)+'}' }
 }
+# Data files (export folder, dump and CSV files, the file browser) may be on a network share, but not
+# a device or a raw \\?\ path: \\.\PhysicalDrive0, \\.\pipe\..., CON and the like are not files.
+function Test-DataPathBad { param([string]$p)
+    if ($p -match '^[\\/]{2}[?.][\\/]') { return $true }
+    $leaf = [IO.Path]::GetFileNameWithoutExtension(($p -replace '[\\/]+$', ''))
+    return ($leaf -match '^(CON|PRN|AUX|NUL|COM\d|LPT\d)$')
+}
+# Whether a path may be run as a client tool: a local file (not \\server\share, not \\?\ or a
+# device), called mysql/mariadb or mysqldump/mariadb-dump as its box asks. $null when it may.
+function Test-ToolPathName { param([string]$p, [string]$kind)
+    if ($kind -ne 'mysql' -and $kind -ne 'mysqldump') { return 'unknown kind of tool' }
+    if ($p -match '^(\\\\|//)') { return 'a tool has to be on this computer, not on a network share' }
+    $stem = [IO.Path]::GetFileNameWithoutExtension($p).ToLowerInvariant(); $isDump = $stem -match 'dump'
+    if ($kind -eq 'mysqldump' -and -not $isDump) { return 'this is not mysqldump.exe or mariadb-dump.exe' }
+    if ($kind -eq 'mysql' -and ($isDump -or ($stem -ne 'mysql' -and $stem -ne 'mariadb'))) { return 'this is not mysql.exe or mariadb.exe' }
+    if (-not [IO.Path]::GetExtension($p).Equals('.exe', [StringComparison]::OrdinalIgnoreCase)) { return 'a tool is an .exe file' }
+    return $null
+}
 function Api-CheckTool { param($data)
     $p = ([string]$data.path).Trim(); $kind = [string]$data.kind
     if (-not $p) { return '{"ok":true}' }
-    $err = $null
-    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { $err = 'there is no file at this path' }
-    else {
-        $stem = [IO.Path]::GetFileNameWithoutExtension($p).ToLowerInvariant(); $isDump = $stem -match 'dump'
-        if ($kind -eq 'mysqldump' -and -not $isDump) { $err = 'this is not mysqldump.exe or mariadb-dump.exe' }
-        elseif ($kind -eq 'mysql' -and ($isDump -or ($stem -ne 'mysql' -and $stem -ne 'mariadb'))) { $err = 'this is not mysql.exe or mariadb.exe' }
-        else {
-            $v = Get-ToolVersion $p
-            if (-not $v) { $err = 'it does not answer as a MySQL or MariaDB client' }
-            elseif ($v -like 'cannot start*') { $err = $v }
-            else { return '{"ok":true,"version":'+(J-Str $v)+'}' }
-        }
+    $err = Test-ToolPathName $p $kind
+    if (-not $err -and -not (Test-Path -LiteralPath $p -PathType Leaf)) { $err = 'there is no file at this path' }
+    if (-not $err) {
+        $v = Get-ToolVersion $p
+        if (-not $v) { $err = 'it does not answer as a MySQL or MariaDB client' }
+        elseif ($v -like 'cannot start*') { $err = $v }
+        else { return '{"ok":true,"version":'+(J-Str $v)+'}' }
     }
     return '{"ok":true,"error":'+(J-Str $err)+'}'
 }
@@ -3661,9 +3755,16 @@ function Api-SaveConfig { param($data)
     # dialog saves all three together, but the Download button saves only the URL template, and
     # rebuilding from scratch would blank the tool paths it never sent.
     if($data.config){
+        # A tool path is checked as Settings' Save checks it, and the download address has to be
+        # https - neither can be set to something else by a request that skips the dialog.
+        $kinds = @{ mysql_bin='mysql'; mysqldump_bin='mysqldump'; mysql_bin_mysql='mysql'; mysqldump_bin_mysql='mysqldump' }
         foreach($k in @('mysql_bin','mysqldump_bin','mysql_bin_mysql','mysqldump_bin_mysql','mariadb_download_url_template')){
             $prop = $data.config.PSObject.Properties[$k]
-            if($prop){ $cfg | Add-Member -NotePropertyName $k -NotePropertyValue ([string]$prop.Value) -Force }
+            if(-not $prop){ continue }
+            $v = ([string]$prop.Value).Trim()
+            if($v -and $kinds.ContainsKey($k)){ $e = Test-ToolPathName $v $kinds[$k]; if($e){ return '{"ok":false,"error":'+(J-Str "$k : $e")+'}' } }
+            if($v -and $k -eq 'mariadb_download_url_template' -and $v -notmatch '^https://'){ return '{"ok":false,"error":"the download address has to start with https://"}' }
+            $cfg | Add-Member -NotePropertyName $k -NotePropertyValue $v -Force
         }
     }
     Save-Cfg $cfg
@@ -3685,6 +3786,11 @@ function Test-ReleaseIsNewer { param([string]$Latest, [string]$Current)
     $norm = { param($v) [version]::new($v.Major, $v.Minor, [Math]::Max($v.Build, 0), [Math]::Max($v.Revision, 0)) }
     return (& $norm $a) -gt (& $norm $b)
 }
+# The release page the update notice opens: this project's own release on GitHub and nothing else,
+# whatever the reply said - the same rule as the Tauri edition's release_page_ok.
+function Test-ReleasePageOk { param([string]$Url)
+    return $Url -match ('(?i)^https://github\.com/' + [regex]::Escape([string]$script:ReleasesRepo) + '/releases/tag/v\d+(\.\d+){1,3}$')
+}
 function Api-UpdateCheck {
     $current = [string]$script:AppVersion
     try {
@@ -3694,7 +3800,9 @@ function Api-UpdateCheck {
             -UserAgent 'NOBSSQL' -Headers @{ Accept = 'application/vnd.github+json' } -TimeoutSec 10 -ErrorAction Stop
         $tag = [string]$r.tag_name
         $newer = Test-ReleaseIsNewer $tag $current
-        '{"ok":true,"current":'+(J-Str $current)+',"latest":'+(J-Str $tag.TrimStart('v','V'))+',"url":'+(J-Str ([string]$r.html_url))+',"newer":'+$newer.ToString().ToLower()+'}'
+        $url = [string]$r.html_url
+        if (-not (Test-ReleasePageOk $url)) { $url = "https://github.com/$($script:ReleasesRepo)/releases" }
+        '{"ok":true,"current":'+(J-Str $current)+',"latest":'+(J-Str $tag.TrimStart('v','V'))+',"url":'+(J-Str $url)+',"newer":'+$newer.ToString().ToLower()+'}'
     } catch {
         '{"ok":false,"current":'+(J-Str $current)+',"error":'+(J-Str $_.Exception.Message)+'}'
     }
@@ -3746,8 +3854,9 @@ function Api-DownloadMysqlTools {
         $ua = 'curl/8.0 NOBSSQL'
         $def = Get-MysqlDownloadDefaults
         $cfg = Load-Cfg
-        $page = if ($cfg -and $cfg.mysql_download_page) { [string]$cfg.mysql_download_page } else { $def.Page }
-        $tpl = if ($cfg -and $cfg.mysql_download_url_template) { [string]$cfg.mysql_download_url_template } else { $def.Template }
+        # An override is taken only as https: the page is where the checksum comes from.
+        $page = if ($cfg -and ([string]$cfg.mysql_download_page) -like 'https://*') { [string]$cfg.mysql_download_page } else { $def.Page }
+        $tpl = if ($cfg -and ([string]$cfg.mysql_download_url_template) -like 'https://*') { [string]$cfg.mysql_download_url_template } else { $def.Template }
         try { $html = (Invoke-WebRequest -Uri $page -UseBasicParsing -UserAgent $ua -ErrorAction Stop).Content }
         catch { return '{"ok":false,"error":'+(J-Str "Could not read MySQL's download page $page : $($_.Exception.Message)")+'}' }
         $info = Get-MysqlDownloadInfo $html
@@ -3810,7 +3919,8 @@ function Api-DownloadTools {
         $zipEntry = $candidates | Where-Object { $_.cpu -match '64' } | Select-Object -First 1
         if(-not $zipEntry){ $zipEntry = $candidates | Select-Object -First 1 }
         if(-not $zipEntry){ return '{"ok":false,"error":"No Windows zip found for this release."}' }
-        $tmpZip = Join-Path $env:TEMP $zipEntry.file_name
+        # A name of our own: the one the release API gives could hold "..\" and point anywhere.
+        $tmpZip = Join-Path $env:TEMP ("nobs-mariadb-" + [Guid]::NewGuid().ToString('N') + ".zip")
         # The REST API's own file_download_url has been observed returning 403 regardless of http/https.
         # A direct mirror URL (same layout MariaDB Foundation publishes at mirror.mariadb.org) works reliably,
         # so try that first and only fall back to the API-provided URL if the mirror layout ever changes.
@@ -3929,7 +4039,7 @@ function Resolve-SavedConn { param($name)
     # so between servers in different zones every copied TIMESTAMP moved by the difference (Zurich
     # to UTC: 12:00 UTC arrived as 14:00 UTC), and equal values showed as different. utc runs
     # both sessions in UTC (see New-Cnf), so the text means the same instant everywhere.
-    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; sslCa=[string]$c.sslCa; password=$pass; readonly=[bool]$c.readonly; utc=$true; sshHost=[string]$c.sshHost; sshPort=[string]$c.sshPort; sshUser=[string]$c.sshUser; sshKey=[string]$c.sshKey; sshPassword=(Unprotect-SshPw ([string]$c.sshPass)) }
+    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; sslCa=[string]$c.sslCa; clearPw=[bool]$c.clearPw; password=$pass; readonly=[bool]$c.readonly; utc=$true; sshHost=[string]$c.sshHost; sshPort=[string]$c.sshPort; sshUser=[string]$c.sshUser; sshKey=[string]$c.sshKey; sshPassword=(Unprotect-SshPw ([string]$c.sshPass)) }
 }
 # Returns an ordered map of table -> ordered list of columns {name,type,null,default,extra} for
 # every table in the given schema, via one information_schema query (cheap, single round trip).
@@ -3965,7 +4075,7 @@ function Get-CreateTableSqlBatch { param($conn,$db,$tables,$RequestId)
             if($RequestId -and $script:CancelledCompares.ContainsKey($RequestId)){ break }
             $endIdx = [Math]::Min($i+$chunkSize,$tables.Count) - 1
             $chunk = $tables[$i..$endIdx]
-            $a = @("--defaults-extra-file=$cnf","--no-data","--compact","--skip-comments",$db) + $chunk
+            $a = @("--defaults-extra-file=$cnf","--no-data","--compact","--skip-comments","--",$db) + $chunk
             $r = Run-Proc $dump $a $RequestId
             if($r.exit -ne 0 -or -not $r.out){ continue }
             $parts = $r.out -split '(?=CREATE TABLE `)'
@@ -4772,7 +4882,7 @@ function Api-ConnGet { param($data)
     if(-not $c){ return '{"ok":false}' }
     $pass=''
     if($c.pass){ try { $sec=ConvertTo-SecureString $c.pass; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec); $pass=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($b); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } catch {} }
-    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"sslCa":'+(J-Str ([string]$c.sslCa))+',"sshHost":'+(J-Str ([string]$c.sshHost))+',"sshPort":'+(J-Str ([string]$c.sshPort))+',"sshUser":'+(J-Str ([string]$c.sshUser))+',"sshKey":'+(J-Str ([string]$c.sshKey))+',"sshPassword":'+(J-Str (Unprotect-SshPw ([string]$c.sshPass)))+',"password":'+(J-Str $pass)+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
+    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"sslCa":'+(J-Str ([string]$c.sslCa))+',"clearPw":'+$(if($c.clearPw){'true'}else{'false'})+',"sshHost":'+(J-Str ([string]$c.sshHost))+',"sshPort":'+(J-Str ([string]$c.sshPort))+',"sshUser":'+(J-Str ([string]$c.sshUser))+',"sshKey":'+(J-Str ([string]$c.sshKey))+',"sshPassword":'+(J-Str (Unprotect-SshPw ([string]$c.sshPass)))+',"password":'+(J-Str $pass)+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
 }
 # A saved connection's SSH password, encrypted for this Windows user the way its database password is.
 function Protect-SshPw { param([string]$Pw) if (-not $Pw) { return '' }; ConvertFrom-SecureString (ConvertTo-SecureString $Pw -AsPlainText -Force) }
@@ -4803,7 +4913,7 @@ function Api-ConnSave { param($data)
     # Saved with the database password, and only when that is: "type it each time" covers both.
     $sshEnc = if ($savePw) { Protect-SshPw ([string]$c.sshPassword) } else { '' }
     $list=@($before | Where-Object { $_.name -ne $name })
-    $list+=[pscustomobject]@{name=$name;host=$c.host;port=$c.port;user=$c.user;ssl=$c.ssl;sslCa=[string]$c.sslCa;sshHost=[string]$c.sshHost;sshPort=[string]$c.sshPort;sshUser=[string]$c.sshUser;sshKey=[string]$c.sshKey;sshPass=$sshEnc;pass=$enc;primary=$prevPrimary;accent=$accent;env=$env;readonly=$ro}
+    $list+=[pscustomobject]@{name=$name;host=$c.host;port=$c.port;user=$c.user;ssl=$c.ssl;sslCa=[string]$c.sslCa;clearPw=[bool]$c.clearPw;sshHost=[string]$c.sshHost;sshPort=[string]$c.sshPort;sshUser=[string]$c.sshUser;sshKey=[string]$c.sshKey;sshPass=$sshEnc;pass=$enc;primary=$prevPrimary;accent=$accent;env=$env;readonly=$ro}
     Save-Conns $list
     '{"ok":true}'
 }
@@ -4812,6 +4922,9 @@ function Api-ConnDelete { param($data)
 }
 
 $Token = [Guid]::NewGuid().ToString('N')
+# Password files (options files, the SSH password) a crash or a kill left in %TEMP%: older than a
+# day, so nothing another running copy of the app still uses.
+try { Get-ChildItem -LiteralPath $env:TEMP -File -ErrorAction Stop | Where-Object { ($_.Name -like 'mysqlcnf_*.cnf' -or $_.Name -like 'nobs-ssh-*') -and $_.LastWriteTime -lt (Get-Date).AddDays(-1) } | Remove-Item -Force -ErrorAction SilentlyContinue } catch { }
 $Html = @'
 <!doctype html><html><head><meta charset="utf-8"><title>NOBS SQL Editor</title><link rel="icon" type="image/png" sizes="32x32" href="data:image/png;base64,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"><link rel="icon" type="image/png" sizes="128x128" href="data:image/png;base64,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">
 <style>
@@ -5386,7 +5499,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="barrow" id="connFormRow">
   <span class="fld">Host <input id="host" class="h" value="127.0.0.1" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">Port <input id="port" class="s" value="3306" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">User <input id="user" class="s" style="width:80px" value="root" autocomplete="off" name="mwt_user" data-lpignore="true" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">Pass <input id="pass" class="p" type="password" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" name="mwt_secret" data-lpignore="true" data-form-type="other" onkeydown="if(event.key==='Enter')connect()"></span>
   <select id="ssl" onchange="sslCaToggle()" title="SSL / TLS for this connection&#10;default - Encrypted when the server offers TLS, unencrypted when it does not. The certificate is not checked.&#10;disabled - Never encrypted.&#10;required - Always encrypted - a server without TLS is refused. The certificate is not checked, so it protects against eavesdropping but not against someone posing as the server.&#10;verify - Encrypted, and the certificate is checked against the CA and must name this host.&#10;verify-ca - Encrypted, and the certificate is checked against the CA but not the host name - for the certificate MariaDB or MySQL generated for itself."><option value="default" title="Encrypted when the server offers TLS, unencrypted when it does not. The certificate is not checked.">default</option><option value="disabled" title="Never encrypted.">disabled</option><option value="required" title="Always encrypted - a server without TLS is refused. The certificate is not checked, so it protects against eavesdropping but not against someone posing as the server.">required</option><option value="verify" title="Encrypted, and the certificate is checked against the CA and must name this host.">verify</option><option value="verify-ca" title="Encrypted, and the certificate is checked against the CA but not the host name - for the certificate MariaDB or MySQL generated for itself.">verify-ca</option></select>
-  <span class="fld" id="sslcaWrap" style="display:none">CA <input id="sslca" class="s" style="width:150px" placeholder="CA certificate (.pem)" title="The CA certificate that signed this server's certificate. Needed for &quot;verify&quot; against a server using a private or self-signed certificate - which is what MariaDB and MySQL generate by default, and which no system trust store accepts. Leave empty to verify against the system trust store instead." onkeydown="if(event.key==='Enter')connect()"><button class="sm" title="Browse for the CA certificate file" onclick="browse({title:'Select CA certificate',filter:'*.pem',mode:'file',onPick:pp=>$('sslca').value=pp})">...</button></span>
+  <span class="fld" id="sslcaWrap" style="display:none">CA <input type="checkbox" id="clearpw" hidden><input id="sslca" class="s" style="width:150px" placeholder="CA certificate (.pem)" title="The CA certificate that signed this server's certificate. Needed for &quot;verify&quot; against a server using a private or self-signed certificate - which is what MariaDB and MySQL generate by default, and which no system trust store accepts. Leave empty to verify against the system trust store instead." onkeydown="if(event.key==='Enter')connect()"><button class="sm" title="Browse for the CA certificate file" onclick="browse({title:'Select CA certificate',filter:'*.pem',mode:'file',onPick:pp=>$('sslca').value=pp})">...</button></span>
   <span class="fld"><button class="sm" id="sshBtn" onclick="editSsh()" title="Configure SSH tunnel">SSH</button><input type="hidden" id="sshhost"><input type="hidden" id="sshport"><input type="hidden" id="sshuser"><input type="hidden" id="sshkey"><input type="hidden" id="sshpass"></span>
   <button class="primary" title="Connect to the server with the details above" onclick="connect()">Connect</button><button class="sm" title="Disconnect and lock the UI" onclick="disconnectAsk()">Disconnect</button>
   <span style="flex:1"></span>
@@ -5489,8 +5602,8 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="row" style="flex:none"><span class="dsec">Files</span><span id="impCount" class="muted"></span><span style="flex:1"></span><button onclick="impAddFiles()">Add files...</button><button onclick="impAddFolder()" title="Every .sql file in a folder">Add folder...</button><button onclick="impClear()">Clear</button></div>
  <!-- flex:1, shared with impLog below, so a long list uses a taller or maximized window. -->
  <div id="impList" class="implist"></div>
- <div class="xrow"><span class="xlbl">Into database</span><input id="impDb" placeholder="the one each file names" style="width:300px" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" onfocus="openImpDbPicker()" oninput="renderImpDbPicker()" onblur="setTimeout(()=>{const p=$('impDbPicker');if(p)p.style.display='none';},150)"><label class="ck" title="Create the database first when it does not exist."><input type="checkbox" id="impCreate"> Create it if missing</label></div>
- <div class="xrow"><span class="xlbl">While loading</span><label class="ck" title="Turn foreign key and unique checks off during the import, for tables that come in out of order or refer to each other."><input type="checkbox" id="impFk" checked> Foreign key checks off</label><label class="ck" title="Keep going when a file or statement fails, rather than stopping (mysql --force)."><input type="checkbox" id="impForce"> Carry on after an error</label><label class="ck" title="Needed when the dump holds raw NUL bytes in binary or text columns (the error: ASCII '\0' appeared in the statement). Safe to leave on for any dump that might hold binary data (mysql --binary-mode)."><input type="checkbox" id="impBinary"> Binary mode</label><span class="optsep"></span><label title="mysql --max-allowed-packet. Match or exceed what the dump was exported with - a file made with a larger packet (large rows or BLOBs in extended INSERTs) can otherwise fail with &quot;MySQL server has gone away&quot; against the client's smaller default (16M).">Max packet <input id="impMaxPacket" value="1G" style="width:56px"></label></div>
+ <div class="xrow"><span class="xlbl" title="The database the files are loaded into. A dump made from another database is restored here instead. This is not a sandbox: a statement in the file that names another database or table (other_db.t, USE, GRANT, ...) still does what it says, with your rights. Import only files you trust.">Into database</span><input id="impDb" placeholder="the one each file names" style="width:300px" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" onfocus="openImpDbPicker()" oninput="renderImpDbPicker()" onblur="setTimeout(()=>{const p=$('impDbPicker');if(p)p.style.display='none';},150)"><label class="ck" title="Create the database first when it does not exist."><input type="checkbox" id="impCreate"> Create it if missing</label></div>
+ <div class="xrow"><span class="xlbl">While loading</span><label class="ck" title="Turn foreign key and unique checks off during the import, for tables that come in out of order or refer to each other."><input type="checkbox" id="impFk" checked> Foreign key checks off</label><label class="ck" title="Keep going when a file or statement fails, rather than stopping (mysql --force)."><input type="checkbox" id="impForce"> Carry on after an error</label><span class="optsep"></span><label title="mysql --max-allowed-packet. Match or exceed what the dump was exported with - a file made with a larger packet (large rows or BLOBs in extended INSERTs) can otherwise fail with &quot;MySQL server has gone away&quot; against the client's smaller default (16M).">Max packet <input id="impMaxPacket" value="1G" style="width:56px"></label></div>
  <div class="row" style="justify-content:flex-end;flex:none"><button class="go" id="impGoBtn" onclick="runImport()">Import</button><button class="warn" id="impCancelBtn" disabled onclick="cancelJob('imp')">Cancel</button><button onclick="hide('mImport')">Close</button></div>
  <div id="impProgress" style="display:none;margin-top:8px;flex:none">
    <div style="height:6px;border-radius:3px;background:var(--panel2);overflow:hidden"><div id="impBar" style="height:100%;width:40%;background:var(--accent);animation:expmove 1.1s ease-in-out infinite"></div></div>
@@ -5664,7 +5777,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
    <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDumpMy" style="flex:1" placeholder="MySQL's mysqldump.exe - empty: detect a MySQL Server installation"><span class="tchip" id="stc_cfgDumpMy"></span><button onclick="browse({title:'Select MySQL\'s mysqldump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDumpMy').value=pp})">Browse...</button></div>
   </div>
  </div>
- <details class="tooldet"><summary>How the tools are found</summary><div class="setnote">Downloaded tools do not update themselves; downloading again replaces them with the current release, whose version is shown in the card. Paths left empty are detected: saved configuration &rarr; MYSQL_BIN / MYSQLDUMP_BIN environment variables &rarr; common install folders (Program Files\MariaDB*, Program Files\MySQL*, WAMP, XAMPP) &rarr; system PATH.</div></details>
+ <details class="tooldet"><summary>How the tools are found</summary><div class="setnote">Downloaded tools do not update themselves; downloading again replaces them with the current release, whose version is shown in the card. Paths left empty are detected: saved configuration &rarr; MYSQL_BIN / MYSQLDUMP_BIN environment variables &rarr; common install folders (Program Files\MariaDB*, Program Files\MySQL*) &rarr; system PATH. WAMP and XAMPP live in folders under C:\ that any user of the computer can write to, so their tools are used only when picked here.</div></details>
  <div id="cfgLog" class="muted" style="white-space:pre-wrap;font-family:var(--mono);font-size:11px;max-height:120px;overflow:auto;margin-top:6px"></div>
  </section>
  <section class="setpage" data-p="general">
@@ -5750,7 +5863,10 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="dLog" class="muted" style="white-space:pre-wrap;font-family:var(--mono);font-size:11px;max-height:220px;overflow:auto;margin-top:6px;flex:none"></div></div></div>
 
 <script>
-const TOKEN="__TOKEN__";
+// PowerShell edition: the server's token comes after # in the address the app window is opened with
+// (the part of an address a browser never sends), is kept for this tab so a reload still has it, and
+// is taken out of the address bar. The page itself carries no secret for another program to fetch.
+const TOKEN=(()=>{let t='';try{const m=/[#&]t=([0-9a-f]{32})/.exec(location.hash||'');if(m){t=m[1];sessionStorage.setItem('nobsTok',t);history.replaceState(null,'',location.pathname+location.search);}else t=sessionStorage.getItem('nobsTok')||'';}catch(e){}return t;})();
 const PAGE_BATCH=1000;
 let curSchema=null, tabs=[], tabSeq=0, activeTab=null;
 /* ============================================================================
@@ -5771,7 +5887,7 @@ let curSchema=null, tabs=[], tabSeq=0, activeTab=null;
    NOTE: this text lives inside a PowerShell here-string, so keep it valid JS.
    ============================================================================ */
 const $=id=>document.getElementById(id);window.$=$;
-function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function connMeta(){return window._connMeta||{};}
 function connMetaSet(n,m){window._connMeta=window._connMeta||{};if(m){const cur=window._connMeta[n]||{};window._connMeta[n]={accent:cur.accent||'',env:m.env||'',readonly:!!m.readonly};}else{delete window._connMeta[n];}}
 window.readOnly=false;window.curEnv='';
@@ -5857,7 +5973,7 @@ function accSet(n,c){window._connMeta=window._connMeta||{};const cur=window._con
 function hexA(hex,a){hex=(hex||'').replace('#','');if(hex.length===3)hex=hex.split('').map(c=>c+c).join('');const v=parseInt(hex,16);if(isNaN(v)||hex.length!==6)return '';return 'rgba('+((v>>16)&255)+','+((v>>8)&255)+','+(v&255)+','+a+')';}
 function applyAccent(color){const bar=$('bar');if(!bar)return;if(!color){bar.style.borderTop='';bar.style.borderBottom='';bar.style.boxShadow='';return;}bar.style.borderTop='2px solid '+color;bar.style.borderBottom='';bar.style.boxShadow='';}
 window.curAccent='';
-function getConn(){return {host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value,sslCa:$('sslca').value,
+function getConn(){return {host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value,sslCa:$('sslca').value,clearPw:$('clearpw').checked,
  sshHost:$('sshhost').value,sshPort:$('sshport').value,sshUser:$('sshuser').value,sshKey:$('sshkey').value,sshPassword:$('sshpass').value};}
 // ---- SSH tunnel ----
 // The tunnel's settings ride with the connection form in hidden fields, so everything that reads
@@ -5891,7 +6007,12 @@ function logLineCls(l){
  return '';
 }
 function logLinesHtml(lines){return lines.map(l=>{const c=logLineCls(l);return '<div class="ln'+(c?' '+c:'')+'">'+esc(l)+'</div>';}).join('');}
-function log(s){const l=$('log');l.textContent+=s+"\n";l.scrollTop=l.scrollHeight;}
+// A password in SQL text shown or kept by the app - the log, a message, the tabs saved for next time -
+// is written as '***': IDENTIFIED BY / AS / USING, PASSWORD('...'), and any ..._PASSWORD = '...' or
+// SET PASSWORD ... = '...'. A quoted value ends at a quote that is not doubled, which is how the app
+// writes one under either sql_mode (strLit doubles quotes; only backslashes differ).
+function sqlNoSecrets(s){return String(s).replace(/(\bidentified\b(?:\s+(?:with|via)\s+[\w$]+)?\s+(?:by|as|using)\s+(?:password\s*)?\(?\s*|\b\w*password\s*(?:=\s*|\(\s*)?|\bset\s+password\b(?:\s+for\s+(?:'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|[^\s=@]+)(?:\s*@\s*(?:'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|[^\s=]+))?)?\s*=\s*(?:password\s*\(\s*)?)(['"])(?:\\[\s\S]|(?!\2)[\s\S]|\2\2)*\2/gi,"$1'***'");}
+function log(s){const l=$('log');l.textContent+=sqlNoSecrets(s)+"\n";l.scrollTop=l.scrollHeight;}
 // The output panel's 104px are worth having back when nothing has gone wrong - folded, its header
 // stays, so the log is one click away and new lines still collect behind it. Kept like the
 // sidebar's width, per browser.
@@ -5905,7 +6026,7 @@ try{if(localStorage.getItem('logFolded'))setLogFolded(true);}catch(e){}
 function toast(msg,kind){
   const cls=(kind===true||kind==='err')?'err':(kind==='ok'?'ok':'');
   let box=$('toasts');if(!box){box=document.createElement('div');box.id='toasts';document.body.appendChild(box);}
-  const t=document.createElement('div');t.className='toast'+(cls?' '+cls:'');t.textContent=msg;box.appendChild(t);
+  const t=document.createElement('div');t.className='toast'+(cls?' '+cls:'');t.textContent=sqlNoSecrets(msg);box.appendChild(t);
   // Long enough to read a server error twice over, and a plain message once without hurrying.
   // Hovering holds it: reading a message should not be a race against its own timer.
   const base=toastMs(),left=(cls==='err'?base*2:base);let timer=null;
@@ -6897,7 +7018,7 @@ function paintConnGo(){const go=$('connGo'),s=$('connlist');if(!go||!s)return;
  go.title=same?'Reconnect':'Connect to the connection picked in the list';go.setAttribute('aria-label',same?'Reconnect':'Connect');
  go.innerHTML='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">'+CONNGO_ICONS[k]+'</svg>';}
 function toggleConnForm(){document.body.classList.toggle('show-connform');}
-function newConn(){$('connlist').value='';$('host').value='127.0.0.1';$('port').value='3306';$('user').value='';$('pass').value='';$('ssl').value='default';$('sslca').value='';sslCaToggle();sshSet({});window.curAccent='';applyAccent('');window.readOnly=false;window.curEnv='';const ec=$('envChip');if(ec)ec.style.display='none';const pwc=$('pwChip');if(pwc)pwc.style.display='none';document.body.classList.add('show-connform');document.body.classList.remove('ro');connTitle();$('user').focus();log('New connection - enter details and Save.');}
+function newConn(){$('connlist').value='';$('host').value='127.0.0.1';$('port').value='3306';$('user').value='';$('pass').value='';$('ssl').value='default';$('sslca').value='';$('clearpw').checked=false;sslCaToggle();sshSet({});window.curAccent='';applyAccent('');window.readOnly=false;window.curEnv='';const ec=$('envChip');if(ec)ec.style.display='none';const pwc=$('pwChip');if(pwc)pwc.style.display='none';document.body.classList.add('show-connform');document.body.classList.remove('ro');connTitle();$('user').focus();log('New connection - enter details and Save.');}
 function setPass(pw){const el=$('pass');if(el)el.value=pw;}
 async function pickConnGuarded(){
   if (anyPending() && !(await ask('You have unsaved grid edits open. Switching connections will leave them orphaned. Switch anyway?'))) return;
@@ -6919,7 +7040,7 @@ async function pickConn() {
         $('port').value = r.conn.port;
         $('user').value = r.conn.user;
         $('ssl').value = r.conn.ssl;
-        $('sslca').value = r.conn.sslCa || '';
+        $('sslca').value = r.conn.sslCa || ''; $('clearpw').checked = !!r.conn.clearPw;
         sslCaToggle();
         sshSet(r.conn);
         const _pw = r.conn.password || '';
@@ -6974,6 +7095,7 @@ async function saveConn(){
   {key:'password',label:'Password',type:'password',value:$('pass').value},
   {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify (CA and host name)'},{value:'verify-ca',label:'verify-ca (CA only - for auto-generated server certificates)'}],value:$('ssl').value},
   {key:'sslCa',label:'CA certificate - only used by SSL "verify"; leave empty to use the system trust store',type:'file',filter:'*.pem',browseTitle:'Select CA certificate',placeholder:'e.g. C:\\certs\\server-ca.pem',value:$('sslca').value},
+  {key:'clearPw',label:'PAM / LDAP sign-in: send the password as typed. Always allowed with SSL "verify"; with "required" or "default" only when this box is ticked - the certificate of the server is not checked there, so anyone in between could read it',type:'checkbox',value:$('clearpw').checked},
   ...sshFields(getConn(),true),
   {key:'color',label:'Accent color (tell servers apart at a glance)',type:'color',value:n0?(accMap()[n0]||'#3b82f6'):'#3b82f6'},
   {key:'env',label:'Environment label (e.g. Production, Dev) - optional',value:m0.env||'',maxlength:40},
@@ -6981,10 +7103,10 @@ async function saveConn(){
   {key:'savepw',label:'Save password (unchecked = type it each time)',type:'checkbox',value:n0?!!$('pass').value:true}
  ]});
  if(!res||!res.name.trim())return;const n=res.name.trim();
- const r=await api('/api/conn-save',{name:n,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});
+ const r=await api('/api/conn-save',{name:n,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,clearPw:!!res.clearPw,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});
  if(!r.ok){toast(r.error,true);return;}
  window.curAccent=res.color;applyAccent(res.color);log('Saved connection: '+n);await refreshConns();$('connlist').value=n;applyEnv(n);
- $('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';sslCaToggle();sshSet(sshRes(res));setPass(res.password);
+ $('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';$('clearpw').checked=!!res.clearPw;sslCaToggle();sshSet(sshRes(res));setPass(res.password);
  const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';
 }
 // Edits a saved connection entirely within its own dialog - host/port/user/password/ssl are
@@ -7003,6 +7125,7 @@ async function editConn(){const n0=$('connlist').value;if(!n0){toast('Select a s
   {key:'password',label:'Password',type:'password',value:g.conn.password||''},
   {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify (CA and host name)'},{value:'verify-ca',label:'verify-ca (CA only - for auto-generated server certificates)'}],value:g.conn.ssl},
   {key:'sslCa',label:'CA certificate - only used by SSL "verify"; leave empty to use the system trust store',type:'file',filter:'*.pem',browseTitle:'Select CA certificate',placeholder:'e.g. C:\\certs\\server-ca.pem',value:g.conn.sslCa||''},
+  {key:'clearPw',label:'PAM / LDAP sign-in: send the password as typed. Always allowed with SSL "verify"; with "required" or "default" only when this box is ticked - the certificate of the server is not checked there, so anyone in between could read it',type:'checkbox',value:!!g.conn.clearPw},
   ...sshFields(g.conn,true),
   {key:'color',label:'Accent color',type:'color',value:accMap()[n0]||'#3b82f6'},
   {key:'env',label:'Environment label (optional)',value:m0.env||'',maxlength:40},
@@ -7010,16 +7133,16 @@ async function editConn(){const n0=$('connlist').value;if(!n0){toast('Select a s
   {key:'savepw',label:'Save password (uncheck to remove the saved password)',type:'checkbox',value:!!(g.ok&&g.conn.password)}
  ]});
  if(!res||!res.name.trim())return;const nn=res.name.trim();
- const r=await api('/api/conn-save',{name:nn,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});if(!r.ok){toast(r.error,true);return;}
+ const r=await api('/api/conn-save',{name:nn,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,clearPw:!!res.clearPw,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});if(!r.ok){toast(r.error,true);return;}
  if(nn!==n0){await api('/api/conn-delete',{name:n0});}
  window.curAccent=res.color;applyAccent(res.color);await refreshConns();$('connlist').value=nn;applyEnv(nn);
  // If this connection is the one currently loaded into the (largely internal, now rarely
  // shown) inline form, keep it in sync with what was just saved - otherwise a subsequent
  // Connect click would silently use stale values from before the edit.
- if($('connlist').value===nn){$('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';sslCaToggle();sshSet(sshRes(res));setPass(res.password);const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';}
+ if($('connlist').value===nn){$('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';$('clearpw').checked=!!res.clearPw;sslCaToggle();sshSet(sshRes(res));setPass(res.password);const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';}
  log('Updated connection: '+nn);}
 async function cloneConn(){const n0=$('connlist').value;
- if(n0){const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('sslca').value=g.conn.sslCa||'';sslCaToggle();sshSet(g.conn);$('pass').value=g.conn.password;}}
+ if(n0){const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('sslca').value=g.conn.sslCa||'';$('clearpw').checked=!!g.conn.clearPw;sslCaToggle();sshSet(g.conn);$('pass').value=g.conn.password;}}
  const base=n0||($('user').value+'@'+$('host').value);
  const res=await inputBox({title:'Clone connection',okText:'Clone',fields:[{key:'name',label:'New connection name',value:base+' (copy)',maxlength:60}]});
  if(!res||!res.name.trim())return;const nn=res.name.trim();
@@ -8165,7 +8288,7 @@ function sessionKeyFor(){const cn=$('connlist')?$('connlist').value:'';if(cn)ret
 // The open tabs are the only copy of what is typed in them. When the browser's storage is full the
 // save failed without a word, and after a restart the tabs came back as they were some time ago.
 // The query history - a few large scripts fill it - makes room first; failing that, it is said, once.
-function saveSession(key){let k,json;try{k=key||sessionKeyFor();json=JSON.stringify(tabs.map(t=>({title:t.title,sql:($('ed_'+t.id)?$('ed_'+t.id).value:''),db:t.db,table:t.table,
+function saveSession(key){let k,json;try{k=key||sessionKeyFor();json=JSON.stringify(tabs.map(t=>({title:t.title,sql:($('ed_'+t.id)?sqlNoSecrets($('ed_'+t.id).value):''),db:t.db,table:t.table,
   // A tab editing a routine, trigger or view stays one: restored as a plain query tab it lost its
   // Apply and the putting back of the old version when the new one fails, and running it on MySQL
   // dropped the routine with nothing to restore it from.
@@ -9318,7 +9441,7 @@ function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=
    h+='<td '+attr+' title="'+esc(clip(val,300))+'">'+cellHtml(val,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci])+'</td>';});h+='</tr>';});
  if(botH>0)h+='<tr class="vpad" style="height:'+botH+'px"><td colspan="'+nCols+'" style="padding:0;border:none"></td></tr>';
  if(ed)t.pending.ins.forEach((row,ii)=>{h+='<tr class="insrow"><td></td><td class="delcell" onclick="delIns(\''+id+'\','+ii+')">\u00D7</td>';
-   t.cols.forEach((c,ci)=>{const v=row[c];const cAttr=esc(c).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27');h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+cAttr+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+cAttr+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+cAttr+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci])+'</td>';});h+='</tr>';});
+   t.cols.forEach((c,ci)=>{const v=row[c];const cAttr=esc(c).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27').replace(/\n/g,'\\n').replace(/\r/g,'\\r');h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+cAttr+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+cAttr+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+cAttr+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci])+'</td>';});h+='</tr>';});
  $('tbody_'+id).innerHTML=h;
  if(wrap&&slice.length){const sampleTr=wrap.querySelector('tbody tr[data-r]');if(sampleTr){const mh=sampleTr.getBoundingClientRect().height;if(mh>4)t._rowH=mh;}}
  updateEditBar(id);}
@@ -10260,7 +10383,15 @@ function pasteRowIntoIns(id,ii){const t=T(id);const vals=singleRowClipboard();if
 function revertChanges(id){const t=T(id);t.pending={upd:{},del:new Set(),ins:[]};renderGrid(id);}
 // preview: build the statements exactly as Apply would, guards and all, and show them instead of
 // running them.
-async function applyChanges(id,preview){if(roBlock())return;const t=T(id);const S=[];const tbl=qid(t.db)+'.'+qid(t.table);
+// strLit writes a backslash one way or the other by the sql_mode seen when the app connected. In a
+// transaction the statements run in the tab's own session, where "SET sql_mode = ..." may have
+// changed it since - and a literal written for the wrong mode can end in the wrong place: under
+// backslash escapes, the value \ written as '\' swallows the quote and the SQL after it. So that
+// session is asked first, and the literals follow what it says.
+async function applyChanges(id,preview){if(roBlock())return;const t=T(id);const W=typeof window!=='undefined'?window:{};const nbe0=W.noBackslashEscapes;
+ if(t&&sessOf(t)){await sessFree(t);try{const m=await api('/api/query',{sql:'SELECT @@SESSION.sql_mode',session:sessOf(t)});if(m&&m.ok&&m.rows&&m.rows.length)W.noBackslashEscapes=/NO_BACKSLASH_ESCAPES/i.test(String(m.rows[0][0]||''));}catch(e){}}
+ try{return await applyChangesRun(id,preview);}finally{W.noBackslashEscapes=nbe0;}}
+async function applyChangesRun(id,preview){const t=T(id);const S=[];const tbl=qid(t.db)+'.'+qid(t.table);
  const bc=await gridBinCols(id);
  // Screened before any SQL is built, so a bad paste writes nothing at all rather than part of a
  // batch. Covers inline cell edits and new rows alike - the grid is the other way into a binary
@@ -10546,7 +10677,7 @@ async function insSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id)
 async function dl(text,name){
  const ext=(name.split('.').pop()||'').toLowerCase();const filters=ext?[{name:ext.toUpperCase()+' file',extensions:[ext]}]:undefined;
  // Tauri: native Save As + backend write
- try{if(window.__TAURI__&&window.__TAURI__.dialog&&window.__TAURI__.dialog.save){const p=await window.__TAURI__.dialog.save({defaultPath:name,filters});if(!p)return;const r=await window.__TAURI__.core.invoke('save_text',{req:{path:p,content:text}});if(r&&r.ok===false){toast('Save failed: '+r.error,true);}else{log('Saved: '+p);toast('Saved: '+p,'ok');}return;}}catch(e){toast('Save failed: '+e,true);return;}
+ try{if(window.__TAURI__&&window.__TAURI__.dialog&&window.__TAURI__.dialog.save){const p=await window.__TAURI__.core.invoke('pick_save_path',{req:{defaultPath:name,filters}});if(!p)return;const r=await window.__TAURI__.core.invoke('save_text',{req:{path:p,content:text}});if(r&&r.ok===false){toast('Save failed: '+r.error,true);}else{log('Saved: '+p);toast('Saved: '+p,'ok');}return;}}catch(e){toast('Save failed: '+e,true);return;}
  // Chromium browsers (Edge/Chrome): File System Access "Save As"
  try{if(window.showSaveFilePicker){const opts={suggestedName:name};if(ext)opts.types=[{description:ext.toUpperCase()+' file',accept:{'text/plain':['.'+ext]}}];const h=await window.showSaveFilePicker(opts);const w=await h.createWritable();await w.write(text);await w.close();log('Saved: '+name);return;}}catch(e){if(e&&e.name==='AbortError')return;}
  // Fallback: classic download to the default folder
@@ -10560,7 +10691,7 @@ async function dl(text,name){
 // two paths (File System Access, classic download) already accept a Blob natively as-is.
 async function dlBinary(blob,name){
  const ext=(name.split('.').pop()||'').toLowerCase();const filters=ext?[{name:ext.toUpperCase()+' file',extensions:[ext]}]:undefined;
- try{if(window.__TAURI__&&window.__TAURI__.dialog&&window.__TAURI__.dialog.save){const p=await window.__TAURI__.dialog.save({defaultPath:name,filters});if(!p)return;const buf=await blob.arrayBuffer();const bytes=Array.from(new Uint8Array(buf));const r=await window.__TAURI__.core.invoke('save_binary',{req:{path:p,bytes:bytes}});if(r&&r.ok===false){toast('Save failed: '+r.error,true);}else{log('Saved: '+p);toast('Saved: '+p,'ok');}return;}}catch(e){toast('Save failed: '+e,true);return;}
+ try{if(window.__TAURI__&&window.__TAURI__.dialog&&window.__TAURI__.dialog.save){const p=await window.__TAURI__.core.invoke('pick_save_path',{req:{defaultPath:name,filters}});if(!p)return;const buf=await blob.arrayBuffer();const bytes=Array.from(new Uint8Array(buf));const r=await window.__TAURI__.core.invoke('save_binary',{req:{path:p,bytes:bytes}});if(r&&r.ok===false){toast('Save failed: '+r.error,true);}else{log('Saved: '+p);toast('Saved: '+p,'ok');}return;}}catch(e){toast('Save failed: '+e,true);return;}
  try{if(window.showSaveFilePicker){const opts={suggestedName:name};if(ext)opts.types=[{description:ext.toUpperCase()+' file',accept:{'image/png':['.'+ext]}}];const h=await window.showSaveFilePicker(opts);const w=await h.createWritable();await w.write(blob);await w.close();log('Saved: '+name);return;}}catch(e){if(e&&e.name==='AbortError')return;}
  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();}
 
@@ -10712,7 +10843,7 @@ function erdFindTable(){
 // that survives filtering always has BOTH ends present - the filter can never itself cause the
 // existing "relationship could not be drawn" diagnostic to misfire.
 window._erdRawData=null;
-window._erdPos={};
+window._erdPos=Object.create(null);
 // Zoom applies a plain CSS transform to the already-rendered SVG - cheap and instant, no
 // re-running the layout algorithm just to change scale. It's ALSO baked into the SVG string
 // erdRender() builds (via window._erdZoom at render time), so the current zoom level survives
@@ -10906,7 +11037,8 @@ function erdRender(){
  const data=window._erdRawData;
  if(!data)return;
  const r=data.r;
- const tables={};
+ // Keyed by table and column names, which can be "constructor" or "__proto__": no prototype.
+ const tables=Object.create(null);
  r.columns.forEach(row=>{
   const tbl=row[0],col=row[1];
   if(!tables[tbl])tables[tbl]={cols:[],pk:new Set()};
@@ -10943,10 +11075,10 @@ function erdRender(){
  // labeled "[PK]"/"[FK]" explicitly (a crow's foot at the table edge tells you A relationship
  // exists, but tracing exactly which ROW it touches gets hard once a table has more than a
  // handful of columns - an explicit label removes the guesswork).
- const fkByTable={};
+ const fkByTable=Object.create(null);
  (r.fks||[]).forEach(row=>{
   const tbl=row[0],col=row[1],refTbl=row[2],refCol=row[3];
-  if(tables[tbl]){if(!fkByTable[tbl])fkByTable[tbl]={};fkByTable[tbl][col]={refTbl,refCol};}
+  if(tables[tbl]){if(!fkByTable[tbl])fkByTable[tbl]=Object.create(null);fkByTable[tbl][col]={refTbl,refCol};}
  });
  function erdRowLabel(tbl,col){
   const isPk=tables[tbl].pk.has(col);
@@ -10972,7 +11104,7 @@ function erdRender(){
  for(let c=0;c<cols;c++){colX[c]=xAcc;xAcc+=colWidths[c]+gapX;}
  let totalW=xAcc-gapX+padX;
 
- const pos={};
+ const pos=Object.create(null);
  names.forEach((n,i)=>{
   const cx=i%cols,cy=Math.floor(i/cols);
   pos[n]={x:colX[cx],cy,w:tables[n].w,h:tables[n].h};
@@ -10989,7 +11121,7 @@ function erdRender(){
  // different set (the "only related" tick, a table's own relations) the untouched tables move to
  // new places while a dragged one stays where it was put, and one lands on top of another. When
  // the set changes the diagram is laid out afresh instead, and the drags are let go.
- {const key=names.join('\u0000');if(window._erdPosKey!==key){window._erdPos={};window._erdPosKey=key;}}
+ {const key=names.join('\u0000');if(window._erdPosKey!==key){window._erdPos=Object.create(null);window._erdPosKey=key;}}
  // If a drag moves a table outside the originally-computed bounds, the diagram's own dimensions
  // expand to keep it fully visible rather than clipping it off.
  names.forEach(n=>{
@@ -11056,7 +11188,7 @@ function erdRender(){
 }
 async function openErd(db){
  $('erdFind').value='';window._erdFocus=null;
- window._erdPos={};
+ window._erdPos=Object.create(null);
  const r=await api('/api/schema-erd',{db});
  if(!r.ok){toast(r.error||'Could not load the database.',true);return;}
  $('erdTitle').textContent='ER diagram - '+db;
@@ -11109,7 +11241,7 @@ async function refreshProcessList(){
   // button at all rather than one that would only ever fail.
   const info=infoIdx>=0?String(row[infoIdx]||'').trim().toLowerCase():'';
   const isSelf=(info==='show full processlist'||info==='show processlist');
-  h+='<td style="padding:4px 6px;border-bottom:1px solid var(--bd2)">'+((pid!=null&&!isSelf)?'<button class="sm warn" onclick="killProcess(\''+esc(pid).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27')+'\')">Kill</button>':'')+'</td>';
+  h+='<td style="padding:4px 6px;border-bottom:1px solid var(--bd2)">'+((pid!=null&&!isSelf)?'<button class="sm warn" onclick="killProcess(\''+esc(pid).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27').replace(/\n/g,'\\n').replace(/\r/g,'\\r')+'\')">Kill</button>':'')+'</td>';
   h+='</tr>';
  });
  h+='</tbody></table>';
@@ -11489,7 +11621,7 @@ function acctSettingSql(who,res,a){const out=[],n=k=>Math.max(0,parseInt(res[k],
   out.push('ALTER USER '+who+' '+(res.exp==='never'?'PASSWORD EXPIRE NEVER':res.exp==='days'?'PASSWORD EXPIRE INTERVAL '+days+' DAY':'PASSWORD EXPIRE DEFAULT')+';');
  return out;}
 // Statements that carry a password are logged without it.
-function logNoSecrets(s){log(s.replace(/(BY|PASSWORD\()\s*'(?:[^'\\]|\\.|'')*'/gi,"$1 '***'"));}
+function logNoSecrets(s){log(sqlNoSecrets(s));}
 async function newUser(){const plugins=await authPlugins();
  const res=await inputBox({title:'Create user',okText:'Create',width:'520px',fields:[{key:'user',label:'User name'},{key:'host',label:'Host - % for anywhere',value:'%'},{key:'pw',label:'Password',type:'password'},
   {key:'plugin',label:'Sign-in method',type:'select',options:[{value:'',label:'Server default'},...plugins.map(p=>({value:p,label:p}))],value:''},
@@ -11814,7 +11946,7 @@ function expOptsRestore(){
   el.addEventListener('change',expOptsSave);
  });
 }
-async function openExport(preselect){const r=await api('/api/schemas');const box=$('expDbs');box.innerHTML='';if(r.ok)r.schemas.forEach(s=>{const safe=s.name.replace(/[^A-Za-z0-9]/g,'_');const dbAttr=esc(s.name).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27');box.innerHTML+='<div class="expdbrow"><span class="exptoggle" id="expx_'+safe+'" onclick="expTables(\''+dbAttr+'\',\''+safe+'\')" title="Show tables to exclude">\u25B8</span><label class="ck" style="display:inline-flex"><input type="checkbox" class="expdb" value="'+esc(s.name)+'" onchange="expDbToggle(\''+safe+'\',this.checked)"> '+esc(s.name)+'</label><div class="exptbls" id="expt_'+safe+'" style="display:none"></div></div>';});const ob=$('expOpts'),adv=$('expOptsAdv');
+async function openExport(preselect){const r=await api('/api/schemas');const box=$('expDbs');box.innerHTML='';if(r.ok)r.schemas.forEach(s=>{const safe=s.name.replace(/[^A-Za-z0-9]/g,'_');const dbAttr=esc(s.name).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27').replace(/\n/g,'\\n').replace(/\r/g,'\\r');box.innerHTML+='<div class="expdbrow"><span class="exptoggle" id="expx_'+safe+'" onclick="expTables(\''+dbAttr+'\',\''+safe+'\')" title="Show tables to exclude">\u25B8</span><label class="ck" style="display:inline-flex"><input type="checkbox" class="expdb" value="'+esc(s.name)+'" onchange="expDbToggle(\''+safe+'\',this.checked)"> '+esc(s.name)+'</label><div class="exptbls" id="expt_'+safe+'" style="display:none"></div></div>';});const ob=$('expOpts'),adv=$('expOptsAdv');
 const ck=([k,l,d,t,g,f])=>'<label class="ck" title="'+esc(t+(f?'\n(mysqldump '+f+')':''))+'"><input type="checkbox" id="eo_'+k+'" '+(d?'checked':'')+'> '+esc(l)+'</label>';
 ob.innerHTML=EXPOPTS.filter(o=>o[4]==='Include').map(ck).join('');
 adv.innerHTML=['Data','Performance','Compatibility'].map(g=>'<div class="xgrp">'+g+'</div>'+EXPOPTS.filter(o=>o[4]===g).map(ck).join('')).join('');
@@ -11886,7 +12018,7 @@ async function expApplyDumpFlavor(){
   }
  });
 }
-async function expTables(db,safe){const c=$('expt_'+safe);if(!c)return;const cx=$('expx_'+safe);if(c.style.display==='none'){c.style.display='block';if(cx)cx.textContent='\u25BE';if(!c.dataset.loaded){c.innerHTML='<span class="muted" style="font-size:11px">Loading\u2026</span>';const q=await api('/api/query',{sql:'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='+lit(db)+' ORDER BY TABLE_NAME'});if(!q.ok){c.innerHTML='<span class="muted" style="font-size:11px">'+esc(q.error||'Could not list tables')+'</span>';return;}if(!q.rows.length){c.innerHTML='<span class="muted" style="font-size:11px">(no tables)</span>';c.dataset.loaded='1';return;}const dbCk=document.querySelector('.expdb[value="'+db.replace(/"/g,'&quot;')+'"]');const on=dbCk?dbCk.checked:true;let h='<div class="muted" style="font-size:11px;margin:1px 0 3px">Untick a table to exclude it from the export:</div>';q.rows.forEach(r=>{const tn=r[0];h+='<label class="ck" style="font-size:12px"><input type="checkbox" class="exptbl" data-db="'+esc(db)+'" value="'+esc(tn)+'" '+(on?'checked':'')+'> '+esc(tn)+'</label>';});c.innerHTML=h;c.dataset.loaded='1';}}else{c.style.display='none';if(cx)cx.textContent='\u25B8';}}
+async function expTables(db,safe){const c=$('expt_'+safe);if(!c)return;const cx=$('expx_'+safe);if(c.style.display==='none'){c.style.display='block';if(cx)cx.textContent='\u25BE';if(!c.dataset.loaded){c.innerHTML='<span class="muted" style="font-size:11px">Loading\u2026</span>';const q=await api('/api/query',{sql:'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='+lit(db)+' ORDER BY TABLE_NAME'});if(!q.ok){c.innerHTML='<span class="muted" style="font-size:11px">'+esc(q.error||'Could not list tables')+'</span>';return;}if(!q.rows.length){c.innerHTML='<span class="muted" style="font-size:11px">(no tables)</span>';c.dataset.loaded='1';return;}const dbCk=document.querySelector('.expdb[value="'+CSS.escape(db)+'"]');const on=dbCk?dbCk.checked:true;let h='<div class="muted" style="font-size:11px;margin:1px 0 3px">Untick a table to exclude it from the export:</div>';q.rows.forEach(r=>{const tn=r[0];h+='<label class="ck" style="font-size:12px"><input type="checkbox" class="exptbl" data-db="'+esc(db)+'" value="'+esc(tn)+'" '+(on?'checked':'')+'> '+esc(tn)+'</label>';});c.innerHTML=h;c.dataset.loaded='1';}}else{c.style.display='none';if(cx)cx.textContent='\u25B8';}}
 function expDbToggle(safe,on){document.querySelectorAll('#expt_'+safe+' .exptbl').forEach(c=>{c.checked=on;});}
 async function runExport(){const dbs=[...document.querySelectorAll('.expdb:checked')].map(c=>c.value);
 const tables=[...document.querySelectorAll('.exptbl:checked')].map(c=>c.dataset.db+'.'+c.value);
@@ -12203,7 +12335,7 @@ async function cmpCompareRows(ti){
  if(!r.ok){$('cmprNote').textContent='';$('cmprGrid').innerHTML='<div class="muted" style="padding:8px">'+esc(r.error||'Could not compare rows.')+' <a href="#" onclick="cmpCompareRows('+ti+');return false" style="color:var(--accent)">Retry</a></div>';return;}
  _cmprState={table:t.name,pkCols:r.pkCols,columns:r.columns,rows:r.rows.map(row=>({data:row,checked:true})),sourceConnName:sc,sourceDb:sd,targetConnName:tc,targetDb:td,missingTotal:r.missingTotal,truncated:r.truncated,allMissingPks:r.allMissingPks||[],extraTotal:r.extraTotal||0,extraPks:r.extraPks||[],targetTableMissing:targetTableMissing};
  var _cmprCancelNote1=r.cancelled?' (cancelled - only some tables/rows were checked before you stopped it)':'';
- $('cmprNote').innerHTML=r.missingTotal+' row(s) missing on target'+(r.truncated?(' (showing first '+r.rows.length+' for review - <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">insert all '+r.missingTotal+' without reviewing them</a>)'):'')+_cmprCancelNote1+'. Rows are inserted with the SAME '+r.pkCols.join('/')+ ' value(s) as the source (insert-only - existing target rows are never changed).'+cmprExtraNote(r.extraTotal,r.extraPks,r.pkCols);
+ $('cmprNote').innerHTML=r.missingTotal+' row(s) missing on target'+(r.truncated?(' (showing first '+r.rows.length+' for review - <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">insert all '+r.missingTotal+' without reviewing them</a>)'):'')+_cmprCancelNote1+'. Rows are inserted with the SAME '+esc(r.pkCols.join('/'))+ ' value(s) as the source (insert-only - existing target rows are never changed).'+cmprExtraNote(r.extraTotal,r.extraPks,r.pkCols);
  $('cmprRoNote').style.display=r.targetReadonly?'inline':'none';
  cmprRender();
 
@@ -12377,7 +12509,7 @@ async function cmprTopUpAfterInsert(insertedRows){
    _cmprState.rows=[];
  }
  const stillTruncated=_cmprState.allMissingPks.length>_cmprState.rows.length;
- $('cmprNote').innerHTML=_cmprState.missingTotal+' row(s) missing on target'+(stillTruncated?(' (showing next '+_cmprState.rows.length+' for review - <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">insert all '+_cmprState.missingTotal+' without reviewing them</a>)'):'')+'. Rows are inserted with the SAME '+_cmprState.pkCols.join('/')+' value(s) as the source (insert-only - existing target rows are never changed).'+cmprExtraNote(_cmprState.extraTotal,_cmprState.extraPks,_cmprState.pkCols);
+ $('cmprNote').innerHTML=_cmprState.missingTotal+' row(s) missing on target'+(stillTruncated?(' (showing next '+_cmprState.rows.length+' for review - <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">insert all '+_cmprState.missingTotal+' without reviewing them</a>)'):'')+'. Rows are inserted with the SAME '+esc(_cmprState.pkCols.join('/'))+' value(s) as the source (insert-only - existing target rows are never changed).'+cmprExtraNote(_cmprState.extraTotal,_cmprState.extraPks,_cmprState.pkCols);
  cmprRender();
 }
 // Reset every field to its fresh-open default here rather than on Close - Escape closes the
@@ -12389,7 +12521,7 @@ function renderImpDbPicker(){const inp=$('impDb');const f=inp.value.toLowerCase(
  showImpDbList(window._impDbSchemas.filter(n=>!f||n.toLowerCase().includes(f)));}
 function showImpDbList(matches){const p=$('impDbPicker');const inp=$('impDb');if(!p||!inp)return;
  if(!matches.length){p.style.display='none';return;}
- p.innerHTML=matches.map(n=>'<div class="item" onmousedown="event.preventDefault();impDbPick(\''+esc(n).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27')+'\')">'+esc(n)+'</div>').join('');
+ p.innerHTML=matches.map(n=>'<div class="item" onmousedown="event.preventDefault();impDbPick(\''+esc(n).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27').replace(/\n/g,'\\n').replace(/\r/g,'\\r')+'\')">'+esc(n)+'</div>').join('');
  const r=inp.getBoundingClientRect();
  p.style.left=r.left+'px';p.style.top=r.bottom+2+'px';p.style.minWidth=r.width+'px';p.style.display='block';}
 function impDbPick(name){$('impDb').value=name;$('impDbPicker').style.display='none';}
@@ -12403,12 +12535,12 @@ function impRender(){const box=$('impList');if(!box)return;const n=_impFiles.len
  const total=_impFiles.reduce((s,f)=>s+(f.size||0),0);$('impCount').textContent=n+' file'+(n===1?'':'s')+(total?', '+fmtBytes(total):'');}
 function impRemove(i){_impFiles.splice(i,1);impRender();}
 function impClear(){_impFiles=[];impRender();}
-async function openImport(){_impFiles=[];impRender();$('impLog').textContent='';$('impCreate').checked=false;$('impFk').checked=true;$('impForce').checked=false;$('impBinary').checked=false;$('impMaxPacket').value='1G';const inp=$('impDb');inp.value=(typeof curSchema!=='undefined'&&curSchema)?curSchema:'';window._impDbSchemas=[];try{const r=await api('/api/schemas');if(r.ok)window._impDbSchemas=r.schemas.map(s=>s.name);}catch(e){}show('mImport');}
+async function openImport(){_impFiles=[];impRender();$('impLog').textContent='';$('impCreate').checked=false;$('impFk').checked=true;$('impForce').checked=false;$('impMaxPacket').value='1G';const inp=$('impDb');inp.value=(typeof curSchema!=='undefined'&&curSchema)?curSchema:'';window._impDbSchemas=[];try{const r=await api('/api/schemas');if(r.ok)window._impDbSchemas=r.schemas.map(s=>s.name);}catch(e){}show('mImport');}
 async function runImport(){const files=_impFiles.map(f=>f.path);if(!files.length){toast('Add at least one file.',true);return;}
  $('impLog').textContent='';
  const jobId=(crypto.randomUUID?crypto.randomUUID():('j'+Date.now()+Math.random()));
  progStart('imp','Importing '+files.length+' file'+(files.length===1?'':'s'),jobId);
- const r=await api('/api/import',{files,targetDb:$('impDb').value.trim(),createDb:$('impCreate').checked,fkOff:$('impFk').checked,force:$('impForce').checked,binaryMode:$('impBinary').checked,maxpacket:$('impMaxPacket').value.trim(),jobId:jobId});
+ const r=await api('/api/import',{files,targetDb:$('impDb').value.trim(),createDb:$('impCreate').checked,fkOff:$('impFk').checked,force:$('impForce').checked,maxpacket:$('impMaxPacket').value.trim(),jobId:jobId});
  progStop('imp');
  if(r.cancelled){log('Import cancelled.');}
  if(!r.ok){showToolError('impLog','mImport',r.error);log('Import error: '+r.error);return;}
@@ -12670,7 +12802,7 @@ function acAccept(id){const ta=acTa||$('ed_'+id);const pos=ta.selectionStart;con
 
 let csvTarget={db:null,table:null};
 async function exportFull(db,name,fmt){fmt=fmt||'csv';const ext=(fmt==='inserts')?'sql':'csv';const defName=name+(fmt==='inserts'?'_inserts.sql':'.csv');
- if(window.__TAURI__&&window.__TAURI__.core){let path;try{path=await window.__TAURI__.dialog.save({defaultPath:defName,filters:[{name:ext.toUpperCase()+' file',extensions:[ext]}]});}catch(e){toast('Save dialog failed: '+e,true);return;}if(!path)return;log('Exporting all rows of '+db+'.'+name+'...');const r=await window.__TAURI__.core.invoke('export_table',{req:{conn:getConn(),db:db,table:name,file:path,format:fmt,nullValue:csvNullMarker()}});if(r&&r.ok){log(r.message);toast(r.message,'ok');}else toast('Export failed: '+(r?r.error:'unknown'),true);return;}
+ if(window.__TAURI__&&window.__TAURI__.core){let path;try{path=await window.__TAURI__.core.invoke('pick_save_path',{req:{defaultPath:defName,filters:[{name:ext.toUpperCase()+' file',extensions:[ext]}]}});}catch(e){toast('Save dialog failed: '+e,true);return;}if(!path)return;log('Exporting all rows of '+db+'.'+name+'...');const r=await window.__TAURI__.core.invoke('export_table',{req:{conn:getConn(),db:db,table:name,file:path,format:fmt,nullValue:csvNullMarker()}});if(r&&r.ok){log(r.message);toast(r.message,'ok');}else toast('Export failed: '+(r?r.error:'unknown'),true);return;}
  try{
    const cq=await api('/api/query',{sql:"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)});
    const est=(cq.ok&&cq.rows.length&&cq.rows[0][0]!=null)?+cq.rows[0][0]:null;
@@ -12771,7 +12903,7 @@ window.addEventListener('beforeunload',e=>{saveSession();if(anyPending()){e.prev
 (function(){function initSideResize(){const sd=$('side'),rz=$('sideResize'),mn=$('main');if(!sd||!rz||!mn){setTimeout(initSideResize,300);return;}const saved=parseInt(localStorage.getItem('sideW')||'',10);if(saved&&saved>=280)sd.style.width=saved+'px';let drag=false;rz.addEventListener('pointerdown',e=>{if(e.target!==rz)return;if(document.body.classList.contains('side-folded')){toggleSide();return;}drag=true;rz.classList.add('drag');try{rz.setPointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='none';e.preventDefault();});rz.addEventListener('pointermove',e=>{if(!drag)return;const left=mn.getBoundingClientRect().left;let w=e.clientX-left;const max=Math.max(280,window.innerWidth-320);w=Math.max(280,Math.min(w,max));sd.style.width=w+'px';});const end=e=>{if(!drag)return;drag=false;rz.classList.remove('drag');try{rz.releasePointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='';localStorage.setItem('sideW',String(parseInt(sd.style.width,10)||280));};rz.addEventListener('pointerup',end);rz.addEventListener('pointercancel',end);rz.addEventListener('dblclick',()=>{if(document.body.classList.contains('side-folded'))return;sd.style.width='280px';localStorage.setItem('sideW','280');});}initSideResize();})();
 </script></body></html>
 '@
-$Html = $Html.Replace('__TOKEN__', $Token).Replace('__APP_VERSION__', $script:AppVersion)
+$Html = $Html.Replace('__APP_VERSION__', $script:AppVersion)
 
 Resolve-Tools
 # Probe the client's SSL flag dialect once here, so the answer is seeded into every runspace
@@ -12790,7 +12922,7 @@ if (-not $listener) {
     $listener.Start(); $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
     Write-Host "  (Fixed ports busy - using random port $port; saved UI settings may not persist this run.)" -ForegroundColor Yellow
 }
-$url = "http://127.0.0.1:$port/"
+$url = "http://127.0.0.1:$port/#t=$Token"
 Write-Host ""
 Write-Host "  NOBS SQL Editor $script:AppVersion is running." -ForegroundColor Green
 Write-Host "  Open:  $url"
@@ -12925,6 +13057,12 @@ $RequestHandler = {
         if ([string]$req.host -notmatch '^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$') {
             Send-Http $client '403 Forbidden' 'text/plain; charset=utf-8' ([Text.Encoding]::UTF8.GetBytes('Forbidden')); return
         }
+        if ($req.path -like '/api/*') {
+            $okOrigin = ($null -eq $req.origin) -or ([string]$req.origin -match '^http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$')
+            if (-not $okOrigin -or $req.method -ne 'POST' -or [string]$req.ctype -notmatch '^application/json') {
+                Send-Http $client '403 Forbidden' 'text/plain; charset=utf-8' ([Text.Encoding]::UTF8.GetBytes('Forbidden')); return
+            }
+        }
         if ($req.path -eq '/api/ping') {
             # Token-checked like every other /api/* route. Ping refreshes LastPing, which is what
             # the idle-shutdown check below reads - so while this was unauthenticated, any web
@@ -12933,7 +13071,7 @@ $RequestHandler = {
             # POST to this fixed, predictable port. It could not read the reply, but it did not
             # need to: the side effect was the whole point. The real page already knows the token.
             $data=$null; try { if($req.body){ $data=$req.body | ConvertFrom-Json } } catch { }
-            if (-not $data -or $data.token -ne $Token) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }
+            if (-not (Test-ApiToken $data)) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }
             $SharedState.LastPing = Get-Date; Send-Json $client '{"ok":true}'; return
         }
         if ($req.path -eq '/' -or $req.path -eq '/index.html') { Send-Http $client '200 OK' 'text/html; charset=utf-8' ([Text.Encoding]::UTF8.GetBytes($Html)); return }
@@ -12944,18 +13082,20 @@ $RequestHandler = {
             # own quit() already sends the token via api()'s p.token=TOKEN, so this costs nothing
             # for the legitimate caller.
             $data=$null; try { if($req.body){ $data=$req.body | ConvertFrom-Json } } catch { }
-            if (-not $data -or $data.token -ne $Token) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }
+            if (-not (Test-ApiToken $data)) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }
             Send-Json $client '{"ok":true}'; $SharedState.Quit = $true; return
         }
         if ($req.path -like '/api/*') {
             $data=$null; try { if($req.body){ $data=$req.body | ConvertFrom-Json } } catch { }
-            if (-not $data -or $data.token -ne $Token) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }
+            if (-not (Test-ApiToken $data)) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }
             $conn=$data.conn
             $roBlocked = $false
             # Read-only either because the connection is marked so, or because it is browsing in
             # another character set - a diagnostic, where what is shown is not what would be
             # written. The UI disables writing in that mode too; this does not depend on it.
-            if ([bool]$data.ro -or (Get-BrowseCharset $conn)) {
+            # And read-only when every saved connection to this account says so, whatever the page
+            # sent (Test-SavedReadOnly).
+            if ($req.path -match '/api/(rowop|import|importcsv|kill-process|exec|script|script-results|query)$' -and ([bool]$data.ro -or (Get-BrowseCharset $conn) -or (Test-SavedReadOnly $conn))) {
                 switch -Regex ($req.path) {
                     '/api/(rowop|import|importcsv|kill-process)$' { $roBlocked = $true }
                     '/api/(exec|script|script-results|query)$' { if (-not (Test-SqlReadOnly ([string]$data.sql))) { $roBlocked = $true } }
@@ -13096,6 +13236,8 @@ while ($run) {
     elseif (((Get-Date) - $SharedState.LastPing).TotalSeconds -gt 21600) { $run = $false }
 }
 
+# Results not read to the end: their mysql.exe is ended and its options file removed.
+foreach ($k in @($script:OpenCursors.Keys)) { $oc = $null; if ($script:OpenCursors.TryRemove($k, [ref]$oc) -and -not $oc.Memory) { try { if (-not $oc.Process.HasExited) { $oc.Process.Kill() } } catch {}; $null = Close-QueryCursorProc $oc } }
 # Tabs still holding a transaction: their mysql.exe is ended, and the server rolls back.
 foreach ($k in @($script:TxSessions.Keys)) { $ts = $null; if ($script:TxSessions.TryRemove($k, [ref]$ts)) { Stop-TxSession $ts } }
 # And the SSH tunnels, which would otherwise outlive the app.

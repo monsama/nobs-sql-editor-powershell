@@ -76,7 +76,11 @@ $script:ServerFlavor = [System.Collections.Concurrent.ConcurrentDictionary[strin
 $script:CancelledCompares = [System.Collections.Concurrent.ConcurrentDictionary[string,bool]]::new()
 
 $script:CfgFile = Join-Path $env:APPDATA 'NOBSSQL\config.json'
-$script:ToolsDir = Join-Path $env:APPDATA 'NOBSSQL\bin'
+# Downloaded client tools go to the local AppData: the roaming one is copied to the server at every
+# sign-in and sign-out on a network with roaming profiles, and a hundred megabytes of programs has
+# no business there. Where they went before is kept too - tools already there work from their saved paths.
+$script:ToolsDir = Join-Path $(if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:APPDATA }) 'NOBSSQL\bin'
+$script:ToolsDirOld = Join-Path $env:APPDATA 'NOBSSQL\bin'
 
 # Snapshot builtin function names now, before any of our own functions exist,
 # so later we can diff out just the ones we need to hand to each runspace.
@@ -266,8 +270,9 @@ function Get-PluginDir { param([string]$Tool)
     if (-not $exe) { return $null }
     $binDir = Split-Path -Parent $exe
     if (-not $binDir -or -not $script:ToolsDir) { return $null }
-    if ($binDir.TrimEnd('\') -ne ([string]$script:ToolsDir).TrimEnd('\')) { return $null }
-    $p = Join-Path $script:ToolsDir 'plugin'
+    $ours = @([string]$script:ToolsDir, [string]$script:ToolsDirOld) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') }
+    if ($ours -notcontains $binDir.TrimEnd('\')) { return $null }
+    $p = Join-Path $binDir 'plugin'
     if (Test-Path $p) { return $p }
     return $null
 }
@@ -3502,6 +3507,14 @@ function Get-ToolStamp { param([string]$Path)
 }
 # Whether a path Settings is about to save is the client tool its box asks for, and starts: a
 # mistyped path used to be saved without a word and found out at the next export.
+# Opens one of the app's own folders in Explorer - only these two, never a path from the page.
+function Api-OpenFolder { param($data)
+    $dir = switch ([string]$data.which) { 'config' { Split-Path -Parent $script:CfgFile } 'tools' { $script:ToolsDir } default { $null } }
+    if (-not $dir) { return '{"ok":false,"error":"unknown folder"}' }
+    try { if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+          Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $dir + '"') | Out-Null; return '{"ok":true}' }
+    catch { return '{"ok":false,"error":'+(J-Str $_.Exception.Message)+'}' }
+}
 function Api-CheckTool { param($data)
     $p = ([string]$data.path).Trim(); $kind = [string]$data.kind
     if (-not $p) { return '{"ok":true}' }
@@ -5278,6 +5291,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  .box :is(input:not([type=checkbox],[type=radio],[type=file],[type=hidden],[type=range]),select):not(table *){height:28px}
  .box table.dz :is(input:not([type=checkbox]),select){height:26px}
  /* a path that did not pass the check before Save */
+ .setpath{font-family:var(--mono);font-size:11px;color:var(--fg);user-select:text;overflow-wrap:anywhere}
  #mSettings input.bad{border-color:var(--danger);box-shadow:0 0 0 1px var(--danger)}
  .setnote{font-size:11px;line-height:1.45;color:var(--muted);margin-top:6px}
  .setfoot{justify-content:flex-end;margin-top:14px;padding-top:10px;border-top:1px solid var(--bd2)}
@@ -5578,7 +5592,6 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  </div>
  <div class="muted" style="font-size:11px;line-height:1.5;margin-top:8px">Downloaded tools do not update themselves; downloading again replaces them with the current release, whose version is shown in the card. Paths left empty are detected: saved configuration &rarr; MYSQL_BIN / MYSQLDUMP_BIN environment variables &rarr; common install folders (Program Files\MariaDB*, Program Files\MySQL*, WAMP, XAMPP) &rarr; system PATH.</div>
  <div id="cfgLog" class="muted" style="white-space:pre-wrap;font-family:var(--mono);font-size:11px;max-height:120px;overflow:auto;margin-top:6px"></div>
- <div id="cfgPaths" class="muted" style="font-size:11px;font-family:var(--mono);margin-top:10px;border-top:1px solid var(--bd2);padding-top:8px;line-height:1.6"></div>
  </section>
  <section class="setpage" data-p="general">
   <h4 class="setpt">General</h4>
@@ -5601,6 +5614,12 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <section class="setpage" data-p="data">
   <h4 class="setpt">Local data</h4>
   <div class="setpd">What this app keeps on this computer. Your databases are not touched by anything here.</div>
+  <div class="setgroup">Where it is kept</div>
+  <div class="setcard">
+   <div class="setrow"><div class="setrl"><div class="setrt">Settings</div><div class="setnote"><span id="cfgPathConfig" class="setpath"></span><br>The client tool paths and the other settings on this page, in config.json.</div></div><div class="setrc"><button class="sm" onclick="openFolder('config')">Open folder</button></div></div>
+   <div class="setrow"><div class="setrl"><div class="setrt">Downloaded client tools</div><div class="setnote"><span id="cfgPathTools" class="setpath"></span><br>Where Download puts mysql and mysqldump. Tools you point to yourself stay where they are.</div></div><div class="setrc"><button class="sm" onclick="openFolder('tools')">Open folder</button></div></div>
+  </div>
+  <div class="setgroup">Clear and reset</div>
   <div class="setcard">
    <div class="setrow"><div class="setrl"><div class="setrt">Overview cache</div><div class="setnote">The database overview is kept for five minutes, so reopening it is instant. Refresh reads it from the server again.</div></div><div class="setrc"><button class="sm needsconn" title="Clear the database overview cache and reload" onclick="clearOverviewCache()">Refresh</button></div></div>
    <div class="setrow"><div class="setrl"><div class="setrt">Layout</div><div class="setnote">Puts the sidebar, the panels, the folded groups, the theme and the message timing back to how the app starts. Saved connections, the query library, history and pinned tables are left alone.</div></div><div class="setrc"><button class="sm" onclick="resetLayout()">Reset the layout</button></div></div>
@@ -6410,11 +6429,12 @@ async function showToolsInUse(st){
 async function refreshToolsStatus(manual,quiet){const el=$('cfgStatus');if(!el)return;if(!quiet)el.innerHTML='Checking...';try{const r=await api('/api/tools-status');if(!r||!r.ok){el.textContent='';return;}renderToolsStatus(r);
  if(r.mysql&&r.mysql!=='(not found)'&&!$('cfgMysql').value)$('cfgMysql').value=r.mysql;
  if(r.mysqldump&&r.mysqldump!=='(not found)'&&!$('cfgDump').value)$('cfgDump').value=r.mysqldump;
- const pe=$('cfgPaths');if(pe)pe.innerHTML='Downloads: '+esc(r.download_dir)+'<br>Config: '+esc(r.config_file);}catch(e){el.textContent='';}}
+ const pc=$('cfgPathConfig'),pt=$('cfgPathTools');if(pc)pc.textContent=r.config_file||'';if(pt)pt.textContent=r.download_dir||'';}catch(e){el.textContent='';}}
 function resetDownloadUrl(){$('cfgDownloadUrl').value=window._mariadbDownloadUrlDefault||'';}
 // Save tries each path it was given first: a file that is not there, is the other tool, or does not
 // start is outlined with the reason, and nothing is saved until they all work.
 const CFG_TOOLS=[['cfgMysql','mysql','mysql (MariaDB servers)'],['cfgDump','mysqldump','mysqldump (MariaDB servers)'],['cfgMysqlMy','mysql','mysql (MySQL servers)'],['cfgDumpMy','mysqldump','mysqldump (MySQL servers)']];
+async function openFolder(which){let r=null;try{r=await api('/api/open-folder',{which});}catch(e){}if(!r||!r.ok)toast('Could not open the folder'+(r&&r.error?': '+r.error:'')+'.',true);}
 async function saveSettings(){
  const bad=[],found=[];
  for(const [id,kind,label] of CFG_TOOLS){const el=$(id);if(!el)continue;el.classList.remove('bad');el.removeAttribute('data-err');const p=el.value.trim();if(!p)continue;
@@ -12677,7 +12697,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','TxSessions','TxLost','Tunnels','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','AppVersion','ReleasesRepo','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload','BrowseCharsets') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ToolsDirOld','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','TxSessions','TxLost','Tunnels','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','AppVersion','ReleasesRepo','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload','BrowseCharsets') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }
@@ -12772,6 +12792,7 @@ $RequestHandler = {
                 '/api/get-config'     { Send-Json $client (Api-GetConfig) }
                 '/api/save-config'    { Send-Json $client (Api-SaveConfig $data) }
                 '/api/check-tool'     { Send-Json $client (Api-CheckTool $data) }
+                '/api/open-folder'    { Send-Json $client (Api-OpenFolder $data) }
                 '/api/download-tools' { Send-Json $client (Api-DownloadTools) }
                 '/api/download-mysql-tools' { Send-Json $client (Api-DownloadMysqlTools) }
                 '/api/update-check' { Send-Json $client (Api-UpdateCheck) }

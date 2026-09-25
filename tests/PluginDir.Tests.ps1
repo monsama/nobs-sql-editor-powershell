@@ -52,6 +52,16 @@ try {
     New-Item -ItemType Directory -Path $ourPlug -Force | Out-Null
     Check ((Get-PluginDir) -eq $ourPlug) 'once plugin/ exists beside the binaries it is used' "got $(Get-PluginDir)"
 
+    "`n-- tools downloaded before the move to the local AppData keep their plugins --"
+    # Downloads went to the roaming AppData before; a client still there, from its saved path, is ours too.
+    $oldBin = Join-Path $root (Join-Path 'old' 'bin'); $oldPlug = Join-Path $oldBin 'plugin'
+    New-Item -ItemType Directory -Path $oldPlug -Force | Out-Null
+    New-Item -ItemType File -Path (Join-Path $oldBin 'mysql.exe') -Force | Out-Null
+    $script:ToolsDirOld = $oldBin
+    $script:MysqlPath = Join-Path $oldBin 'mysql.exe'
+    Check ((Get-PluginDir) -eq $oldPlug) 'a client in the old tools folder uses the plugins beside it' "got $(Get-PluginDir)"
+    $script:ToolsDirOld = $null
+
     "`n-- a client from a real installation finds its own, and must be left alone --"
     # Overriding a full MariaDB or MySQL install's plugin directory with a different product's
     # plugins is how a working connection gets broken.

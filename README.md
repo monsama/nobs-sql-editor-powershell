@@ -1,5 +1,10 @@
 # NOBS SQL Editor - PowerShell edition
 
+[![Latest release](https://img.shields.io/github/v/release/monsama/nobs-sql-editor-powershell)](https://github.com/monsama/nobs-sql-editor-powershell/releases/latest)
+[![test](https://github.com/monsama/nobs-sql-editor-powershell/actions/workflows/test.yml/badge.svg)](https://github.com/monsama/nobs-sql-editor-powershell/actions/workflows/test.yml)
+[![compat](https://github.com/monsama/nobs-sql-editor-powershell/actions/workflows/compat.yml/badge.svg)](https://github.com/monsama/nobs-sql-editor-powershell/actions/workflows/compat.yml)
+[![License: GPL v2+](https://img.shields.io/badge/license-GPL--2.0--or--later-blue)](LICENSE)
+
 A MySQL and MariaDB client in a single PowerShell script. It starts a small web
 server that listens only on 127.0.0.1, opens the interface in your browser, and runs
 your queries through the `mysql` / `mysqldump` command-line tools. No installation and
@@ -10,7 +15,40 @@ It is the same application as
 interface as a native desktop app built with [Tauri](https://tauri.app). Use this
 edition on machines where you can't, or would rather not, install anything.
 
+## At a glance
+
+| | |
+|---|---|
+| **Platform** | Windows, with Windows PowerShell 5.1 or later |
+| **Download** | one file, `NOBSSQL.ps1`, about 1 MB |
+| **Install** | none, and no admin rights |
+| **Servers** | MySQL 5.7 to 9.4 and MariaDB 10.2 to 12.3, tested - see [Supported servers](#supported-servers) |
+| **Needs** | the `mysql` / `mysqldump` client tools - Settings downloads them if you have none |
+| **Interface** | a Chrome or Edge app window, or your default browser |
+| **Local server** | 127.0.0.1 only; its API needs a token that is new for every start |
+| **Passwords** | encrypted with Windows DPAPI for your user account |
+| **Your data** | `%APPDATA%\NOBSSQL` (connections, settings, query library, client tools) |
+| **Network** | Only your database servers, plus what is listed under [Network access](#network-access) |
+| **License** | GPL-2.0-or-later |
+
+## Supported servers
+
+Every change is tested against these servers, with the full live and GUI test suites:
+
+| Server | Versions tested |
+|---|---|
+| MySQL | 5.7, 8.0, 8.4, 9.4 (9.4 also with `lower_case_table_names=2`) |
+| MariaDB | 10.2, 10.6, 10.11, 12.3 |
+
+Versions in between are expected to work. Older ones (MySQL 5.6, MariaDB 10.1 and before) are
+not tested. Where a server lacks a feature, the app leaves it out rather than failing: there are
+no roles on MySQL 5.7, and no per-account password expiry or account locking on MariaDB before
+10.4, so the user editor does not offer them there.
+
 ## Running
+
+Download `NOBSSQL.ps1` from the
+[Releases](https://github.com/monsama/nobs-sql-editor-powershell/releases) page, then:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\NOBSSQL.ps1
@@ -38,46 +76,63 @@ extensions do apply as usual.
 **Closing the console window stops the server.** Pass `-NoBrowser` to start the server
 without opening a browser.
 
-Requires Windows PowerShell 5.1 or later.
-
 ## Features
 
-- Connections with saved profiles, a per-connection accent colour and
-  environment label, and a **read-only / safe mode** to protect production
-  servers.
-- SSH tunnels through the system's OpenSSH client (key, agent or password;
-  host aliases and ProxyJump from ~/.ssh/config work too).
-- Browse schemas, tables, views, procedures, functions, triggers and events,
-  with quick filtering and search across all schemas.
-- Tabbed SQL editor with syntax highlighting, autocomplete that knows the tables
-  and aliases of the statement, find and replace (Ctrl+F / Ctrl+H), query
-  formatting, and run-whole-script or run-selection. A procedure call, or a script with
-  several SELECTs, shows each result in a tab of its own.
-- Result grids with per-column filtering and sorting, column resize and
-  show/hide, and a row-detail form view for wide tables.
-- Inline and full-row editing staged as pending changes and applied in a single
-  transaction; add and delete rows. Typing with several cells picked writes the
-  value into all of them. Right-click Apply (or Ctrl+Shift+S) to see the SQL
-  it would run first.
-- Manual transactions: with Auto-commit off a tab keeps one transaction open
-  across its runs until Commit or Rollback. Commit also saves grid edits
-  not applied yet; Rollback discards them. The count beside Commit opens
-  the transaction's log: what it has run so far, how many rows each run changed,
-  and how it went.
-- Explain draws the plan: every table read as a card, a full scan in red and an
-  index lookup in green, with the joins, sorts and subqueries around them.
-- A result charts as bars or a line, from the rows the grid shows.
-- Users and privileges: privileges as a checklist per server, database or table, with
-  the GRANT and REVOKE shown before they run; roles and default roles; clone an
-  account; sign-in method, SSL, password expiry and limits; who has access to a
-  database; and a transfer script that carries roles and can run again.
-- Export tables or query results to CSV, INSERT statements, Excel, JSON or
-  Markdown; CSV import.
-- Data export / import via the MySQL/MariaDB command-line tools: structure and data,
+**Connections**
+- Saved connection profiles with a per-connection accent colour and environment label.
+- **Read-only / safe mode** for production servers: every statement is checked by the local
+  server before it is sent, not only greyed out in the interface.
+- SSH tunnels through the system's OpenSSH client (key, agent or password; host aliases and
+  ProxyJump from `~/.ssh/config` work too).
+- SSL/TLS modes up to full certificate verification.
+
+**Editor**
+- Tabbed SQL editor with syntax highlighting, and autocomplete that knows the tables and aliases
+  of the statement.
+- Find and replace (Ctrl+F / Ctrl+H), formatting, undo for every editor command.
+- Run the whole script, the selection, or the statement at the cursor. A procedure call, or a
+  script with several SELECTs, shows each result in a tab of its own.
+- Explain draws the plan: every table read as a card, a full scan in red and an index lookup in
+  green, with the joins, sorts and subqueries around them.
+- Query history, and a reusable query library.
+
+**Results and editing**
+- Result grids with per-column filtering and sorting, column resize and show/hide, and a
+  row-detail form for wide tables. Large results load as you scroll.
+- Inline and full-row editing, staged as pending changes and applied in one transaction; add and
+  delete rows. Right-click **Apply** (or Ctrl+Shift+S) shows the SQL it would run first.
+- Pick several cells to type one value into all of them, or set them all to NULL or empty.
+- **Go to referenced row** follows a foreign key, into another database too.
+- Manual transactions: with Auto-commit off a tab keeps one transaction open across its runs
+  until Commit or Rollback, with a log of what it has run.
+- Charts: a result as bars or a line.
+- Read the same rows in another character set, to tell text stored wrong from text read wrong.
+
+**Schema**
+- Browse schemas, tables, views, procedures, functions, triggers and events, with quick filtering
+  and search across all schemas.
+- Table designer and DDL view and edit; routines and triggers edited and recreated in place.
+- ER diagrams, and table maintenance (check, analyze, optimize, repair).
+- Server overview (databases, sizes, row counts, character sets) and the process list, with kill.
+
+**Compare DB**
+- Schema sync between two databases, on the same server or two different ones: columns with
+  their full definitions, indexes, foreign keys and CHECK constraints. Missing tables are created
+  after the tables they refer to; drops are offered but left unticked.
+- Row compare: rows missing on either side and rows that differ, copied or updated by their key.
+
+**Import and export**
+- Tables or query results to CSV, INSERT statements, Excel, JSON or Markdown.
+- Strict CSV import.
+- Database export and import through the MySQL/MariaDB command-line tools: structure and data,
   structure only or data only, as a file per table, per database or one file.
-- Table designer, DDL view and edit, users and privileges, table maintenance,
-  ER diagrams, server process list, and a reusable query library
-  (a query can be saved to it straight from the history).
+
+**Users and privileges**
+- Privileges as a checklist per server, database or table, with the GRANT and REVOKE shown
+  before they run.
+- Roles and default roles; clone an account; sign-in method, SSL, password expiry and limits.
+- Who has access to a database, and a transfer script that recreates accounts and roles on
+  another server.
 
 ## Keeping data exact
 
@@ -98,8 +153,8 @@ Requires Windows PowerShell 5.1 or later.
 - **Copies name their columns** (Compare, Duplicate table, INSERT exports). Invisible columns are
   included; generated columns are left out, since the server computes them. CSV exports include
   every column, and the CSV import skips generated ones.
-- **INSERT exports skip rows whose key already exists** (`ON DUPLICATE KEY UPDATE`). They used
-  `INSERT IGNORE`, which also cuts a value that does not fit instead of failing.
+- **INSERT exports skip rows whose key already exists** (`ON DUPLICATE KEY UPDATE`), rather than
+  using `INSERT IGNORE`, which would also cut short a value that does not fit.
 - **The CSV import is strict.** Header names match the table's columns ignoring case. A column
   the table does not have, or a row with more or fewer fields than the header, imports nothing.
   Foreign key and unique checks stay on, and the whole file is one transaction.
@@ -108,6 +163,8 @@ Requires Windows PowerShell 5.1 or later.
   is being written to. Two tables whose names give the same file name get two files.
 - **Schema sync writes each column as the source server defines it**, including its character
   set, collation, comment and generated expression.
+- **Binary values are shown and saved as `0x…` hex**, byte for byte - BLOB, BINARY, BIT, spatial
+  types and MySQL 9's VECTOR.
 
 ## SSL / TLS
 
@@ -116,7 +173,7 @@ verifying modes check the server against.
 
 | Mode | Encrypted | Certificate checked against the CA | Host name checked |
 |---|---|---|---|
-| `default` | as negotiated | – | – |
+| `default` | when the server offers it | – | – |
 | `disabled` | no | – | – |
 | `required` | yes | no | no |
 | `verify-ca` | yes | yes | no ¹ |
@@ -125,6 +182,11 @@ verifying modes check the server against.
 ¹ With the MySQL client. The MariaDB client - the one this app downloads - cannot check a CA
 without also checking the host name, except on connections to the local machine, so with it
 `verify-ca` is carried out as full `verify`. It never checks less than you asked for.
+
+`required` and the verifying modes refuse a server without TLS rather than continue unencrypted -
+also with the MariaDB client, which on its own would carry on in plaintext when it is not
+verifying the certificate. `required` checks no certificate, so it protects against eavesdropping
+but not against someone posing as the server; the verifying modes do both.
 
 **Against a MariaDB 11.4+ server, with the MariaDB client, `verify` needs no CA at all.** The
 client verifies the server's certificate through the password exchange instead, and that works
@@ -145,6 +207,10 @@ echo | openssl s_client -starttls mysql -connect HOST:PORT -showcerts
 ```
 
 The CA is the last certificate printed (for MariaDB, the only one).
+
+**PAM and LDAP accounts** sign in through `mysql.exe` like everything else. MySQL's client sends
+such a password only on an encrypted connection (`required` or a verifying mode); MariaDB's
+answers PAM either way it asks. PAM sign-in in this edition is not covered by the automated tests.
 
 ## Client tools (mysql / mysqldump)
 
@@ -199,16 +265,48 @@ wrong row. Exporting a whole table from the tree refuses such a table and points
 the Export tool, which copies bytes exactly. The result of any other query - a join,
 say - still shows a NUL in text as a space, and is exported that way.
 
+MySQL's client does not print a VECTOR column (MySQL 9) as hex at all. A table grid
+asks for it as hex and shows it exactly; in the result of any other query it shows
+as raw bytes.
+
 ## Updates
 
 A few seconds after it starts, the app asks GitHub (`api.github.com`) for the latest release of
 [nobs-sql-editor-powershell](https://github.com/monsama/nobs-sql-editor-powershell/releases). If a newer version exists, a small
-notice with a link appears in the bottom-left corner. Nothing is downloaded or installed. The
-request carries nothing beyond what any web request does: your IP address and a user agent
-naming the app.
+notice with a link appears in the bottom-left corner. Nothing is downloaded or installed.
 
 Hide the notice with its **×** and it stays hidden until the next version. Switch the check off,
 or run it by hand, under **Settings → Updates**.
+
+## Network access
+
+The local server listens on 127.0.0.1 only, and its API answers only requests that carry the
+token of the page it opened. Apart from your database servers and SSH hosts, the app contacts:
+
+| Host | When | What for |
+|---|---|---|
+| `api.github.com` | at start (can be switched off) | the update check above |
+| `downloads.mariadb.org`, `dlm.mariadb.com` or a MariaDB mirror | only when you ask for it in Settings | MariaDB client tools |
+| `dev.mysql.com`, `cdn.mysql.com`, `downloads.mysql.com` | only when you ask for it in Settings | MySQL client tools |
+| `cdn.buymeacoffee.com` | when the interface opens | the image on the "Buy me a coffee" button |
+
+None of these requests carries anything beyond what any web request does: your IP address and a
+user agent. There is no telemetry.
+
+## How it's tested
+
+Every push and pull request runs, on Windows:
+
+- unit tests of the script's functions and of the interface's logic, a parse check of the whole
+  file, and the checks that keep the shared interface in step with the desktop edition;
+- live tests that start the script and drive its API against real MariaDB and MySQL servers,
+  and GUI tests that drive the interface in a headless browser - grid edits, Compare, export and
+  import, the user editor;
+- the same live and GUI tests against every server in [Supported servers](#supported-servers).
+
+They also run weekly, so a change on a vendor's download site is caught before a user meets it.
+Each published release is checked afterwards: the checksums in its notes and in
+`SHA256SUMS.txt` must match the files as published.
 
 ## License
 

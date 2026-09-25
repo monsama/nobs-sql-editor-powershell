@@ -185,7 +185,8 @@ without also checking the host name, except on connections to the local machine,
 
 `required` and the verifying modes refuse a server without TLS rather than continue unencrypted -
 also with the MariaDB client, which on its own would carry on in plaintext when it is not
-verifying the certificate. `required` checks no certificate, so it protects against eavesdropping
+verifying the certificate. Its dump tool, which cannot be given that check, is pinned to the
+certificate the server presented a moment before the export. `required` checks no certificate, so it protects against eavesdropping
 but not against someone posing as the server; the verifying modes do both.
 
 **Against a MariaDB 11.4+ server, with the MariaDB client, `verify` needs no CA at all.** The
@@ -265,9 +266,12 @@ wrong row. Exporting a whole table from the tree refuses such a table and points
 the Export tool, which copies bytes exactly. The result of any other query - a join,
 say - still shows a NUL in text as a space, and is exported that way.
 
-MySQL's client does not print a VECTOR column (MySQL 9) as hex at all. A table grid
-asks for it as hex and shows it exactly; in the result of any other query it shows
-as raw bytes.
+MySQL 8.4's client - the one Settings downloads - does not know MySQL 9's VECTOR type: it
+prints a VECTOR's bytes as they are, with each zero byte as a space. A query on one table asks
+for its VECTOR columns as hex as well and shows them exactly. In a join or an expression the
+zero bytes still show as `20`. MySQL 9's own client prints VECTOR as hex itself, so with its
+`mysql.exe` set for MySQL servers in Settings - or found in a MySQL 9 installation, when none is
+set - every result is exact.
 
 ## Updates
 
@@ -288,7 +292,6 @@ token of the page it opened. Apart from your database servers and SSH hosts, the
 | `api.github.com` | at start (can be switched off) | the update check above |
 | `downloads.mariadb.org`, `dlm.mariadb.com` or a MariaDB mirror | only when you ask for it in Settings | MariaDB client tools |
 | `dev.mysql.com`, `cdn.mysql.com`, `downloads.mysql.com` | only when you ask for it in Settings | MySQL client tools |
-| `cdn.buymeacoffee.com` | when the interface opens | the image on the "Buy me a coffee" button |
 
 None of these requests carries anything beyond what any web request does: your IP address and a
 user agent. There is no telemetry.

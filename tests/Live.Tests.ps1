@@ -600,6 +600,18 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
                      "INSERT INTO $gs.t (id, a) VALUES (1, 5), (2, 7)")) {
         $sr = Api '/api/exec' @{ conn = $conn; sql = $s }; if (-not $sr.ok) { "  note  setup: $($sr.error)" }
     }
+    # An export on ssl=required is encrypted or does not happen. mariadb-dump has no init-command
+    # and went on in plaintext against a server without TLS; it is pinned to the server's
+    # certificate now (Get-ServerCertFingerprint), and MySQL's mysqldump insists by itself.
+    $reqDir = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-req-$PID"
+    Remove-Item $reqDir -Recurse -Force -ErrorAction SilentlyContinue
+    $reqConn = $conn.Clone(); $reqConn.ssl = 'required'
+    $re = Api '/api/export' @{ conn = $reqConn; dbs = @('nobs_test'); folder = $reqDir; mode = 'db'; options = @{ charset = 'utf8mb4'; what = 'structure' } }
+    $reqWrote = @(Get-ChildItem $reqDir -Filter *.sql -ErrorAction SilentlyContinue).Count -gt 0
+    if ($caps.tls) { Check ($re.ok -and $reqWrote -and ($re | ConvertTo-Json -Compress) -notmatch 'FAILED') 'an export on ssl=required goes through where the server has TLS' ($re | ConvertTo-Json -Compress) }
+    else { Check ((-not $reqWrote) -and ($re | ConvertTo-Json -Compress) -match 'no TLS|SSL') 'an export on ssl=required is refused by a server without TLS' ($re | ConvertTo-Json -Compress) }
+    Remove-Item $reqDir -Recurse -Force -ErrorAction SilentlyContinue
+
     $genDir = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-gen-$PID"
     Remove-Item $genDir -Recurse -Force -ErrorAction SilentlyContinue
     $ge = Api '/api/export' @{ conn = $conn; dbs = @($gs); folder = $genDir; mode = 'db'

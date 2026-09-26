@@ -261,11 +261,14 @@ eq(L.litAs('0x41', null), '0x41', 'with the type unknown it is lit(), as before'
 eq(/keyWhere\(t,ri,bc,kt\)/.test(applyBody), true, 'applyChanges finds rows through keyWhere');
 eq(/litAs\(v,bc\?bc\[ci\]:null\)/.test(extractFunction(src, 'keyWhere')), true, 'which writes row keys by column type');
 eq(/litAs\(byRow\[ri\]\[ci\]/.test(applyBody), true, 'applyChanges writes changed cells by column type');
-for (const f of ['insGrid', 'insSel', 'exportFull']) {
+for (const f of ['insertsText', 'exportFull']) {
   eq(extractFunction(src, f).includes('litAs('), true, f + ' writes rows by column type');
 }
+for (const f of ['insGrid', 'insSel', 'copyInserts']) {
+  eq(extractFunction(src, f).includes('insertsText('), true, f + ' writes its INSERTs through insertsText');
+}
 // XML output turns a NUL inside text into a space, so exports of a table refuse such a table.
-for (const f of ['insSel', 'csvSel', 'exportFull']) {
+for (const f of ['insSel', 'csvSel', 'exportFull', 'copyInserts']) {
   eq(extractFunction(src, f).includes('refuseNulTextExport('), true, f + ' checks the table for NUL in text first');
 }
 

@@ -11,7 +11,7 @@ $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-    $n.Name -in @('Test-ApiToken','Test-ToolPathName','Test-DataPathBad','Test-ReleasePageOk','Resolve-ConnSecrets','Load-Conns','Add-ConnObjs','Get-EndpointKey','Get-SavedDbPw','Unprotect-SshPw','Api-ConnSave','Save-Conns','Use-FileLock','Protect-SshPw','Test-SavedReadOnly','Add-DumpNames')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
+    $n.Name -in @('Test-ApiToken','Test-ToolPathName','Test-DataPathBad','Test-ReleasePageOk','Resolve-ConnSecrets','Load-Conns','Add-ConnObjs','Get-EndpointKey','Get-SavedDbPw','Unprotect-SshPw','Api-ConnSave','Save-Conns','Use-FileLock','Protect-SshPw','Test-SavedReadOnly','Add-DumpNames','Get-UiZoom')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $fail = 0
 function Check($cond, $label, $detail) { if ($cond) { "  ok    $label" } else { "  FAIL  $label$(if($detail){" -> $detail"})"; $script:fail++ } }
@@ -93,6 +93,12 @@ try {
     Check (-not (Test-SavedReadOnly $asked)) 'one that is not leaves it to the page'
     Check (-not (Test-SavedReadOnly ([pscustomobject]@{ host = 'other.example'; port = '3306'; user = 'app' }))) 'another address: the page decides'
 } finally { Remove-Item -LiteralPath $script:ConnFile -Force -ErrorAction SilentlyContinue }
+
+"-- the interface zoom --"
+Check ((Get-UiZoom '1.25') -eq 1.25) 'a zoom of 1.25 is read with its point'
+Check ($null -eq (Get-UiZoom '1,25')) 'a comma is not taken for 125'
+Check ($null -eq (Get-UiZoom '3')) 'more than 2 is refused'
+Check ($null -eq (Get-UiZoom 'big')) 'so is text'
 
 "-- dump names --"
 $a = Add-DumpNames @('--no-data') 'C:\out.sql' @('--result-file=C:\evil', 't')

@@ -3753,9 +3753,18 @@ function Api-GetConfig {
     $tpl = if($cfg -and $cfg.mariadb_download_url_template){[string]$cfg.mariadb_download_url_template}else{''}
     $mbm = if($cfg -and $cfg.mysql_bin_mysql){[string]$cfg.mysql_bin_mysql}else{''}
     $dbm = if($cfg -and $cfg.mysqldump_bin_mysql){[string]$cfg.mysqldump_bin_mysql}else{''}
-    '{"ok":true,"config":{"mysql_bin":'+(J-Str $mb)+',"mysqldump_bin":'+(J-Str $db)+',"mysql_bin_mysql":'+(J-Str $mbm)+',"mysqldump_bin_mysql":'+(J-Str $dbm)+',"mariadb_download_url_template":'+(J-Str $tpl)+'},"mariadbDownloadUrlDefault":'+(J-Str $script:DefaultMariaDbUrlTemplate)+'}'
+    $zoom = if($cfg -and $cfg.ui_zoom){[string]$cfg.ui_zoom}else{''}
+    '{"ok":true,"config":{"mysql_bin":'+(J-Str $mb)+',"mysqldump_bin":'+(J-Str $db)+',"mysql_bin_mysql":'+(J-Str $mbm)+',"mysqldump_bin_mysql":'+(J-Str $dbm)+',"mariadb_download_url_template":'+(J-Str $tpl)+',"ui_zoom":'+(J-Str $zoom)+'},"mariadbDownloadUrlDefault":'+(J-Str $script:DefaultMariaDbUrlTemplate)+'}'
 }
 # Endpoint: save tool paths from the Settings dialog.
+# The interface zoom (Settings -> General), a factor from 0.5 to 2 - read with a point for its
+# decimal, whatever the Windows number format - or $null.
+function Get-UiZoom { param([string]$v)
+    $z = 0.0
+    if (-not [double]::TryParse(([string]$v).Trim(), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$z)) { return $null }
+    if ($z -lt 0.5 -or $z -gt 2) { return $null }
+    return $z
+}
 function Api-SaveConfig { param($data)
     $cfg = Load-Cfg; if(-not $cfg){ $cfg=[pscustomobject]@{} }
     # Merge the keys that were actually sent instead of rebuilding the object. The Settings
@@ -3765,12 +3774,13 @@ function Api-SaveConfig { param($data)
         # A tool path is checked as Settings' Save checks it, and the download address has to be
         # https - neither can be set to something else by a request that skips the dialog.
         $kinds = @{ mysql_bin='mysql'; mysqldump_bin='mysqldump'; mysql_bin_mysql='mysql'; mysqldump_bin_mysql='mysqldump' }
-        foreach($k in @('mysql_bin','mysqldump_bin','mysql_bin_mysql','mysqldump_bin_mysql','mariadb_download_url_template')){
+        foreach($k in @('mysql_bin','mysqldump_bin','mysql_bin_mysql','mysqldump_bin_mysql','mariadb_download_url_template','ui_zoom')){
             $prop = $data.config.PSObject.Properties[$k]
             if(-not $prop){ continue }
             $v = ([string]$prop.Value).Trim()
             if($v -and $kinds.ContainsKey($k)){ $e = Test-ToolPathName $v $kinds[$k]; if($e){ return '{"ok":false,"error":'+(J-Str "$k : $e")+'}' } }
             if($v -and $k -eq 'mariadb_download_url_template' -and $v -notmatch '^https://'){ return '{"ok":false,"error":"the download address has to start with https://"}' }
+            if($v -and $k -eq 'ui_zoom' -and -not (Get-UiZoom $v)){ return '{"ok":false,"error":"the zoom has to be a number from 0.5 to 2"}' }
             $cfg | Add-Member -NotePropertyName $k -NotePropertyValue $v -Force
         }
     }
@@ -5135,7 +5145,7 @@ body.schemas-folded #schemas{display:none} #objects{flex:1;overflow:auto}
 .tabpane.edfolded-editor [id^="ew_"]{display:none !important}
 /* With the results folded away the editor takes the pane, whatever height a drag last gave it. */
 .tabpane.edfolded-results [id^="ew_"]{flex:1 1 auto !important;height:auto !important}
- .hl,.editor{position:absolute;inset:0;margin:0;padding:8px;font-family:var(--mono);font-size:13px;line-height:1.4;white-space:pre;overflow:auto;border:0;tab-size:4}
+ .hl,.editor{position:absolute;inset:0;margin:0;padding:8px;font-family:var(--mono);font-size:var(--edfs,13px);line-height:1.4;white-space:pre;overflow:auto;border:0;tab-size:4}
  .hl{pointer-events:none;z-index:1;color:var(--fg)} .editor{z-index:2;color:transparent;background:transparent;caret-color:var(--fg);resize:none;outline:none}
  .hl.fm{z-index:0;color:transparent} .fm mark{background:var(--hit);color:transparent;border-radius:var(--r-s)} .fm mark.on{background:var(--accent);opacity:.45}
  .findbar{position:absolute;top:4px;right:20px;z-index:5;display:flex;flex-direction:column;gap:4px;padding:5px 6px;background:var(--panel);border:1px solid var(--bd);border-radius:var(--r-m);box-shadow:0 3px 10px rgba(0,0,0,.25);font-size:12px} .findbar .frow{display:flex;gap:4px;align-items:center} .findbar input:not([type]){width:190px} .findbar label{display:inline-flex;align-items:center;gap:2px;color:var(--muted);cursor:pointer} .findbar .frn{min-width:64px;text-align:right}
@@ -5151,7 +5161,7 @@ body.schemas-folded #schemas{display:none} #objects{flex:1;overflow:auto}
  .c-str{color:var(--str)} .c-kw{color:var(--kw);font-weight:600} .c-com{color:var(--com);font-style:italic} .c-num{color:var(--num)}
  .toolbar{padding:4px 8px;background:var(--panel);border-bottom:1px solid var(--bd2);display:flex;gap:9px;align-items:center;flex-wrap:wrap}
  .tbsep{width:1px;align-self:stretch;background:var(--bd);margin:2px 8px}
- .result{flex:1;overflow:auto} table.grid{border-collapse:collapse;width:100%;table-layout:fixed} .grid th .rz{position:absolute;left:-5px;top:0;width:9px;height:100%;cursor:col-resize;z-index:3} .grid th:last-child .rz{left:-9px} /* the last edge's handle stays inside the grid: centred on it, it stuck out past the right side and gave every narrow result a scrollbar for nothing */ .grid th .rz:hover,.grid th .rz.drag{background:var(--accent);opacity:.55}
+ .result{flex:1;overflow:auto} table.grid{border-collapse:collapse;width:100%;table-layout:fixed;font-size:var(--gridfs,13px)} .grid th .rz{position:absolute;left:-5px;top:0;width:9px;height:100%;cursor:col-resize;z-index:3} .grid th:last-child .rz{left:-9px} /* the last edge's handle stays inside the grid: centred on it, it stuck out past the right side and gave every narrow result a scrollbar for nothing */ .grid th .rz:hover,.grid th .rz.drag{background:var(--accent);opacity:.55}
  table.grid th{position:sticky;top:0;background:var(--gridh);border:none;border-right:1px solid var(--bd);box-shadow:inset 0 -2px 0 var(--bd);padding:3px 8px;text-align:left;white-space:nowrap;z-index:1;transform:translateZ(0);will-change:transform}
 table.grid td{border:none;border-right:1px solid var(--bd2);border-bottom:1px solid var(--bd2);padding:2px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 table.grid td:first-child{text-align:center;vertical-align:middle;padding:0}
@@ -5537,7 +5547,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  .setrc{flex:none;margin-left:auto;display:flex;gap:6px;align-items:center}
  .setrc input[type=checkbox]{width:16px;height:16px;margin:0}
  /* the buttons down the right of a settings card are one width, so they line up */
- .setcard .setrc>button{width:150px;justify-content:center}
+ .setcard .setrc>button,.setcard .setrc>select{width:150px;justify-content:center}
  /* every field and list in a window as tall as its buttons; in the table designer's grid a little
     less, and the same for both */
  .box :is(input:not([type=checkbox],[type=radio],[type=file],[type=hidden],[type=range]),select):not(table *){height:28px}
@@ -5871,6 +5881,10 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
   <div class="setgroup">Appearance and help</div>
   <div class="setcard">
    <div class="setrow"><div class="setrl"><div class="setrt">Theme</div><div class="setnote">Light or dark, remembered on this computer.</div></div><div class="setrc"><button class="sm" title="Toggle light / dark theme" onclick="toggleTheme()">Switch theme</button></div></div>
+   <div class="setrow"><div class="setrl"><div class="setrt">Editor text size</div><div class="setnote">The SQL editor. Ctrl + mouse wheel in the editor changes it as well.</div></div><div class="setrc"><select id="setEdFs" onchange="uiSizeSet('ed',this.value)"><option value="10">10 px</option><option value="11">11 px</option><option value="12">12 px</option><option value="13">13 px (default)</option><option value="14">14 px</option><option value="15">15 px</option><option value="16">16 px</option><option value="17">17 px</option><option value="18">18 px</option><option value="19">19 px</option><option value="20">20 px</option><option value="21">21 px</option><option value="22">22 px</option></select></div></div>
+   <div class="setrow"><div class="setrl"><div class="setrt">Results text size</div><div class="setnote">The rows of every result grid.</div></div><div class="setrc"><select id="setGridFs" onchange="uiSizeSet('grid',this.value)"><option value="10">10 px</option><option value="11">11 px</option><option value="12">12 px</option><option value="13">13 px (default)</option><option value="14">14 px</option><option value="15">15 px</option><option value="16">16 px</option><option value="17">17 px</option><option value="18">18 px</option></select></div></div>
+   <div class="setrow"><div class="setrl"><div class="setrt">Interface zoom</div><div class="setnote" id="setZoomNote">Everything in the window, larger or smaller, as Ctrl + and Ctrl - in a browser.</div></div><div class="setrc"><select id="setZoom" onchange="uiZoomSet(this.value)"><option value="0.8">80%</option><option value="0.9">90%</option><option value="1">100% (default)</option><option value="1.1">110%</option><option value="1.25">125%</option><option value="1.5">150%</option><option value="1.75">175%</option></select></div></div>
+   <div class="setrow"><div class="setrl"><div class="setrt">Text sizes and zoom</div><div class="setnote">Back to 13 px in the editor and the results, and 100%.</div></div><div class="setrc"><button class="sm" onclick="uiSizesReset()">Reset to defaults</button></div></div>
    <div class="setrow"><div class="setrl"><div class="setrt">Keyboard shortcuts</div><div class="setnote">Every shortcut in the editor, the grids and the dialogs.</div></div><div class="setrc"><button class="sm" title="Keyboard shortcuts" onclick="show('mShortcuts')">Show</button></div></div>
    <div class="setrow"><div class="setrl"><div class="setrt">About</div><div class="setnote">Version, license and project information.</div></div><div class="setrc"><button class="sm" title="Version, license and project information" onclick="openAbout()">About</button></div></div>
   </div>
@@ -6665,7 +6679,7 @@ async function resetLayout(){
 }
 async function clearAllData(){if(!(await ask('Clear ALL app data?\n\nThis permanently deletes:\n\u2022 saved connections (host / user / password)\n\u2022 the query library\n\u2022 caches, accent colors, environment labels, history and session tabs.\n\nThis cannot be undone.')))return;const n=_clearKeys(true);try{await api('/api/conn-clear');}catch(e){}try{await api('/api/lib-clear');}catch(e){}log('Cleared '+n+' local entr'+(n===1?'y':'ies')+' + saved connections + library. Reloading...');setTimeout(()=>location.reload(),500);}
 function setPage(p){const sv=document.querySelector('#mSettings .setfoot .go');if(sv)sv.style.visibility=p==='tools'?'':'hidden';document.querySelectorAll('#mSettings .setnav button').forEach(b=>b.classList.toggle('on',b.dataset.p===p));document.querySelectorAll('#mSettings .setpage').forEach(s=>s.classList.toggle('on',s.dataset.p===p));}
-async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}if($('cfgUpdateCheck'))$('cfgUpdateCheck').checked=updateCheckOn();if($('cfgToastMs'))$('cfgToastMs').value=String(toastMs());show('mSettings');
+async function openSettings(){$('cfgLog').textContent='';uiSizesApply();try{const r=await api('/api/get-config');const c=(r&&r.config)||{};uiZoomShow(c);$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}if($('cfgUpdateCheck'))$('cfgUpdateCheck').checked=updateCheckOn();if($('cfgToastMs'))$('cfgToastMs').value=String(toastMs());show('mSettings');
  // The first call answers from what is remembered about each binary; the second re-reads them and
  // updates the cards if a tool was replaced behind the app's back.
  await refreshToolsStatus();setTimeout(()=>refreshToolsStatus(false,true),50);}
@@ -6821,6 +6835,49 @@ function buildMenuItems(container,items,local){items.forEach(it=>{if(it==='-'){c
  }else{d.onclick=()=>{$('ctx').style.display='none';it[1]();};}
  container.appendChild(d);});}
 document.addEventListener('click',(e)=>{$('ctx').style.display='none';const cp=$('colPicker');if(cp&&cp.style.display==='block'&&!cp.contains(e.target))cp.style.display='none';const cm=$('copyMenu');if(cm&&cm.style.display==='block'&&!cm.contains(e.target))cm.style.display='none';});
+
+// Ctrl+mouse-wheel font zoom on any textarea, same convention as Workbench - delegated on
+// document so it works on every SQL query tab's editor (created dynamically per tab) and the
+// cell-edit textarea alike, without wiring a listener onto each one individually. The SQL editor
+// is actually TWO stacked elements sharing one font-size (an invisible <textarea> for input/
+// caret, and a <pre> underneath rendering the syntax-highlighted text) - both have to change
+// together, in lockstep, or the highlighted text drifts out of alignment with the real cursor.
+document.addEventListener('wheel',(e)=>{
+ if(!e.ctrlKey)return;
+ const ta=e.target.closest('textarea');
+ if(!ta)return;
+ e.preventDefault();
+ const cur=parseFloat(getComputedStyle(ta).fontSize)||13;
+ const next=Math.max(9,Math.min(28,Math.round(cur+(e.deltaY<0?1:-1))));
+ if(next===cur)return;
+ // In the SQL editor it is the editor's text size (Settings -> General), for every tab and the
+ // next start; in a cell's editor, that box alone.
+ if(ta.id.indexOf('ed_')===0){uiSizeSet('ed',next);return;}
+ ta.style.fontSize=next+'px';
+},{passive:false});
+// Text sizes and the interface zoom (Settings -> General). The editor's and the results' sizes are
+// kept on this computer, as the theme is; the zoom in the config, as the PowerShell edition needs it
+// before its window opens.
+const UI_SIZES={ed:[10,22,13],grid:[10,18,13]};
+function uiSizeKey(k){return k==='ed'?'edFontSize':'gridFontSize';}
+function uiSizeGet(k){const [lo,hi,d]=UI_SIZES[k];try{const v=+localStorage.getItem(uiSizeKey(k));return v>=lo&&v<=hi?v:d;}catch(e){return d;}}
+function uiSizeSet(k,v){const [lo,hi,d]=UI_SIZES[k];v=Math.max(lo,Math.min(hi,Math.round(+v)||d));try{localStorage.setItem(uiSizeKey(k),String(v));}catch(e){}uiSizesApply();}
+function uiSizesApply(){const r=document.documentElement.style;r.setProperty('--edfs',uiSizeGet('ed')+'px');r.setProperty('--gridfs',uiSizeGet('grid')+'px');
+ const a=$('setEdFs'),b=$('setGridFs');if(a)a.value=String(uiSizeGet('ed'));if(b)b.value=String(uiSizeGet('grid'));
+ if(typeof tabs!=='undefined')tabs.forEach(t=>{try{syncHl(t.id);}catch(e){}});}
+async function uiZoomSet(z){z=Math.max(0.5,Math.min(2,+z||1));const r=await api('/api/save-config',{config:{ui_zoom:String(z)}});
+ if(!r||!r.ok){toast('The zoom was not saved: '+((r&&r.error)||''),true);return;}
+ if(window.__TAURI__){try{await window.__TAURI__.core.invoke('set_zoom',{req:{zoom:z}});}catch(e){toast('Zoom: '+e,true);}
+  // The window's size in the page's units changed with it: an open dialog is centred again, rather
+  // than left where the old size put it.
+  setTimeout(()=>document.querySelectorAll('.modal.floating.show').forEach(m=>{floatCenterX(m.id);floatCenterY(m.id);}),120);}
+ else toast('Saved - the zoom applies from the next start of the app.','ok');}
+// Text sizes and zoom back to how the app comes.
+async function uiSizesReset(){try{localStorage.removeItem('edFontSize');localStorage.removeItem('gridFontSize');}catch(e){}uiSizesApply();
+ const s=$('setZoom');if(s)s.value='1';await uiZoomSet(1);log('Text sizes and zoom are back to their defaults.');}
+function uiZoomShow(c){const s=$('setZoom');if(!s)return;const z=+(c&&c.ui_zoom)||1;s.value=String(z);if(s.value!==String(z))s.value='1';
+ const n=$('setZoomNote');if(n)n.textContent='Everything in the window, larger or smaller, as Ctrl + and Ctrl - in a browser.'+(window.__TAURI__?'':' From the next start of the app.');}
+uiSizesApply();
 
 // syntax highlight (single-pass tokenizer)
 const KW=RESERVED;
@@ -13239,7 +13296,16 @@ function Start-AppWindow {
         # which database server gets connected to. A dedicated profile is not enough on its own:
         # an extension installed by company policy (ExtensionInstallForcelist) lands in every
         # profile, new ones included, which is how one turned up in these fields.
-        $script:BrowserProcess = Start-Process $exe -ArgumentList @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-extensions","--disable-save-password-bubble","--disable-session-crashed-bubble","--disable-features=AutofillServerCommunication,Translate","--start-maximized","--window-position=0,0","--window-size=$w,$h") -PassThru
+        # The zoom chosen in Settings, as Edge's scale factor: that replaces Windows' own display
+        # scaling, so it is multiplied by it. Written with a point, whatever the number format.
+        $zoomArg = @()
+        $cfgz = Load-Cfg; $z = if ($cfgz) { Get-UiZoom ([string]$cfgz.ui_zoom) } else { $null }
+        if ($z -and $z -ne 1) {
+            $sys = 1.0
+            try { Add-Type -Namespace Nobs -Name Dpi -MemberDefinition '[System.Runtime.InteropServices.DllImport("user32.dll")] public static extern uint GetDpiForSystem();' -ErrorAction SilentlyContinue; $sys = [Nobs.Dpi]::GetDpiForSystem() / 96.0 } catch { }
+            $zoomArg = @('--force-device-scale-factor=' + ($z * $sys).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture))
+        }
+        $script:BrowserProcess = Start-Process $exe -ArgumentList (@($zoomArg) + @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-extensions","--disable-save-password-bubble","--disable-session-crashed-bubble","--disable-features=AutofillServerCommunication,Translate","--start-maximized","--window-position=0,0","--window-size=$w,$h")) -PassThru
         return $true
     }
     return $false

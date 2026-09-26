@@ -222,7 +222,7 @@ The CA is the last certificate printed (for MariaDB, the only one).
 
 **PAM and LDAP accounts** sign in through `mysql.exe` like everything else. MySQL's client is allowed to
 send such a password only where the server has been verified (a verifying mode) or, on a network
-you trust, on `required` when the saved connection has **PAM / LDAP sign-in** ticked - `required`
+you trust, on `required` when the saved connection has **This account signs in through PAM or LDAP** ticked - `required`
 checks no certificate, so whoever sits in between could pose as the server and read it. MariaDB's
 client answers PAM whenever it is asked; it has no setting to refuse. PAM sign-in in this edition is not covered by the automated tests.
 

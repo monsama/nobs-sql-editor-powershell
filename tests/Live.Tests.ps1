@@ -1205,6 +1205,10 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
         $roleSql = if ($caps.roles) { @("CREATE ROLE $role", "GRANT SELECT ON nobs_test.* TO $role") } else { @() }
         $roleGrant = if ($caps.roles) { @("GRANT $role TO 'nobs_xfer_plain'@'%'", $(if ($isMaria) { "SET DEFAULT ROLE $role FOR 'nobs_xfer_plain'@'%'" } else { "SET DEFAULT ROLE $role TO 'nobs_xfer_plain'@'%'" })) } else { @() }
         $lock = if ($caps.lock) { ' ACCOUNT LOCK' } else { '' }
+        # MariaDB 10.2 on the Windows CI runner now and then marks a grant table as crashed in the
+        # middle of a run (ERROR 1194) - the server's defect (see start-compat-servers.ps1). They are
+        # repaired before the accounts are made; on any other MariaDB this changes nothing.
+        if ($isMaria) { $null = Api '/api/script' @{ conn = $conn; sql = 'REPAIR TABLE mysql.columns_priv, mysql.tables_priv' } }
         $setup = Api '/api/script' @{ conn = $conn; sql = (@($roleSql) + @(
             "CREATE USER 'nobs_xfer_plain'@'%' IDENTIFIED BY 'Plain-pw-1'", "GRANT INSERT ON nobs_test.* TO 'nobs_xfer_plain'@'%'") + @($roleGrant) + @(
             "CREATE USER 'nobs_xfer_cols'@'localhost' IDENTIFIED BY 'Cols-pw-2' WITH MAX_QUERIES_PER_HOUR 100$lock",

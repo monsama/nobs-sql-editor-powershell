@@ -11,7 +11,7 @@ $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-    $n.Name -in @('Test-ApiToken','Test-ToolPathName','Test-DataPathBad','Test-ReleasePageOk','Resolve-ConnSecrets','Load-Conns','Add-ConnObjs','Get-EndpointKey','Get-SavedDbPw','Unprotect-SshPw')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
+    $n.Name -in @('Test-ApiToken','Test-ToolPathName','Test-DataPathBad','Test-ReleasePageOk','Resolve-ConnSecrets','Load-Conns','Add-ConnObjs','Get-EndpointKey','Get-SavedDbPw','Unprotect-SshPw','Api-ConnSave','Save-Conns','Use-FileLock','Protect-SshPw')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $fail = 0
 function Check($cond, $label, $detail) { if ($cond) { "  ok    $label" } else { "  FAIL  $label$(if($detail){" -> $detail"})"; $script:fail++ } }
@@ -67,6 +67,22 @@ try {
     $typed = [pscustomobject]@{ savedName = 'prod'; host = 'db.example'; port = '3306'; user = 'app'; password = 'typed' }
     Check ((Resolve-ConnSecrets $typed).password -eq 'typed') 'a typed password is used as typed'
     Check (-not (Resolve-ConnSecrets ([pscustomobject]@{ savedName = 'nope'; host = 'db.example'; port = '3306'; user = 'app' })).password) 'an unknown name gets nothing'
+
+    "-- saving keeps a password only with its address --"
+    $base = [pscustomobject]@{ host = 'db.example'; port = '3306'; user = 'app'; ssl = 'default'; password = 'first'; sshHost = ''; sshPort = ''; sshUser = '' }
+    $pwOf = { param($n) Get-SavedDbPw (Load-Conns | Where-Object { $_.name -eq $n } | Select-Object -First 1) }
+    $null = Api-ConnSave ([pscustomobject]@{ name = 'c1'; conn = $base; savepw = $true })
+    Check ((& $pwOf 'c1') -eq 'first') 'a typed password is saved'
+    $empty = $base.PSObject.Copy(); $empty.password = ''
+    $null = Api-ConnSave ([pscustomobject]@{ name = 'c1'; conn = $empty; savepw = $true })
+    Check ((& $pwOf 'c1') -eq 'first') 'saved again with the box empty: kept'
+    $null = Api-ConnSave ([pscustomobject]@{ name = 'c2'; conn = $empty; savepw = $true; keepFrom = 'c1' })
+    Check ((& $pwOf 'c2') -eq 'first') 'a copy of it to the same address takes it along'
+    $moved = $empty.PSObject.Copy(); $moved.host = 'other.example'
+    $null = Api-ConnSave ([pscustomobject]@{ name = 'c1'; conn = $moved; savepw = $true })
+    Check (-not (& $pwOf 'c1')) 'moved to another address: dropped'
+    $null = Api-ConnSave ([pscustomobject]@{ name = 'c2'; conn = $base; savepw = $false })
+    Check (-not (& $pwOf 'c2')) 'not to be saved: none'
 } finally { Remove-Item -LiteralPath $script:ConnFile -Force -ErrorAction SilentlyContinue }
 
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }

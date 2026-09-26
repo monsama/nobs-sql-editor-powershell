@@ -11,7 +11,7 @@ $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-    $n.Name -in @('Test-ApiToken','Test-ToolPathName','Test-DataPathBad','Test-ReleasePageOk','Resolve-ConnSecrets','Load-Conns','Add-ConnObjs','Get-EndpointKey','Get-SavedDbPw','Unprotect-SshPw','Api-ConnSave','Save-Conns','Use-FileLock','Protect-SshPw')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
+    $n.Name -in @('Test-ApiToken','Test-ToolPathName','Test-DataPathBad','Test-ReleasePageOk','Resolve-ConnSecrets','Load-Conns','Add-ConnObjs','Get-EndpointKey','Get-SavedDbPw','Unprotect-SshPw','Api-ConnSave','Save-Conns','Use-FileLock','Protect-SshPw','Test-SavedReadOnly','Add-DumpNames')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $fail = 0
 function Check($cond, $label, $detail) { if ($cond) { "  ok    $label" } else { "  FAIL  $label$(if($detail){" -> $detail"})"; $script:fail++ } }
@@ -83,6 +83,19 @@ try {
     Check (-not (& $pwOf 'c1')) 'moved to another address: dropped'
     $null = Api-ConnSave ([pscustomobject]@{ name = 'c2'; conn = $base; savepw = $false })
     Check (-not (& $pwOf 'c2')) 'not to be saved: none'
+
+    "-- read-only as the saved connections say --"
+    $ro = [pscustomobject]@{ host = 'ro.example'; port = '3306'; user = 'app'; ssl = 'default'; password = ''; sshHost = ''; sshPort = ''; sshUser = '' }
+    $null = Api-ConnSave ([pscustomobject]@{ name = 'r1'; conn = $ro; savepw = $false; readonly = $true })
+    $asked = [pscustomobject]@{ host = 'RO.example '; port = 3306; user = 'app' }
+    Check (Test-SavedReadOnly $asked) 'every saved connection to it is read-only'
+    $null = Api-ConnSave ([pscustomobject]@{ name = 'r2'; conn = $ro; savepw = $false; readonly = $false })
+    Check (-not (Test-SavedReadOnly $asked)) 'one that is not leaves it to the page'
+    Check (-not (Test-SavedReadOnly ([pscustomobject]@{ host = 'other.example'; port = '3306'; user = 'app' }))) 'another address: the page decides'
 } finally { Remove-Item -LiteralPath $script:ConnFile -Force -ErrorAction SilentlyContinue }
+
+"-- dump names --"
+$a = Add-DumpNames @('--no-data') 'C:\out.sql' @('--result-file=C:\evil', 't')
+Check (($a -join ' ') -eq '--no-data --result-file=C:\out.sql -- --result-file=C:\evil t') 'names come after "--", the result file before it' ($a -join ' ')
 
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }

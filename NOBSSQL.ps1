@@ -2261,6 +2261,12 @@ function Get-MySqlGeneratedTables { param($conn, $dbs, $excl, [string]$Dump)
     if (-not $r.ok) { return @() }
     return @($r.rows | ForEach-Object { "$($_[0]).$($_[1])" } | Where-Object { -not $excl.ContainsKey($_) })
 }
+# The database and table names go after "--", so a name that starts with "-" is a name and not
+# another option (a database called "--result-file=C:\x" would otherwise say where to write).
+# Everything else comes before, --result-file included.
+function Add-DumpNames { param([object[]]$Args0, [string]$ResultFile, [object[]]$Names)
+    return @($Args0) + @("--result-file=$ResultFile", '--') + @($Names | ForEach-Object { [string]$_ })
+}
 function Api-Export { param($conn,$data)
     $dump = Get-ToolFor $conn 'mysqldump'
     if(-not $dump -or -not (Test-Path $dump)){ return '{"ok":false,"error":"mysqldump.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
@@ -2325,7 +2331,7 @@ function Api-Export { param($conn,$data)
             if(-not $o.createdb){$a+='--no-create-db'}
             foreach($k in $excl.Keys){ $a+=("--ignore-table="+$k) }
             # The names after "--", so one that starts with "-" is a name and not another option.
-            $a+="--result-file=$file"; $a+='--'; $a+=$dbs
+            $a = Add-DumpNames $a $file $dbs
             $r=Run-Proc $dump $a $null $jobId
             if($job.Cancelled){
                 if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
@@ -2349,7 +2355,7 @@ function Api-Export { param($conn,$data)
                 if($o.adddropdb){$a+='--add-drop-database'}; if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
                 if(-not $o.createdb){$a+='--no-create-db'}
                 foreach($k in $excl.Keys){ if($k -like ($d+'.*')){ $a+=("--ignore-table="+$k) } }
-                $a+="--result-file=$file"; $a+='--'; $a+=$d
+                $a = Add-DumpNames $a $file @($d)
                 $r=Run-Proc $dump $a $null $jobId
                 if($job.Cancelled){
                     if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
@@ -2382,8 +2388,7 @@ function Api-Export { param($conn,$data)
                     if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
                     # The excluded tables are left out; when they are most of the database, the
                     # wanted ones are named instead, which keeps the command line short.
-                    $a+="--result-file=$whole"
-                    if($skipped.Count -gt $wanted.Count){ $a+='--'; $a+=$d; $a+=$wanted } else { foreach($t in $skipped){ $a+=("--ignore-table=$d.$t") }; $a+='--'; $a+=$d }
+                    if($skipped.Count -gt $wanted.Count){ $a = Add-DumpNames $a $whole (@($d) + @($wanted)) } else { foreach($t in $skipped){ $a+=("--ignore-table=$d.$t") }; $a = Add-DumpNames $a $whole @($d) }
                     $r=Run-Proc $dump $a $null $jobId
                     try {
                         if($job.Cancelled){ [void]$log.Add("CANCELLED $d"); break dbloop }
@@ -2410,7 +2415,7 @@ function Api-Export { param($conn,$data)
                     $file=Join-Path $folder "$dsafe.routines_events$stamp.sql"
                     $a=@()+$common+@('--no-create-info','--no-data','--no-create-db','--skip-triggers')
                     if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
-                    $a+="--result-file=$file"; $a+='--'; $a+=$d
+                    $a = Add-DumpNames $a $file @($d)
                     $r=Run-Proc $dump $a $null $jobId
                     # Cancelling kills mysqldump, which comes back as exit -1 with nothing on
                     # stderr. Without this check that fell through to the generic FAILED branch

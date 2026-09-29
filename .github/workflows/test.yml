@@ -163,6 +163,11 @@ jobs:
         shell: pwsh
         run: ./tests/GridSave.Tests.ps1 ./NOBSSQL.ps1
 
+      # "Set empty" only where the column type has an empty value.
+      - name: Run set-empty tests
+        shell: pwsh
+        run: ./tests/CanEmpty.Tests.ps1 ./NOBSSQL.ps1
+
       # Autocomplete context, and the JSON and Excel exports of a result.
       - name: Run editor tools tests
         shell: pwsh

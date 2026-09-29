@@ -316,7 +316,7 @@ release lists in `SHA256SUMS.txt`. A mismatch installs nothing. The script you r
 the download arrived whole and is the file that was published; it is not a signature.
 
 Hide the notice with its **×** and it stays hidden until the next version. Switch the check off,
-or run it by hand, under **Settings → General**.
+or run it by hand, under **Settings → Updates**.
 
 ## Network access
 

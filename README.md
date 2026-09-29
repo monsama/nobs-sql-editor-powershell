@@ -1,4 +1,4 @@
-# NO-BS SQL Editor - PowerShell edition
+# NOBS SQL Editor - PowerShell edition
 
 [![Latest release](https://img.shields.io/github/v/release/monsama/nobs-sql-editor-powershell)](https://github.com/monsama/nobs-sql-editor-powershell/releases/latest)
 [![test](https://github.com/monsama/nobs-sql-editor-powershell/actions/workflows/test.yml/badge.svg)](https://github.com/monsama/nobs-sql-editor-powershell/actions/workflows/test.yml)

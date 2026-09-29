@@ -19,6 +19,7 @@ pwsh -NoProfile -File tests/UserSql.Tests.ps1            ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ViewIndices.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ToolChoice.Tests.ps1         ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UpdateCheck.Tests.ps1        ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/RunChecks.Tests.ps1          ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/TableBinding.Tests.ps1       ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/GridSave.Tests.ps1           ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/EditorTools.Tests.ps1        ./NOBSSQL.ps1
@@ -44,6 +45,7 @@ All but the last need nothing set up. `Live` needs a database. CI runs all of th
 | `UserSql` | the SQL the Users dialog and the grid build client-side, including the table grid query that reads text holding a NUL exactly | `node` on PATH |
 | `ViewIndices` | the grid's sort/filter ordering | `node` on PATH |
 | `UpdateCheck` | the new-version notice: shown when newer, quiet when hidden, switched off or offline | `node` on PATH |
+| `RunChecks` | the question before an UPDATE or DELETE without a WHERE, which queries Explain may measure, and how EXPLAIN ANALYZE and ANALYZE FORMAT=JSON are read | `node` on PATH |
 | `TableBinding` | which database and table a result grid saves to (after a leading `USE`, or with another schema selected), and control characters shown in text | `node` on PATH |
 | `GridSave` | how saving grid edits finds each row: a guard before every change, FLOAT and TIMESTAMP keys, a missing key column | `node` on PATH |
 | `EditorTools` | autocomplete's reading of the statement (tables, aliases, qualifiers), and the JSON and Excel exports | `node` on PATH |
@@ -55,7 +57,7 @@ cannot lift their subject out with the PowerShell AST. They extract it by brace-
 under `node`, which the `windows-latest` CI image already ships. If `node` is missing they **fail**
 rather than skipping.
 
-`ConnSslCa`, `TableDesigner`, `DdlRecreate`, `UpdateCheck`, `TableBinding`, `GridSave` and `EditorTools` embed the very same test files the Tauri edition
+`ConnSslCa`, `TableDesigner`, `DdlRecreate`, `UpdateCheck`, `TableBinding`, `GridSave`, `EditorTools` and `RunChecks` embed the very same test files the Tauri edition
 runs (`tests/ui/*.test.mjs` in nobs-sql-editor), pointed at this file through `NOBS_UI_SOURCE`.
 They are generated from those files - regenerate rather than edit them by hand.
 

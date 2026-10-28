@@ -14,6 +14,7 @@ pwsh -NoProfile -File tests/ResultRows.Tests.ps1         ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UiParses.Tests.ps1           ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ConnSslCa.Tests.ps1          ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/TableDesigner.Tests.ps1      ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/ValuePanel.Tests.ps1         ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/DdlRecreate.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UserSql.Tests.ps1            ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ViewIndices.Tests.ps1        ./NOBSSQL.ps1
@@ -41,6 +42,7 @@ All but the last need nothing set up. `Live` needs a database. CI runs all of th
 | `UiParses` | that every inline `<script>` in the page parses | `node` on PATH |
 | `ConnSslCa` | that every save and load of a connection carries its CA certificate | `node` on PATH |
 | `TableDesigner` | that editing a column keeps everything the designer does not show | `node` on PATH |
+| `ValuePanel` | the value panel's views and encodings, and that a value saved from it is stored exactly as it was read | `node` on PATH |
 | `DdlRecreate` | recovering a procedure, function or trigger whose recreate failed | `node` on PATH |
 | `UserSql` | the SQL the Users dialog and the grid build client-side, including the table grid query that reads text holding a NUL exactly | `node` on PATH |
 | `ViewIndices` | the grid's sort/filter ordering | `node` on PATH |
@@ -57,7 +59,7 @@ cannot lift their subject out with the PowerShell AST. They extract it by brace-
 under `node`, which the `windows-latest` CI image already ships. If `node` is missing they **fail**
 rather than skipping.
 
-`ConnSslCa`, `TableDesigner`, `DdlRecreate`, `UpdateCheck`, `TableBinding`, `GridSave`, `EditorTools` and `RunChecks` embed the very same test files the Tauri edition
+`ConnSslCa`, `TableDesigner`, `ValuePanel`, `DdlRecreate`, `UpdateCheck`, `TableBinding`, `GridSave`, `EditorTools` and `RunChecks` embed the very same test files the Tauri edition
 runs (`tests/ui/*.test.mjs` in nobs-sql-editor), pointed at this file through `NOBS_UI_SOURCE`.
 They are generated from those files - regenerate rather than edit them by hand.
 

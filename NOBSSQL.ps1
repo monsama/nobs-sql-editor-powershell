@@ -1768,14 +1768,16 @@ function Api-Script { param($conn,$data)
             $n++
             if ($entry -and $entry.Cancelled) { $errMsg = 'Query cancelled.'; break }
             $t0 = [System.Diagnostics.Stopwatch]::StartNew()
-            $r1 = Invoke-TxStatements $s @($st) 1
+            $r1 = Invoke-TxStatements $s @($st) 50 -Warnings
             if ($r1.lost) { $lost = $true; break }
             if ($r1.err) { $errMsg = $r1.err; break }
-            $rw = Invoke-TxStatements $s @('SHOW WARNINGS') 50
-            if (-not $rw.lost -and -not $rw.err) {
-                foreach ($set in $rw.sets) { foreach ($row in $set.Rows) {
+            # SHOW WARNINGS, read right after the statement (see Invoke-TxStatements -Warnings), is
+            # the LAST result set this call produced - the statement's own, if it has one, came first.
+            if ($r1.sets.Count -gt 0) {
+                $warnSet = $r1.sets[$r1.sets.Count - 1]
+                foreach ($row in $warnSet.Rows) {
                     if ($row.Length -ge 3) { $warnings.Add([pscustomobject]@{ stmt=$n; level=[string]$row[0]; code=[string]$row[1]; message=[string]$row[2] }) }
-                } }
+                }
             }
             $statements.Add((Stmt-Report $n $st ([long]$r1.affected) $t0.Elapsed.TotalMilliseconds))
         }
@@ -2007,7 +2009,7 @@ function Open-TxSession { param([string]$Id, $conn, [bool]$Tx = $true)
 # statement's. @@error_count was the first way of telling, and it is not one: the server resets it
 # only for a statement that reads a table, so after one error every USE and SET after it seemed to
 # fail too.
-function Invoke-TxStatements { param($s, [string[]]$Stmts, [int]$MaxRows)
+function Invoke-TxStatements { param($s, [string[]]$Stmts, [int]$MaxRows, [switch]$Warnings)
     Initialize-DumpDb
     $sets = New-Object 'System.Collections.Generic.List[NobsResultSet]'
     $n = 0; $affected = 0
@@ -2017,6 +2019,10 @@ function Invoke-TxStatements { param($s, [string[]]$Stmts, [int]$MaxRows)
         # A statement with a semicolon of its own - a procedure body - goes in under a delimiter it
         # does not contain.
         $body = if ($st.Contains(';')) { "DELIMITER ~~nobs~~`n$st`n~~nobs~~`nDELIMITER ;`n" } else { "$st;`n" }
+        # Read right after the statement, before the marker's own SIGNAL overwrites the diagnostics
+        # area with its own (synthetic) condition - a separate SHOW WARNINGS call later would read
+        # that instead of the statement's.
+        if ($Warnings) { $body += "SHOW WARNINGS;`n" }
         # ROW_COUNT() in the marker is what the statement before it changed, for the transaction's log.
         $bytes = [Text.Encoding]::UTF8.GetBytes($body + "SELECT '$marker' AS nobs_marker, ROW_COUNT() AS nobs_rows;`nSIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='$marker';`n")
         try { $s.Process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length); $s.Process.StandardInput.BaseStream.Flush() }

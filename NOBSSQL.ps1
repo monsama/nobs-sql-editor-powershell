@@ -62,11 +62,16 @@ $script:RunningJobs = [System.Collections.Concurrent.ConcurrentDictionary[string
 # is the pscustomobject built by Open-QueryCursor (Process/Reader/Rows/Headers/RequestId/
 # Cnf/LastUsed/Lock). See Open-QueryCursor, Api-FetchCursorBatch, Api-CloseCursor below.
 $script:OpenCursors = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
-# Tabs with auto-commit off: session id -> the mysql.exe holding its transaction (see Open-TxSession).
+# A tab's kept connection, transactional (auto-commit off) or not: session id -> the mysql.exe
+# holding it (see Open-TxSession).
 $script:TxSessions = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 # Open SSH tunnels: SSH login and database address -> the ssh.exe holding it (see Get-Endpoint).
 $script:Tunnels = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 $script:TxLost = "The connection holding this tab's transaction was lost, so the server rolled back everything it had not committed. The next run starts a new transaction."
+# Session ids whose connection was gone when a run asked for it, and was opened again - the next
+# successful answer for that id says so (Mark-SessionReset), since what earlier runs left in the
+# old one (@variables, temporary tables) is not in the new one.
+$script:SessionResets = [System.Collections.Concurrent.ConcurrentDictionary[string,bool]]::new()
 # What each server is (host:port -> $true for MariaDB), shared by every runspace - see Get-ServerIsMariaDB.
 $script:ServerFlavor = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 # A simple thread-safe set of requestIds the user has asked to cancel. Compare operations run
@@ -1967,12 +1972,13 @@ function Api-CloseCursor { param($data)
 # the very first page.
 # ---------- Transactions a tab keeps open ----------
 # With auto-commit off, a tab's statements run in one mysql.exe of its own, started with
-# autocommit=0 and kept running until Commit, Rollback or the tab closing. The statements go in one
-# at a time, each followed by a marker SELECT that also reads @@error_count - the errors of the
-# statement before it - so a script stops at its first error as it does elsewhere, while the
-# transaction stays open. --force keeps the client running after an error; without it the client
-# would exit and the server would roll everything back.
-function Open-TxSession { param([string]$Id, $conn)
+# autocommit=0 (Tx) or the server's default (not Tx) and kept running until the tab lets it go - its
+# transaction ending (with Tx) or the tab closing (either way). The statements go in one at a time,
+# each followed by a marker SELECT that also reads @@error_count - the errors of the statement
+# before it - so a script stops at its first error as it does elsewhere, while the session stays
+# open. --force keeps the client running after an error; without it the client would exit and the
+# server would roll back whatever the session held.
+function Open-TxSession { param([string]$Id, $conn, [bool]$Tx = $true)
     Initialize-DumpDb
     $my = Get-Mysql $conn
     $ra = Get-ResultArgs $my $conn
@@ -1984,8 +1990,9 @@ function Open-TxSession { param([string]$Id, $conn)
         $psi.StandardOutputEncoding = $script:RawEnc; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
         $psi.Arguments = Format-Args (@("--defaults-extra-file=$cnf", '--comments', '--force', '--unbuffered') + $ra)
         $p = New-Object System.Diagnostics.Process; $p.StartInfo = $psi; [void]$p.Start()
-        $s = [pscustomobject]@{ Id=$Id; Process=$p; Out=(New-Object NobsXmlRows $p.StandardOutput); Err=(New-Object NobsLineSink @($p.StandardError, $p)); Lock=(New-Object object); Cid=0; Conn=$conn }
-        $r = Invoke-TxStatements $s @('SET autocommit=0', 'SELECT CONNECTION_ID()') 1
+        $s = [pscustomobject]@{ Id=$Id; Process=$p; Out=(New-Object NobsXmlRows $p.StandardOutput); Err=(New-Object NobsLineSink @($p.StandardError, $p)); Lock=(New-Object object); Cid=0; Conn=$conn; Tx=$Tx }
+        $first = if ($Tx) { @('SET autocommit=0', 'SELECT CONNECTION_ID()') } else { @('SELECT CONNECTION_ID()') }
+        $r = Invoke-TxStatements $s $first 1
         if ($r.err) { try { if (-not $p.HasExited) { $p.Kill() } } catch {}; throw $r.err }
         $s.Cid = [long]$r.sets[0].Rows[0][0]
         return $s
@@ -2030,18 +2037,55 @@ function Invoke-TxStatements { param($s, [string[]]$Stmts, [int]$MaxRows)
     }
     @{ sets=$sets; err=$null; affected=$affected }
 }
-# The tab's session, opened the first time, and held for the caller until Exit-TxSession.
-function Enter-TxSession { param([string]$Id, $conn)
+# The tab's session, as the run asks for it (Tx: its transaction, autocommit=0; otherwise its kept
+# connection with autocommit as the server has it) - opened the first time, held for the caller
+# until Exit-TxSession, and switched over in place if the tab turned Auto-commit on or off since its
+# last run, rather than reopened: what the session holds besides the transaction stays either way.
+function Enter-TxSession { param([string]$Id, $conn, [bool]$Tx = $true)
     $s = $null
     if (-not $script:TxSessions.TryGetValue($Id, [ref]$s)) {
-        $s = Open-TxSession $Id $conn
+        $s = Open-TxSession $Id $conn $Tx
         if (-not $script:TxSessions.TryAdd($Id, $s)) { Stop-TxSession $s; $null = $script:TxSessions.TryGetValue($Id, [ref]$s) }
     }
-    if (-not [System.Threading.Monitor]::TryEnter($s.Lock, 15000)) { throw "This tab's transaction is still busy with the statement before. Wait for it, or cancel it, and run again." }
-    if ($s.Process.HasExited) { [System.Threading.Monitor]::Exit($s.Lock); $null = $script:TxSessions.TryRemove($Id, [ref]$null); throw $script:TxLost }
+    if (-not [System.Threading.Monitor]::TryEnter($s.Lock, 15000)) { throw "This tab's connection is still busy with the statement before. Wait for it, or cancel it, and run again." }
+    if ($s.Process.HasExited) { return Reopen-TxSession $Id $conn $Tx $s.Lock $s.Tx }
+    # A ping: the connection may have died while idle (the server's wait_timeout, a dropped network).
+    # mysql.exe, kept alive by --force, reports that as an ordinary statement error rather than exiting.
+    $ping = Invoke-TxStatements $s @('DO 0') 1
+    if ($ping.lost -or $ping.err) { return Reopen-TxSession $Id $conn $Tx $s.Lock $s.Tx }
+    if ($s.Tx -ne $Tx) {
+        $switch = if ($Tx) { @('SET autocommit=0') } else { @('ROLLBACK', 'SET autocommit=1') }
+        $r = Invoke-TxStatements $s $switch 1
+        if ($r.lost) { return Reopen-TxSession $Id $conn $Tx $s.Lock $s.Tx }
+        if ($r.err) { [System.Threading.Monitor]::Exit($s.Lock); $null = $script:TxSessions.TryRemove($Id, [ref]$null); throw $r.err }
+        $s.Tx = $Tx
+    }
     return $s
 }
+# The session's connection is gone: remove it, and either report the tab's transaction as lost (both
+# the checkout that held it and the one asking now wanted a transaction) or open a fresh connection
+# and record the reset, which the caller's next successful answer says (Mark-SessionReset) - what
+# earlier runs left in the old one is not in the new one.
+function Reopen-TxSession { param([string]$Id, $conn, [bool]$Tx, $Lock, [bool]$WasTx)
+    try { [System.Threading.Monitor]::Exit($Lock) } catch {}
+    $null = $script:TxSessions.TryRemove($Id, [ref]$null)
+    if ($WasTx -and $Tx) { throw $script:TxLost }
+    $script:SessionResets[$Id] = $true
+    $new = Open-TxSession $Id $conn $Tx
+    if (-not $script:TxSessions.TryAdd($Id, $new)) { Stop-TxSession $new; $null = $script:TxSessions.TryGetValue($Id, [ref]$new) }
+    if (-not [System.Threading.Monitor]::TryEnter($new.Lock, 15000)) { throw "This tab's connection is still busy with the statement before. Wait for it, or cancel it, and run again." }
+    return $new
+}
 function Exit-TxSession { param($s) try { [System.Threading.Monitor]::Exit($s.Lock) } catch {} }
+# Wraps a /api/query, /api/script or /api/script-results JSON answer for a session id: if that
+# session's connection had to be opened again (Reopen-TxSession), says so once, on the next answer.
+function Mark-SessionReset { param([string]$Id, [string]$Json)
+    if (-not $Id) { return $Json }
+    $dummy = $false
+    if (-not $script:SessionResets.TryRemove($Id, [ref]$dummy)) { return $Json }
+    if ($Json.StartsWith('{')) { return '{"sessionReset":true,' + $Json.Substring(1) }
+    return $Json
+}
 # Closing its input ends mysql.exe, and the server rolls back what was not committed.
 function Stop-TxSession { param($s)
     try { $s.Process.StandardInput.Close() } catch {}
@@ -2054,7 +2098,10 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
     $id = [string]$data.session
     $sql = [string]$data.sql
     if (-not $sql.Trim()) { return '{"ok":false,"error":"Empty query."}' }
-    try { Initialize-DumpDb; $s = Enter-TxSession $id $conn } catch { return '{"ok":false,"error":'+(J-Str (Get-InnerMessage $_))+'}' }
+    # sessionTx is left out by callers from before a tab's connection outlived Auto-commit being on,
+    # whose sessions were all transactions.
+    $sessionTx = if ($data.PSObject.Properties['sessionTx']) { [bool]$data.sessionTx } else { $true }
+    try { Initialize-DumpDb; $s = Enter-TxSession $id $conn $sessionTx } catch { return '{"ok":false,"error":'+(J-Str (Get-InnerMessage $_))+'}' }
     $rid = [string]$data.requestId
     $entry = $null
     try {
@@ -2130,8 +2177,10 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
         Exit-TxSession $s
     }
 }
-# Endpoint: Commit, Rollback, or Close (roll back and end the session) for a tab. A session that
-# was never opened has nothing to commit or roll back, which is not an error.
+# Endpoint: Commit, Rollback, or Close (roll back and let the connection go) for a tab's session;
+# Release ends its transaction (rolled back: there is nothing to commit by then) and keeps the
+# connection for the tab's runs with Auto-commit on. A session that was never opened has nothing to
+# commit or roll back, which is not an error.
 function Api-SessionEnd { param($conn, $data)
     $id = [string]$data.session
     $action = [string]$data.action
@@ -2141,6 +2190,11 @@ function Api-SessionEnd { param($conn, $data)
         $null = $script:TxSessions.TryRemove($id, [ref]$null)
         Stop-TxSession $s
         return '{"ok":true,"open":false}'
+    }
+    if ($action -eq 'release') {
+        try { $s = Enter-TxSession $id $conn $false } catch { return '{"ok":false,"error":'+(J-Str (Get-InnerMessage $_))+'}' }
+        Exit-TxSession $s
+        return '{"ok":true,"open":true}'
     }
     try { $s = Enter-TxSession $id $conn } catch {
         $m = Get-InnerMessage $_
@@ -6120,6 +6174,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
   <div class="setgroup">Running queries</div>
   <div class="setcard">
    <div class="setrow"><div class="setrl"><div class="setrt">Ask before UPDATE or DELETE without WHERE</div><div class="setnote">Asks for confirmation before running an UPDATE or DELETE that has no WHERE clause of its own, since it would change or remove every row of the table. A WHERE inside a subquery does not count.</div></div><div class="setrc"><input type="checkbox" id="cfgNoWhereAsk" onchange="setNoWhereAsk(this.checked)" title="Ask before running an UPDATE or DELETE that has no WHERE"></div></div>
+   <div class="setrow"><div class="setrl"><div class="setrt">Keep each tab's connection between runs</div><div class="setnote">Each query tab runs on a connection of its own and keeps it, so what one run leaves - @variables, temporary tables, SET SESSION - is there for the next, as in the mysql client. Off, every run opens a new connection with nothing carried over. With Auto-commit off a tab always keeps its connection, for its transaction. The server counts one connection per tab that has run something.</div></div><div class="setrc"><input type="checkbox" id="cfgKeepConn" onchange="setKeepConn(this.checked)" title="Keep each query tab's connection between its runs"></div></div>
   </div>
   <div class="setgroup">Notifications</div>
   <div class="setcard">
@@ -6427,8 +6482,11 @@ function hideDead(){const d=$('deadOverlay');if(d)d.style.display='none';}
 // lists such as a schema's tables or its column names for autocomplete stopped at 1000 in both.
 // Only the grid passes pageSize; for everyone else the remaining rows are read here.
 async function api(path,p,signal){
+ // Whether a run on the tab's kept connection is in its transaction (see runSessOf).
+ if(p&&p.session&&p.sessionTx===undefined){const tb=tabs.find(x=>x.sessId===p.session);if(tb)p.sessionTx=!!tb.txOn;}
  const txe=(p&&p.session)?txWatch(path,p):null;
  const r=await apiCall(path,p,signal);
+ if(p&&p.session&&r&&r.sessionReset)sessReset(p.session);
  if(txe){txe.ok=!!(r&&r.ok);if(r&&!r.ok)txe.error=r.error||(r.aborted?'Cancelled.':'Failed.');if(r&&r.affected!=null)txe.affected=+r.affected;
   const ws=r&&r.warnings?warnFromWrites(r.warnings,splitStmts(String(p.sql||''))):[];if(ws.length)txe.warn=warnText(ws);}
  if(p&&p.session&&r&&r.ok===false&&TX_LOST.test(r.error||''))txLost(p.session);
@@ -6993,7 +7051,7 @@ async function clearAllData(){if(!(await ask('Clear ALL app data?\n\nThis perman
 function setPage(p){const sv=document.querySelector('#mSettings .setfoot .go');if(sv)sv.style.visibility=p==='tools'?'':'hidden';document.querySelectorAll('#mSettings .setnav button').forEach(b=>b.classList.toggle('on',b.dataset.p===p));document.querySelectorAll('#mSettings .setpage').forEach(s=>s.classList.toggle('on',s.dataset.p===p));if(p==='about')aboutPage();}
 // The About page: its buttons get their icons when it is shown.
 function aboutPage(){const pg=document.querySelector('#mSettings .setpage[data-p="about"]');if(pg)decorateIcons(pg);}
-async function openSettings(){$('cfgLog').textContent='';uiSizesApply();try{const r=await api('/api/get-config');const c=(r&&r.config)||{};uiZoomShow(c);$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}if($('cfgUpdateCheck'))$('cfgUpdateCheck').checked=updateCheckOn();if($('cfgNoWhereAsk'))$('cfgNoWhereAsk').checked=noWhereAskOn();if($('cfgToastMs'))$('cfgToastMs').value=String(toastMs());show('mSettings');
+async function openSettings(){$('cfgLog').textContent='';uiSizesApply();try{const r=await api('/api/get-config');const c=(r&&r.config)||{};uiZoomShow(c);$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}if($('cfgUpdateCheck'))$('cfgUpdateCheck').checked=updateCheckOn();if($('cfgNoWhereAsk'))$('cfgNoWhereAsk').checked=noWhereAskOn();if($('cfgKeepConn'))$('cfgKeepConn').checked=keepConnOn();if($('cfgToastMs'))$('cfgToastMs').value=String(toastMs());show('mSettings');
  // The first call answers from what is remembered about each binary; the second re-reads them and
  // updates the cards if a tool was replaced behind the app's back.
  await refreshToolsStatus();setTimeout(()=>refreshToolsStatus(false,true),50);}
@@ -7759,6 +7817,9 @@ async function connect() {window._connFormTouched=true;window._newConnPrev=null;
   window._activeConnName = $('connlist').value || '';
   paintConnGo();
   window._activeReadOnly = window.readOnly;
+  // A tab keeps the connection it opened, to the server it was opened to. Connecting again - to the
+  // same saved connection with a changed host, say - must not leave its runs going there.
+  tabs.forEach(t=>{if(!t.txOn)tabSessClose(t);});
   // Whether a backslash inside a string is an escape on this server. With NO_BACKSLASH_ESCAPES in
   // its sql_mode it is an ordinary character, and every literal the app wrote - grid edits,
   // comments, passwords - stored C:\temp as C:\\temp, one more pair on every save. strLit()
@@ -7794,7 +7855,7 @@ async function disconnectAsk(){const running=tabs.filter(t=>t.runningReqId),dirt
   if(!(await ask('Disconnect with '+what.join(' and ')+'? The edits stay in their tabs; the running queries are stopped'+(open.length?'; what was not committed is rolled back':'')+'.')))return;
   await Promise.all(running.map(t=>cancelQuery(t.id)));}
  disconnect();}
-function disconnect(){tabs.forEach(t=>{if(t.txOn||t.txSession){txClose(t);t.txOn=false;txPaint(t.id);}});window.mariadb=false;window.serverVersion='';document.body.classList.add('disconnected');window._activeConn=null;window._activeConnName='';window._activeReadOnly=false;$('schemas').innerHTML='';clearObjectsPanel();applyAccent('');const _cs=$('connStatus');if(_cs){_cs.textContent='';_cs.className='chip off dotonly';_cs.title='Not connected';_cs.tabIndex=-1;}window.curAccent='';window.readOnly=false;window.curEnv='';
+function disconnect(){tabs.forEach(t=>{if(t.txOn||t.txSession||t.sessId){txClose(t);t.txOn=false;txPaint(t.id);}});window.mariadb=false;window.serverVersion='';document.body.classList.add('disconnected');window._activeConn=null;window._activeConnName='';window._activeReadOnly=false;$('schemas').innerHTML='';clearObjectsPanel();applyAccent('');const _cs=$('connStatus');if(_cs){_cs.textContent='';_cs.className='chip off dotonly';_cs.title='Not connected';_cs.tabIndex=-1;}window.curAccent='';window.readOnly=false;window.curEnv='';
  // Re-preview the still-selected connection's env chip rather than hard-hiding it, same as the
  // password icon (never touched here) already does - "Not connected" shouldn't also erase what
  // you were just looking at in the dropdown.
@@ -7928,8 +7989,7 @@ async function allResultRows(id){const t=T(id);
  const rs=t.resultSets&&t.resultSets[t.resultIdx||0];
  // The same request the grid's rows came from (in the PowerShell edition that can be the exact-text
  // form of the query), in the same session.
- await sessFree(t);
- const q=await api('/api/query',Object.assign({},(!rs&&t.lastRunQ)||{sql,db:dbOf(t)},{session:sessOf(t)}));
+ const q=await tabQuery(t,Object.assign({},(!rs&&t.lastRunQ)||{sql,db:dbOf(t)}));
  if(!q.ok){toast(q.error,true);return null;}
  return {cols:q.columns,rows:q.rows};}
 // How many rows the LIMIT at the very end of a statement allows - LIMIT n, LIMIT offset,n and
@@ -8734,7 +8794,10 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
  // middle button after the browser has had its say; mousedown only stops the paste-on-click that
  // X11-style middle-click would otherwise start.
  tb.addEventListener('auxclick',e=>{if(e.button===1){e.preventDefault();closeTabAsk(id);}});
- tb.addEventListener('mousedown',e=>{if(e.button===1)e.preventDefault();});tb.oncontextmenu=e=>{e.preventDefault();const tf=T(id)&&T(id).file;menu(e.clientX,e.clientY,[['Save'+(tf?' '+tf.name:' as file...'),()=>saveSqlFile(id)],tf&&['Save as...',()=>saveSqlFile(id,true)],'-',['Close',()=>closeTabAsk(id)],tabs.length>1&&['Close others',()=>closeOthers(id)],tabs.length>1&&['Close all',()=>closeAll()]]);};
+ tb.addEventListener('mousedown',e=>{if(e.button===1)e.preventDefault();});tb.oncontextmenu=e=>{e.preventDefault();const tf=T(id)&&T(id).file,tab=T(id);menu(e.clientX,e.clientY,[['Save'+(tf?' '+tf.name:' as file...'),()=>saveSqlFile(id)],tf&&['Save as...',()=>saveSqlFile(id,true)],'-',
+  // A fresh start for the tab's session: its @variables, temporary tables and settings let go.
+  tab.sessId&&!tab.txOn&&!tab.runningReqId&&['New connection for this tab',()=>{if(tab.cursorId){tab.hasMore=false;closeCursorFor(tab);updateStatusLine(id);}tabSessClose(tab);toast('The next run in this tab opens a new connection.');}],
+  ['Close',()=>closeTabAsk(id)],tabs.length>1&&['Close others',()=>closeOthers(id)],tabs.length>1&&['Close all',()=>closeAll()]]);};
  tb.addEventListener('dragstart',e=>{e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',id);tb.classList.add('dragging');});
  tb.addEventListener('dragend',()=>{tb.classList.remove('dragging');});
  tb.addEventListener('dragover',e=>{e.preventDefault();e.dataTransfer.dropEffect='move';tb.classList.add('dragover');});
@@ -9011,7 +9074,7 @@ function restoreSessionFor(key){if(tabs.length)return;let arr=[];try{const raw=l
 });}}
 // Closes every tab without the "unsaved changes" prompt - only called right after the user has
 // already confirmed switching connections (connect() asks that separately, once, up front).
-function clearAllTabsSilently(){[...tabs].forEach(t=>{const b=$('tabbtn_'+t.id);if(b)b.remove();const p=$('pane_'+t.id);if(p)p.remove();});tabs=[];activeTab=null;toggleOverview();markRunSchema(null);}
+function clearAllTabsSilently(){[...tabs].forEach(t=>{tabSessClose(t);const b=$('tabbtn_'+t.id);if(b)b.remove();const p=$('pane_'+t.id);if(p)p.remove();});tabs=[];activeTab=null;toggleOverview();markRunSchema(null);}
 // Deliberately does NOT prepend "USE <schema>;" to the new tab's text - that's redundant
 // (Api-Query/Api-Script already receive the schema via a SEPARATE db parameter, passed to
 // mysql.exe as --database=..., independent of whatever text is in the query itself), and it was
@@ -9198,8 +9261,7 @@ function planHtml(json){let plan;try{plan=typeof json==='string'?JSON.parse(json
  return head+'<ul class="plan">'+Object.keys(plan).map(k=>planNode(k,plan[k])).join('')+'</ul><details class="pjson"><summary>The plan as the server gave it (JSON)</summary><pre>'+esc(JSON.stringify(plan,null,2))+'</pre></details>';}
 let _planCtx=null;
 async function planShow(id,stmt){const t=T(id);if(!t)return;
- await sessFree(t);
- const r=await api('/api/query',{sql:'EXPLAIN FORMAT=JSON '+stmt,db:dbOf(t),session:sessOf(t)});
+ const r=await tabQuery(t,{sql:'EXPLAIN FORMAT=JSON '+stmt,db:dbOf(t)});
  _planCtx={id,stmt};
  $('planTitle').textContent='Query plan - '+t.title;
  $('planBody').innerHTML=r.ok&&r.rows&&r.rows.length?planHtml(r.rows[0][0]):'<div class="unone">'+esc(r.error||'The server gave no plan for this statement.')+'</div>';
@@ -9220,8 +9282,8 @@ function planMs(ms){ms=+ms||0;return ms>=1000?(ms/1000).toFixed(ms>=10000?1:2)+'
 // each with what it expected and what it did.
 async function planMeasure(){const c=_planCtx,t=c&&T(c.id);if(!t||!planReadsOnly(c.stmt))return;
  const b=$('planMeasureBtn');b.disabled=true;b.textContent='Measuring…';$('planNote').textContent='Running the query…';
- try{await sessFree(t);
-  const r=await api('/api/query',{sql:(window.mariadb?'ANALYZE FORMAT=JSON ':'EXPLAIN ANALYZE ')+c.stmt,db:dbOf(t),session:sessOf(t),timeLimit:timeLimitSec()});
+ try{
+  const r=await tabQuery(t,{sql:(window.mariadb?'ANALYZE FORMAT=JSON ':'EXPLAIN ANALYZE ')+c.stmt,db:dbOf(t),timeLimit:timeLimitSec()});
   if(_planCtx!==c)return;
   if(!r.ok){const old=!window.mariadb&&/syntax|1064/i.test(r.error||'');
    $('planNote').textContent='';
@@ -9471,7 +9533,7 @@ async function runScriptResults(id,sql,reqId,seq){const t0=performance.now();
  const stmts=splitStmts(sql).filter(s=>!isCommentOnly(s));
  const writes=stmts.some(s=>!/^(select|show|describe|desc|explain|with|table|values|use)\b/i.test(sqlHead(s)));
  if(writes&&roBlock()){st.className='status';st.textContent='Read-only mode: statement blocked.';return;}
- const r=await api('/api/script-results',{sql,db:dbOf(t),requestId:reqId,maxRows:PAGE_BATCH,session:sessOf(t),timeLimit:timeLimitSec()},t.abortCtrl.signal);
+ const r=await api('/api/script-results',{sql,db:dbOf(t),requestId:reqId,maxRows:PAGE_BATCH,session:runSessOf(t),timeLimit:timeLimitSec()},t.abortCtrl.signal);
  if(r.aborted){if(!stale()){st.className='status';st.textContent='Query cancelled.';}return;}
  if(stale())return;
  t.table=null;t.pk=null;t.pending=null;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;t.exact=false;
@@ -9549,7 +9611,7 @@ function timeLimitNote(err,reading){err=String(err==null?'':err);
 async function runSql(id,sql,paging){const t=T(id);if(!t)return;
  if(!paging&&!(await okToRunUnfiltered(t,splitStmts(String(sql==null?'':sql)).filter(s=>!isCommentOnly(s))))){const s0=$('st_'+id);if(s0){s0.className='status';s0.textContent='Not run.';}return;}
  if(sql!=null&&sql!==t.curRun){t.prevRun=t.curRun;t.curRun=sql;}const st=$('st_'+id);st.className='status';st.textContent='Running\u2026';
- if(sessOf(t))await sessFree(t); // in a transaction its one connection is held by the cursor: the close is waited for
+ if(runSessOf(t))await sessFree(t,true); // the tab's kept connection holds the cursor of a result still being read: the close is waited for
  closeCursorFor(t);
  addHistory(sql);
  const stmts=splitStmts(sql).filter(s=>!isCommentOnly(s));
@@ -9607,7 +9669,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
       // statement - but extending the CLI's own "$$" convention this far tested cleanly, while
       // still being implausible to ever collide with real SQL content.
       const leadingSql=stmts.slice(0,-1).map(s=>'DELIMITER $$$$$$$$\n'+s+'\n$$$$$$$$\nDELIMITER ;').join('\n');
-      const scriptR=await api('/api/script',{sql:leadingSql,db:dbOf(t),session:sessOf(t),timeLimit:timeLimitSec()},t.abortCtrl.signal);
+      const scriptR=await api('/api/script',{sql:leadingSql,db:dbOf(t),session:runSessOf(t),timeLimit:timeLimitSec()},t.abortCtrl.signal);
       if(scriptR.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
       if(stale())return;
       setRunWarnings(id,scriptR.warnings,stmts);
@@ -9621,7 +9683,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
     const bind=t.ddl?null:parseSingleEditableTable(lastStmt,tableDb);
     const exact=bind?await exactTextQuery(_q,lastStmt,bind):null;
     if(stale())return;
-    t.lastRunQ={sql:exact?exact.sql:_q,db:runDb,exactText:exact&&exact.cols.length?exact.cols:undefined,timeLimit:timeLimitSec()};const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,timeLimit:t.lastRunQ.timeLimit,requestId:reqId,pageSize:PAGE_BATCH,browse:true,exactText:exact&&exact.cols.length?exact.cols:undefined,session:sessOf(t)},t.abortCtrl.signal);
+    t.lastRunQ={sql:exact?exact.sql:_q,db:runDb,exactText:exact&&exact.cols.length?exact.cols:undefined,timeLimit:timeLimitSec()};const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,timeLimit:t.lastRunQ.timeLimit,requestId:reqId,pageSize:PAGE_BATCH,browse:true,exactText:exact&&exact.cols.length?exact.cols:undefined,session:runSessOf(t)},t.abortCtrl.signal);
     if(r.aborted){if(!stale()){st.className='status';st.textContent='Query cancelled.';}return;}
     if(stale())return;
     if(!r.ok){st.className='status err';st.textContent=timeLimitNote(r.error);$('res_'+id).innerHTML='';runLog(id,sqlOneLine(_q)+' -> '+logErr(r.error),'err',{sql,n:stmts.length});await schemaGoneNote(id,r.error);if(t.ddl){const _rn=await ddlRestoreIfDropped(t.ddl);if(_rn){st.textContent+=_rn;log(_rn.trim());}}return;}
@@ -9675,7 +9737,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
   } else {
     if(roBlock()){st.className='status';st.textContent='Read-only mode: statement blocked.';return;}
     const continueOnError=!!($('coe_'+id)&&$('coe_'+id).checked);
-    const r=await api('/api/script',{sql,db:dbOf(t),requestId:reqId,continueOnError,session:sessOf(t),timeLimit:timeLimitSec()},t.abortCtrl.signal);
+    const r=await api('/api/script',{sql,db:dbOf(t),requestId:reqId,continueOnError,session:runSessOf(t),timeLimit:timeLimitSec()},t.abortCtrl.signal);
     if(r.aborted){if(T(id)){st.className='status';st.textContent='Cancelled.';}return;}
     if(stale())return;
     if(r.failures){
@@ -9745,7 +9807,41 @@ async function cancelQuery(id){const t=T(id);if(!t)return;if(t.abortCtrl){try{t.
 // stays open until Commit or Rollback. The tab keeps track of whether it has sent anything that
 // changes data, so closing it or disconnecting can say so before the changes are rolled back.
 const TX_LOST=/holding this tab's transaction was lost/;
+// The tab's transaction, for what has to go into it: grid edits applied, Commit and Rollback.
 function sessOf(t){return t&&t.txOn?t.txSession:undefined;}
+// ---- the connection a tab keeps ----
+// A tab's runs share a connection of its own (Open-TxSession/Enter-TxSession, PowerShell's version
+// of main.rs's sess_checkout), so what one run leaves - @variables, temporary tables, SET SESSION -
+// is there for the next, as in the mysql client. Before, every run opened a new connection with
+// Auto-commit on, and `SET @x=1;` then `SELECT @x;` gave NULL. With Auto-commit off the same
+// connection is the tab's transaction: one id for both (t.sessId), and each run says which it wants
+// (sessionTx, added in api()), so switching keeps what the session holds. It can be switched off in
+// Settings; reading in another character set never uses it, since that reading is a connection
+// setting the kept connection was not opened with.
+function keepConnOn(){try{return localStorage.getItem('keepConn')!=='off';}catch(e){return true;}}
+function setKeepConn(on){try{localStorage.setItem('keepConn',on?'on':'off');}catch(e){}
+ // Off: the connections kept for Auto-commit runs are let go; a tab's transaction keeps its own.
+ if(!on)tabs.forEach(t=>{if(!t.txOn)tabSessClose(t);});}
+function tabSess(t){return t.sessId||(t.sessId='tab_'+t.id+'_'+Date.now().toString(36));}
+// The session a run from the editor goes to: the transaction with Auto-commit off, else the kept
+// connection - or none, and a new connection, when keeping is off or another charset is being read.
+function runSessOf(t){if(!t)return undefined;if(t.txOn)return t.txSession;return keepConnOn()&&!window.browseCharset?tabSess(t):undefined;}
+// Lets the tab's connection go, whichever it was kept for. The server rolls back what was not committed.
+function tabSessClose(t){if(t&&t.sessId){api('/api/session-end',{session:t.sessId,action:'close'});t.sessId=null;}if(t)t.txSession=null;}
+// A query the tab asks besides its runs - reading every row of a result, a plan - that may need
+// what the runs left in the connection, but must not stop a result still being read from it. In a
+// transaction it goes into the transaction, as always. Otherwise it runs on a connection of its own,
+// and only when that cannot find a table, column or database (a temporary table, most likely) on
+// the tab's connection, after closing the result there.
+async function tabQuery(t,p){const tx=sessOf(t);
+ if(tx){await sessFree(t);return api('/api/query',Object.assign({},p,{session:tx}));}
+ const r=await api('/api/query',p),s=runSessOf(t);
+ if(r.ok||!s||!/\b(1146|1054|1049)\b|doesn't exist|Unknown (table|column|database)/i.test(r.error||''))return r;
+ await sessFree(t,true);return api('/api/query',Object.assign({},p,{session:s}));}
+// The kept connection had died (the server's wait_timeout, a dropped network) and a new one was opened.
+function sessReset(session){const t=tabs.find(x=>x.sessId===session);if(!t)return;
+ const m='This tab\'s connection had been closed, so a new one was opened. What earlier runs left in it - @variables, temporary tables, SET SESSION - is gone.';
+ log(m+' ('+t.title+')');toast(m,true);}
 // Whether SQL only reads. Only for telling the user there is something to commit; the server is
 // what decides.
 // Whether a run only reads, so needs no Commit. Read as the server reads it: strings and quoted names
@@ -9805,9 +9901,18 @@ function warnOpen(title,ws,stmts,apply){_warnApply=apply||null;const many=!!(stm
    '<td class="'+(warnIsNote(x)?'muted':'uwarn')+'">'+esc(x.level)+'</td><td>'+esc(x.code)+'</td><td>'+esc(x.message)+'</td></tr>').join('')+'</tbody></table>';
  $('warnApply').style.display=apply?'':'none';$('warnClose').textContent=apply?'Cancel':'Close';show('mWarn');}
 async function warnApplyAnyway(){const a=_warnApply;_warnApply=null;hide('mWarn');if(a)await a();}
+// Auto-commit off: the tab's kept connection becomes its transaction, with what it already holds.
+// On again: the transaction ends and the connection is kept for the runs that follow - or let go,
+// when keeping is off.
 function txToggle(id,manual){const t=T(id);if(!t)return;
- if(manual){t.txOn=true;t.txSession=t.txSession||('tx_'+id+'_'+Date.now().toString(36));}
- else{if(t.txDirty){toast('Commit or roll back the open transaction first.',true);txPaint(id);return;}t.txOn=false;txClose(t);}
+ if(manual){t.txOn=true;t.txSession=tabSess(t);}
+ else{if(t.txDirty){toast('Commit or roll back the open transaction first.',true);txPaint(id);return;}
+  if(!t.txOn){txPaint(id);return;}
+  t.txOn=false;t.txSession=null;t.txDirty=false;t.txLog=[];
+  // The result on screen holds the connection while it is still being read; it is closed so the
+  // release does not wait for it.
+  if(keepConnOn()&&t.sessId){if(t.cursorId){t.hasMore=false;closeCursorFor(t);updateStatusLine(id);}api('/api/session-end',{session:t.sessId,action:'release'});}
+  else tabSessClose(t);}
  txPaint(id);}
 // Commit saves the grid's pending edits first - Apply and then Commit in one click - and commits
 // nothing if they cannot be saved: the transaction stays open, with the reason on screen. Rollback
@@ -9823,8 +9928,8 @@ async function txEnd(id,action){const t=T(id);if(!t||!t.txOn)return;
  t.txDirty=false;t.txLog=[];txPaint(id);log(m+' ('+t.title+')');toast(m);
  if(t.table)await openRun(id);else if(t.curRun&&t.cols&&t.cols.length&&txReadsOnly(t.curRun))await runSql(id,t.curRun);
  const st=$('st_'+id);if(st){st.className='status';st.textContent=m;}}
-// Lets the tab's connection go. The server rolls back whatever was not committed.
-function txClose(t){if(t&&t.txSession){api('/api/session-end',{session:t.txSession,action:'close'});t.txSession=null;}if(t){t.txDirty=false;t.txLog=[];}}
+// Lets the tab's connection go, with its transaction. The server rolls back whatever was not committed.
+function txClose(t){tabSessClose(t);if(t){t.txDirty=false;t.txLog=[];}}
 // A toggle button: pressed or not, kept in .checked like the checkbox it stands in for.
 function togPress(b,on){b.checked=on===undefined?!b.checked:!!on;b.classList.toggle('ison',b.checked);b.setAttribute('aria-pressed',String(b.checked));}
 function txPaint(id){const t=T(id),cb=$('txac_'+id),bar=$('txbar_'+id),cm=$('txcommit_'+id);const on=!!(t&&t.txOn),dirty=!!(t&&(t.txDirty||(t.txOn&&pendingCount(t)>0)));
@@ -9837,7 +9942,8 @@ function txPaint(id){const t=T(id),cb=$('txac_'+id),bar=$('txbar_'+id),cm=$('txc
 // an export - waited for it, and after 15 seconds failed as "still busy with the statement before".
 // So the cursor is closed first, and the close waited for: the rows already read stay, and what was
 // not read yet comes with the next run.
-async function sessFree(t){if(!t||!sessOf(t)||!t.cursorId)return;const c=t.cursorId;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;
+// run: the result came from a run, on the tab's kept connection, rather than in its transaction.
+async function sessFree(t,run){if(!t||!(run?runSessOf(t):sessOf(t))||!t.cursorId)return;const c=t.cursorId;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;
  try{await api('/api/close-cursor',{cursorId:c});}catch(e){}if(typeof updateStatusLine==='function')updateStatusLine(t.id);}
 function closeCursorFor(t){if(!t||!t.cursorId)return;const cid=t.cursorId;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;
  try{api('/api/close-cursor',{cursorId:cid});}catch(e){}}
@@ -14761,7 +14867,7 @@ $RequestHandler = {
                 '/api/ddl'     { Send-Json $client (Api-Ddl $conn $data.db $data.type $data.name) }
                 '/api/pk'      { Send-Json $client (Api-Pk $conn $data.db $data.table) }
                 '/api/fk'      { Send-Json $client (Api-Fk $conn $data.db $data.table) }
-                '/api/query'   { if ($data.session) { Send-Json $client (Api-TxRun $conn $data 'query') } else { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId $data.pageSize $data.exactText) } }
+                '/api/query'   { if ($data.session) { Send-Json $client (Mark-SessionReset $data.session (Api-TxRun $conn $data 'query')) } else { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId $data.pageSize $data.exactText) } }
                 '/api/session-end' { Send-Json $client (Api-SessionEnd $conn $data) }
                 '/api/fetch-cursor-batch' { Send-Json $client (Api-FetchCursorBatch $data) }
                 '/api/close-cursor' { Send-Json $client (Api-CloseCursor $data) }
@@ -14771,8 +14877,8 @@ $RequestHandler = {
                 '/api/schema-erd' { Send-Json $client (Api-SchemaErd $conn $data.db) }
                 '/api/process-list' { Send-Json $client (Api-ProcessList $conn) }
                 '/api/kill-process' { Send-Json $client (Api-KillProcess $conn $data) }
-                '/api/script'  { if ($data.session) { Send-Json $client (Api-TxRun $conn $data 'script') } else { Send-Json $client (Api-Script $conn $data) } }
-                '/api/script-results' { if ($data.session) { Send-Json $client (Api-TxRun $conn $data 'script-results') } else { Send-Json $client (Api-ScriptResults $conn $data) } }
+                '/api/script'  { if ($data.session) { Send-Json $client (Mark-SessionReset $data.session (Api-TxRun $conn $data 'script')) } else { Send-Json $client (Api-Script $conn $data) } }
+                '/api/script-results' { if ($data.session) { Send-Json $client (Mark-SessionReset $data.session (Api-TxRun $conn $data 'script-results')) } else { Send-Json $client (Api-ScriptResults $conn $data) } }
                 '/api/rowop'   { Send-Json $client (Api-RowOp $conn $data) }
                 '/api/export'  { Send-Json $client (Api-Export $conn $data) }
                 '/api/import'  { Send-Json $client (Api-Import $conn $data) }

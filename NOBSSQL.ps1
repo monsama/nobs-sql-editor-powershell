@@ -1685,29 +1685,106 @@ function Api-KillProcess { param($conn,$data)
     if(-not $pid_ -or -not ($pid_ -match '^[0-9]+$')){ return '{"ok":false,"error":"Invalid process id."}' }
     Run-Exec $conn ("KILL " + $pid_)
 }
-# Endpoint: run a multi-statement SQL script.
-function Api-Script { param($conn,$data)
-    $my=Get-Mysql $conn
-    $cnf=New-Cnf $conn -Tool $my
-    $tmp=Join-Path $env:TEMP ("mysqlscript_"+[Guid]::NewGuid().ToString('N')+".sql")
-    $requestId=[string]$data.requestId
+# A session of mysql.exe for one /api/script call, kept open across its statements so a warning
+# can be read right after the statement that caused it, before the next one resets it. Unlike
+# Open-TxSession (a tab's kept transaction), autocommit is left at the server's default: a script
+# without transaction:true still has each of its statements commit itself, exactly as sending the
+# whole thing to mysql.exe in one piece always did.
+function Open-ScriptSession { param($conn)
+    Initialize-DumpDb
+    $my = Get-Mysql $conn
+    $ra = Get-ResultArgs $my $conn
+    $cnf = New-Cnf $conn -Tool $my
     try {
-        $scriptSql = [string]$data.sql
-        if($data.db){ $bt=[string][char]96; $dbEsc=([string]$data.db).Replace($bt,$bt+$bt); $scriptSql = "USE $bt$dbEsc$bt;`n" + $scriptSql }
-        # Applying staged grid edits sends several statements that only make sense together: if
-        # the third fails, the first two must not stay. mysql.exe stops at the first error by
-        # default, so it never reaches the COMMIT and the transaction is rolled back when the
-        # connection closes. Without this the batch ran on autocommit and a failure left the
-        # table half-updated - the one outcome a pending-changes model exists to prevent.
-        if($data.transaction){ $scriptSql = "START TRANSACTION;`n" + $scriptSql + "`nCOMMIT;" }
-        [IO.File]::WriteAllText($tmp, $scriptSql, (New-Object System.Text.UTF8Encoding($false)))
-        $r=Run-Stdin $my @("--defaults-extra-file=$cnf","--comments") $null $tmp $null $requestId -Sql $scriptSql -Conn $conn
-        if ($r.exit -ne 0 -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
-            $r=Run-Stdin $my @("--defaults-extra-file=$cnf","--comments","--binary-mode") $null $tmp $null $requestId -Sql $scriptSql -Conn $conn
-            if($r.exit -eq 0){ return '{"ok":true,"message":"Auto-retried with --binary-mode (statement contained raw NUL bytes)."}' }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $my; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = $script:RawEnc; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        $psi.Arguments = Format-Args (@("--defaults-extra-file=$cnf", '--comments', '--force', '--unbuffered') + $ra)
+        $p = New-Object System.Diagnostics.Process; $p.StartInfo = $psi; [void]$p.Start()
+        $s = [pscustomobject]@{ Id=$null; Process=$p; Out=(New-Object NobsXmlRows $p.StandardOutput); Err=(New-Object NobsLineSink @($p.StandardError, $p)); Lock=(New-Object object); Cid=0; Conn=$conn }
+        $r = Invoke-TxStatements $s @('SELECT CONNECTION_ID()') 1
+        if ($r.err -or $r.lost) { try { if (-not $p.HasExited) { $p.Kill() } } catch {}; throw $(if ($r.err) { $r.err } else { $script:TxLost }) }
+        $s.Cid = [long]$r.sets[0].Rows[0][0]
+        return $s
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+}
+function Warnings-Json { param([System.Collections.Generic.List[object]]$Warnings)
+    ($Warnings | ForEach-Object { '{"statement":'+$_.stmt+',"level":'+(J-Str $_.level)+',"code":'+$_.code+',"message":'+(J-Str $_.message)+'}' }) -join ','
+}
+# A value the server would store otherwise than typed (cut short, clipped, a zero date) stops a
+# save unless told to keep it anyway - but a SELECT (the row guards an Apply sends to check a
+# value matches exactly one row) warns too, by design, and never blocks anything.
+function Warnings-ChangeData { param([System.Collections.Generic.List[object]]$Warnings, [string[]]$Stmts)
+    foreach ($w in $Warnings) {
+        if ($w.level -match '(?i)^note$') { continue }
+        $i = $w.stmt - 1
+        if ($i -lt 0 -or $i -ge $Stmts.Count -or $Stmts[$i] -notmatch '(?is)^\s*select\b') { return $true }
+    }
+    return $false
+}
+# Endpoint: run a multi-statement SQL script. Each statement runs on its own, followed by SHOW
+# WARNINGS read right after it (see Open-ScriptSession) - what main.rs's take_warnings gets for
+# free from a kept native connection costs one more round trip per statement here, which is what
+# every statement of a tab's kept transaction already pays (Invoke-TxStatements), so a plain
+# script now costs the same per statement that an open transaction always did.
+function Api-Script { param($conn,$data)
+    $requestId=[string]$data.requestId
+    $scriptSql = [string]$data.sql
+    if($data.db){ $bt=[string][char]96; $dbEsc=([string]$data.db).Replace($bt,$bt+$bt); $scriptSql = "USE $bt$dbEsc$bt;`n" + $scriptSql }
+    $wantTx = [bool]$data.transaction
+    $failOnWarnings = [bool]$data.failOnWarnings
+    $user = [NobsTxSql]::Split($scriptSql)
+    $warnings = New-Object 'System.Collections.Generic.List[object]'
+    $s = $null; $entry = $null
+    try {
+        $s = Open-ScriptSession $conn
+    } catch { return '{"ok":false,"error":'+(J-Str (Get-InnerMessage $_))+'}' }
+    try {
+        if ($requestId) { $entry = [pscustomobject]@{ Process=$null; Cancelled=$false; TxSession=$s }; $script:RunningQueries[$requestId] = $entry }
+        $errMsg = $null; $lost = $false
+        if ($wantTx) {
+            $r0 = Invoke-TxStatements $s @('START TRANSACTION') 1
+            if ($r0.lost) { return '{"ok":false,"error":'+(J-Str $script:TxLost)+'}' }
+            if ($r0.err) { return '{"ok":false,"error":'+(J-Str $r0.err)+'}' }
         }
-        if($r.exit -eq 0){ return '{"ok":true}' } else { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
-    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+        $n = 0
+        foreach ($st in $user) {
+            $n++
+            if ($entry -and $entry.Cancelled) { $errMsg = 'Query cancelled.'; break }
+            $r1 = Invoke-TxStatements $s @($st) 1
+            if ($r1.lost) { $lost = $true; break }
+            if ($r1.err) { $errMsg = $r1.err; break }
+            $rw = Invoke-TxStatements $s @('SHOW WARNINGS') 50
+            if (-not $rw.lost -and -not $rw.err) {
+                foreach ($set in $rw.sets) { foreach ($row in $set.Rows) {
+                    if ($row.Length -ge 3) { $warnings.Add([pscustomobject]@{ stmt=$n; level=[string]$row[0]; code=[string]$row[1]; message=[string]$row[2] }) }
+                } }
+            }
+        }
+        if ($entry -and $entry.Cancelled) {
+            if ($wantTx) { $null = Invoke-TxStatements $s @('ROLLBACK') 1 }
+            return '{"ok":false,"cancelled":true,"error":"Query cancelled."}'
+        }
+        if ($lost) { return '{"ok":false,"error":'+(J-Str $script:TxLost)+'}' }
+        if ($errMsg) {
+            if ($wantTx) { $null = Invoke-TxStatements $s @('ROLLBACK') 1 }
+            return '{"ok":false,"error":'+(J-Str $errMsg)+',"warnings":['+(Warnings-Json $warnings)+']}'
+        }
+        if ($failOnWarnings -and (Warnings-ChangeData $warnings $user)) {
+            if ($wantTx) { $null = Invoke-TxStatements $s @('ROLLBACK') 1 }
+            return '{"ok":false,"warned":true,"affected":0,"warnings":['+(Warnings-Json $warnings)+'],"error":"The server would not store every value as given, so nothing was saved."}'
+        }
+        if ($wantTx) {
+            $rc = Invoke-TxStatements $s @('COMMIT') 1
+            if ($rc.lost) { return '{"ok":false,"error":'+(J-Str $script:TxLost)+'}' }
+            if ($rc.err) { return '{"ok":false,"error":'+(J-Str $rc.err)+'}' }
+        }
+        return '{"ok":true,"warnings":['+(Warnings-Json $warnings)+']}'
+    } finally {
+        if ($requestId) { $null = $script:RunningQueries.TryRemove($requestId, [ref]$null) }
+        if ($s) { Stop-TxSession $s }
+    }
 }
 # Endpoint: run a script on one connection and return every result set it produces - a
 # procedure's SELECTs, or several SELECTs in a row - which Api-Script discards. At most maxRows
@@ -5277,6 +5354,7 @@ body.schemas-folded #schemas{display:none} #objects{flex:1;overflow:auto}
  .fitmax [data-reserve]{display:inline-flex!important}
  .applyn{min-width:6.6em;font-variant-numeric:tabular-nums} .txn{min-width:2.8em;font-variant-numeric:tabular-nums}
  .statusbar{display:flex;min-width:0} .statusbar>.status:first-child{flex:1;min-width:0} .pagerinfo{white-space:nowrap} .pagerinfo:empty{display:none}
+ .warnspan{white-space:nowrap;flex:none} .warnspan:empty{display:none} .warnlink{color:var(--warn);font-weight:600} .notelink{color:var(--muted)}
  .stk{display:inline-grid} .stk>span{grid-area:1/1} .stk>.off{visibility:hidden}
  .c-str{color:var(--str)} .c-kw{color:var(--kw);font-weight:600} .c-com{color:var(--com);font-style:italic} .c-num{color:var(--num)}
  .toolbar{padding:4px 8px;background:var(--panel);border-bottom:1px solid var(--bd2);display:flex;gap:9px;align-items:center;flex-wrap:wrap}
@@ -5944,6 +6022,10 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="txLogSub" class="muted" style="flex:none;font-size:12px;margin:-4px 0 10px"></div>
  <div id="txLogList" class="clist" style="flex:1;min-height:0"></div>
  <div class="row" style="flex:none;margin-top:10px"><span class="muted" style="font-size:12px">Nothing here is permanent until Commit; Rollback undoes all of it.</span><span style="flex:1"></span><button class="warn" id="txLogRollback" onclick="txLogEnd('rollback')" title="Undo everything in this transaction">Rollback</button><button class="go" id="txLogCommit" onclick="txLogEnd('commit')" title="Make everything in this transaction permanent">Commit</button><button onclick="hide('mTxLog')">Close</button></div></div></div>
+<div class="modal floating" id="mWarn"><div class="box" style="width:900px;max-width:95vw;height:60vh;max-height:700px;display:flex;flex-direction:column;overflow:hidden;top:80px;left:180px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mWarn')" title="Drag to move"><h3 style="margin:0 0 10px" id="warnTitle">Server warnings</h3></div>
+ <div id="warnSub" class="muted" style="flex:none;font-size:12px;margin:-4px 0 10px"></div>
+ <div id="warnList" style="flex:1;min-height:0;overflow:auto"></div>
+ <div class="row" style="flex:none;margin-top:10px"><span style="flex:1"></span><button class="warn write" id="warnApply" style="display:none" onclick="warnApplyAnyway()" title="Save the edits with the values as the server takes them">Apply anyway</button><button id="warnClose" onclick="hide('mWarn')">Close</button></div></div></div>
 <div class="modal floating" id="mUserTransfer"><div class="box" style="width:820px;max-width:94vw;height:640px;display:flex;flex-direction:column;overflow:hidden;top:60px;left:130px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mUserTransfer')" title="Drag to move"><h3 style="margin:0 0 10px">Transfer script</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mUserTransfer')" title="Maximize" id="maxBtn_mUserTransfer" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mUserTransfer')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="muted" style="margin-bottom:8px;flex:none">A script that recreates this server's accounts and roles on another one: each account as the server itself describes it (SHOW CREATE USER), then its grants (SHOW GRANTS) - sign-in method, password hash and grant options included. Copy or save it, and run it on the target server.</div>
  <div class="row" style="flex:none"><span class="muted" style="flex:none">Leave out these accounts</span> <input id="utExclude" style="flex:1" value="mysql.sys,mysql.session,mysql.infoschema,root,debian-sys-maint,mariadb.sys,healthcheck,mariabackup,galera,replica,PUBLIC"></div>
@@ -6320,7 +6402,8 @@ function hideDead(){const d=$('deadOverlay');if(d)d.style.display='none';}
 async function api(path,p,signal){
  const txe=(p&&p.session)?txWatch(path,p):null;
  const r=await apiCall(path,p,signal);
- if(txe){txe.ok=!!(r&&r.ok);if(r&&!r.ok)txe.error=r.error||(r.aborted?'Cancelled.':'Failed.');if(r&&r.affected!=null)txe.affected=+r.affected;}
+ if(txe){txe.ok=!!(r&&r.ok);if(r&&!r.ok)txe.error=r.error||(r.aborted?'Cancelled.':'Failed.');if(r&&r.affected!=null)txe.affected=+r.affected;
+  const ws=r&&r.warnings?warnFromWrites(r.warnings,splitStmts(String(p.sql||''))):[];if(ws.length)txe.warn=warnText(ws);}
  if(p&&p.session&&r&&r.ok===false&&TX_LOST.test(r.error||''))txLost(p.session);
  if(path!=='/api/query'||!p||p.pageSize!=null||!r||!r.ok||!r.hasMore||!r.cursorId)return r;
  // The desktop backend does not repeat cursorId in a fetch answer; the id stays the same.
@@ -6329,6 +6412,7 @@ async function api(path,p,signal){
   cur=await apiCall('/api/fetch-cursor-batch',{cursorId:cid,requestId:p.requestId,pageSize:5000},signal);
   if(!cur||!cur.ok){apiCall('/api/close-cursor',{cursorId:cid});return cur||{ok:false,error:'Reading the rest of the result failed.'};}
   for(const x of cur.rows)rows.push(x);
+  if(cur.warnings&&cur.warnings.length)r.warnings=(r.warnings||[]).concat(cur.warnings);
  }
  r.rows=rows;r.hasMore=false;delete r.cursorId;
  return r;
@@ -8648,7 +8732,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   '<button class="tog ison" id="txac_'+id+'" aria-pressed="true" onclick="txToggle(\''+id+'\',this.classList.contains(\'ison\'))" data-ic="autocommit" data-fit="2" title="Auto-commit: every statement is permanent as soon as it runs. Turn it off to keep everything this tab runs in one transaction, on a connection of its own, until you Commit or Roll back.">Auto-commit</button>'+
   '<span id="txbar_'+id+'" style="display:inline-flex;gap:6px;align-items:center;margin-left:6px"><button class="sm" id="txcommit_'+id+'" disabled title="Make this tab\'s changes permanent, including grid edits not applied yet" onclick="txEnd(\''+id+'\',\'commit\')">Commit</button><button class="sm txn" id="txlog_'+id+'" disabled title="What this transaction has run so far" onclick="txShowLog(\''+id+'\')">0</button><button class="sm warn" id="txrollback_'+id+'" disabled title="Undo everything this tab has not committed, including grid edits not applied yet" onclick="txEnd(\''+id+'\',\'rollback\')">Rollback</button></span>'+
   '</span></div>'+
-  '<div class="qfbar" id="qf_'+id+'" style="display:none"></div><div id="rsets_'+id+'" style="display:none;gap:6px;align-items:center;flex-wrap:wrap;padding:4px 8px"></div><div class="result" id="res_'+id+'"></div>'+vpHtml(id)+'<div class="statusbar"><div class="status" id="st_'+id+'">Ready.</div>'+pager+'</div>';
+  '<div class="qfbar" id="qf_'+id+'" style="display:none"></div><div id="rsets_'+id+'" style="display:none;gap:6px;align-items:center;flex-wrap:wrap;padding:4px 8px"></div><div class="result" id="res_'+id+'"></div>'+vpHtml(id)+'<div class="statusbar"><div class="status" id="st_'+id+'">Ready.</div><span class="status warnspan" id="stw_'+id+'"></span>'+pager+'</div>';
  $('panes').appendChild(pane);watchBar(pane.querySelector('.toolbar'));edFoldSync(id);vpWire(id);const ta=$('ed_'+id);ta.value=sql||'';
  const ra1=$('resultActions_'+id);if(ra1)ra1.style.display='none';updateEditBar(id);
  (function(){const es=$('es_'+id),ew=$('ew_'+id);es.addEventListener('mousedown',e=>{if(e.target!==es)return;e.preventDefault();
@@ -9362,6 +9446,7 @@ async function runScriptResults(id,sql,reqId,seq){
  const n=t.resultSets.length;
  if(r.ok){st.className='status';st.textContent='OK. '+stmts.length+' statement(s) executed, '+n+' result(s).';log('SCRIPT OK ('+stmts.length+' statements, '+n+' results)');}
  else{st.className='status err';st.textContent=timeLimitNote(r.error||'Failed.')+(n?' - showing the '+n+' result(s) produced before it.':'');log(logErr(r.error||'Failed.'));}
+ setRunWarnings(id,r.warnings,stmts);
  if(writes&&t.db)loadObjects(t.db);
 }
 function showResultSet(id,i){
@@ -9454,6 +9539,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
  // A CALL, or more than one SELECT: every result is shown, each in its own tab.
  const multiResult=scriptShowsResults(stmts);
  if(t.resultSets){t.resultSets=null;renderResultSetTabs(id);}
+ setRunWarnings(id,null,stmts);
  const reqId=(crypto.randomUUID?crypto.randomUUID():('r'+Date.now()+Math.random()));
  t.abortCtrl=new AbortController();t.runningReqId=reqId;setRunning(id,true);
  // Which run this is. A second run can start on this tab while this one is still in flight - the
@@ -9487,6 +9573,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
       const scriptR=await api('/api/script',{sql:leadingSql,db:dbOf(t),session:sessOf(t),timeLimit:timeLimitSec()},t.abortCtrl.signal);
       if(scriptR.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
       if(stale())return;
+      setRunWarnings(id,scriptR.warnings,stmts);
       if(!scriptR.ok){st.className='status err';st.textContent=timeLimitNote(scriptR.error);$('res_'+id).innerHTML='';log('ERROR: '+scriptR.error);if(t.ddl){const _rn=await ddlRestoreIfDropped(t.ddl);if(_rn){st.textContent+=_rn;log(_rn.trim());}}return;}
     }
     const _q=(leadingAreAllUse&&stmts.length>1?sql:lastStmt).trim().replace(/;+\s*$/,'');
@@ -9511,6 +9598,8 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
     // rebuilt at all, even though this new table has a PK and should show +Row/Apply/etc.
     {const eb=$('edit_'+id);eb.style.display='none';}
     t.cursorId=r.cursorId||null;t.hasMore=!!r.hasMore;t.cursorReqId=t.cursorId?reqId:null;
+    t.warnFinalNo=stmts.length||1;
+    addRunWarnings(id,r.warnings);
     if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';return;}
     const ra=$('resultActions_'+id);if(ra)ra.style.display='inline-flex';
     refreshRunTableBinding(id,lastStmt,tableDb);
@@ -9575,6 +9664,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
       if(t.db)loadObjects(t.db);
     } else if(r.ok){st.textContent='OK. '+stmts.length+' statement(s) executed.';log('SCRIPT OK ('+stmts.length+' statements)');if(t.db)loadObjects(t.db);}
     else{st.className='status err';st.textContent=timeLimitNote(r.error);log('SCRIPT ERROR: '+r.error);await schemaGoneNote(id,r.error);}
+    setRunWarnings(id,r.warnings,stmts);
   }
  } finally {
   if(!stale()){t.runningReqId=null;t.abortCtrl=null;setRunning(id,false);}
@@ -9645,10 +9735,32 @@ function txLogRender(){const id=window._txLogTab,t=T(id),box=$('txLogList');if(!
  else box.innerHTML=log.map(e=>{
   const kind=e.grid?'<span class="utag urole">grid edits</span>':'<span class="utag">query</span>';
   const res=e.ok===undefined?'<span class="muted">running...</span>':e.ok?(e.affected!=null?'<span class="'+(+e.affected?'uok':'muted')+'">'+fmtCount(+e.affected)+' row'+(+e.affected===1?'':'s')+' changed</span>':'<span class="uok">done</span>'):'<span class="uwarn">failed: '+esc(String(e.error||'').split('\n')[0])+'</span>';
-  return '<div class="citem"><div class="citem-h"><span class="muted" style="font-family:var(--mono);font-size:12px">'+hm(e.at)+'</span>'+kind+'<span class="citem-t">'+res+'</span></div><pre class="ugrants" style="margin:0;max-height:180px">'+esc(e.sql.trim())+'</pre></div>';}).join('');
+  return '<div class="citem"><div class="citem-h"><span class="muted" style="font-family:var(--mono);font-size:12px">'+hm(e.at)+'</span>'+kind+'<span class="citem-t">'+res+(e.warn?' <span class="uwarn">'+esc(e.warn)+'</span>':'')+'</span></div><pre class="ugrants" style="margin:0;max-height:180px">'+esc(e.sql.trim())+'</pre></div>';}).join('');
  const on=!!(t&&t.txOn),dirty=!!(t&&t.txDirty);
  $('txLogCommit').disabled=!on||!dirty;$('txLogRollback').disabled=!on||!dirty;}
 async function txLogEnd(action){const id=window._txLogTab;hide('mTxLog');if(id!=null)await txEnd(id,action);}
+function warnIsNote(x){return /^note$/i.test(String(x&&x.level||''));}
+function warnText(ws){let w=0,n=0;(ws||[]).forEach(x=>{if(warnIsNote(x))n++;else w++;});const p=[];
+ if(w)p.push(w+' warning'+(w===1?'':'s'));if(n)p.push(n+' note'+(n===1?'':'s'));return p.join(', ');}
+function warnLine(x,stmts){return (x.level||'Warning')+' '+x.code+': '+x.message+(stmts&&stmts.length>1?' (statement '+x.statement+')':'');}
+function warnFromWrites(ws,stmts){return (ws||[]).filter(x=>!/^\s*select\b/i.test(sqlHead((stmts||[])[x.statement-1]||'')));}
+function setRunWarnings(id,ws,stmts){const t=T(id);if(!t)return;t.warnings=null;t.warnStmts=stmts||null;warnPaint(id);addRunWarnings(id,ws,true);}
+function addRunWarnings(id,ws,kept){const t=T(id);if(!t||!ws||!ws.length)return;
+ const add=kept?ws:ws.map(x=>Object.assign({},x,{statement:t.warnFinalNo||1}));
+ t.warnings=(t.warnings||[]).concat(add);warnPaint(id);
+ log(warnText(add)+' ('+t.title+'):\n'+add.map(x=>'  '+warnLine(x,t.warnStmts)).join('\n'));}
+function warnPaint(id){const t=T(id),el=$('stw_'+id);if(!t||!el)return;
+ el.innerHTML=t.warnings?'<a href="#" class="'+(t.warnings.some(x=>!warnIsNote(x))?'warnlink':'notelink')+'" title="What the server said about this run" onclick="event.preventDefault();warnShow(\''+id+'\')">'+esc(warnText(t.warnings))+'</a>':'';}
+function warnShow(id){const t=T(id);if(t&&t.warnings)warnOpen(t.title,t.warnings,t.warnStmts);}
+let _warnApply=null;
+function warnOpen(title,ws,stmts,apply){_warnApply=apply||null;const many=!!(stmts&&stmts.length>1);
+ $('warnTitle').textContent=apply?'Not saved: the server would change values':'Server warnings';
+ $('warnSub').textContent=title+' - '+warnText(ws)+(apply?'. Nothing was saved. Apply anyway stores the values as the server takes them.':'');
+ $('warnList').innerHTML='<table class="utab"><thead><tr>'+(many?'<th>Statement</th>':'')+'<th>Level</th><th>Code</th><th>Message</th></tr></thead><tbody>'+
+  ws.map(x=>'<tr>'+(many?'<td style="font-family:var(--mono);font-size:12px">'+x.statement+': '+esc(clip(String(stmts[x.statement-1]||'').trim(),80))+'</td>':'')+
+   '<td class="'+(warnIsNote(x)?'muted':'uwarn')+'">'+esc(x.level)+'</td><td>'+esc(x.code)+'</td><td>'+esc(x.message)+'</td></tr>').join('')+'</tbody></table>';
+ $('warnApply').style.display=apply?'':'none';$('warnClose').textContent=apply?'Cancel':'Close';show('mWarn');}
+async function warnApplyAnyway(){const a=_warnApply;_warnApply=null;hide('mWarn');if(a)await a();}
 function txToggle(id,manual){const t=T(id);if(!t)return;
  if(manual){t.txOn=true;t.txSession=t.txSession||('tx_'+id+'_'+Date.now().toString(36));}
  else{if(t.txDirty){toast('Commit or roll back the open transaction first.',true);txPaint(id);return;}t.txOn=false;txClose(t);}
@@ -9707,6 +9819,7 @@ async function fetchNextBatch(id){const t=T(id);if(!t||!t.cursorId||t.runningReq
   if(!r.ok){if(st){st.className='status err';st.textContent=timeLimitNote(r.error,true);}log(logErr(r.error));t.cursorId=null;t.cursorReqId=null;t.hasMore=false;return;}
   t.rows=t.rows.concat(r.rows);
   t.hasMore=!!r.hasMore;t.cursorId=r.hasMore?(r.cursorId||t.cursorId):null;t.cursorReqId=t.hasMore?t.cursorReqId:null;
+  addRunWarnings(id,r.warnings);
   if(st){st.className=wasClassName;st.textContent=wasText;}
   // renderBody (not renderGrid) deliberately: it only rewrites tbody's own innerHTML, not the
   // scrollable wrap element's - renderGrid replacing wrap's innerHTML resets scrollTop to 0,
@@ -11801,10 +11914,10 @@ function revertChanges(id){const t=T(id);t.pending={upd:{},del:new Set(),ins:[]}
 // changed it since - and a literal written for the wrong mode can end in the wrong place: under
 // backslash escapes, the value \ written as '\' swallows the quote and the SQL after it. So that
 // session is asked first, and the literals follow what it says.
-async function applyChanges(id,preview){if(roBlock())return;const t=T(id);const W=typeof window!=='undefined'?window:{};const nbe0=W.noBackslashEscapes;
+async function applyChanges(id,preview,anyway){if(roBlock())return;const t=T(id);const W=typeof window!=='undefined'?window:{};const nbe0=W.noBackslashEscapes;
  if(t&&sessOf(t)){await sessFree(t);try{const m=await api('/api/query',{sql:'SELECT @@SESSION.sql_mode',session:sessOf(t)});if(m&&m.ok&&m.rows&&m.rows.length)W.noBackslashEscapes=/NO_BACKSLASH_ESCAPES/i.test(String(m.rows[0][0]||''));}catch(e){}}
- try{return await applyChangesRun(id,preview);}finally{W.noBackslashEscapes=nbe0;}}
-async function applyChangesRun(id,preview){const t=T(id);const S=[];const tbl=qid(t.db)+'.'+qid(t.table);
+ try{return await applyChangesRun(id,preview,anyway);}finally{W.noBackslashEscapes=nbe0;}}
+async function applyChangesRun(id,preview,anyway){const t=T(id);const S=[];const tbl=qid(t.db)+'.'+qid(t.table);
  const bc=await gridBinCols(id);
  // Screened before any SQL is built, so a bad paste writes nothing at all rather than part of a
  // batch. Covers inline cell edits and new rows alike - the grid is the other way into a binary
@@ -11887,10 +12000,13 @@ async function applyChangesRun(id,preview){const t=T(id);const S=[];const tbl=qi
  // parent that does not exist and silently break referential integrity the schema was
  // written to guarantee.
  await sessFree(t);
- const r=await api('/api/script',{sql:S.join('\n'),transaction:true,session:sessOf(t)});
+ const r=await api('/api/script',{sql:S.join('\n'),transaction:true,session:sessOf(t),failOnWarnings:!anyway});
+ const stmts=splitStmts(S.join('\n')),ws=warnFromWrites(r.warnings,stmts);
+ if(!r.ok&&r.warned){log('APPLY stopped: '+warnText(ws)+'\n'+ws.map(x=>'  '+warnLine(x,stmts)).join('\n'));
+  warnOpen(t.title+' - Apply',ws,stmts,()=>applyChanges(id,false,true));return false;}
  // true once saved, so Commit (txEnd) can tell whether to go on; it waits for the grid to show what
  // was saved, since until then the reload is still reading on the tab's connection.
- if(r.ok){log('Applied '+changes+' change(s).');toast('Applied '+changes+' change(s).','ok');invalidateTableCache(t.db,t.table);await openRun(id);refreshTabDirty(id);return true;}else{log('APPLY error: '+r.error);toast(/Result consisted of more than one row/.test(String(r.error))?ONE_ROW_REFUSED:'Apply failed: '+r.error,true);return false;}}
+ if(r.ok){log('Applied '+changes+' change(s).');toast('Applied '+changes+' change(s)'+(ws.length?', with '+warnText(ws):'')+'.','ok');invalidateTableCache(t.db,t.table);await openRun(id);refreshTabDirty(id);if(ws.length)setRunWarnings(id,ws,stmts);return true;}else{log('APPLY error: '+r.error);toast(/Result consisted of more than one row/.test(String(r.error))?ONE_ROW_REFUSED:'Apply failed: '+r.error,true);return false;}}
 
 function ddlFailureNote(err, sql){
  const e = String(err || "");

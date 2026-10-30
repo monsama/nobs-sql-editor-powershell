@@ -283,9 +283,9 @@ for (const f of ['insSel', 'csvSel', 'exportFull', 'copyInserts']) {
     const t = { db: 'd', table: 't', cols: ['id', 'b', 'n'], binCols: [], pk: ['id'], rows: [['1', '0x01', 'x']], exact: true,
                 pending: { upd, del: new Set(), ins } };
     const env = {
-      roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
+      roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, runLog: () => {}, invalidateTableCache: () => {},
       openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, sessFree: async () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, true, false],
-      toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
+      toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m), fmtCount: n => String(n), splitStmts: () => [], warnFromWrites: () => [],
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
     };
     const keys = Object.keys(env);
@@ -379,9 +379,9 @@ for (const f of ['insSel', 'csvSel', 'exportFull', 'copyInserts']) {
     const t = { db: 'd', table: 't', cols: ['k', 'v'], binCols: [], pk: ['k'], rows: [['a b', 'x']], exact,
                 pending: { upd: { '0:1': 'y' }, del: new Set(), ins: [] } };
     const env = {
-      roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
+      roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, runLog: () => {}, invalidateTableCache: () => {},
       openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, sessFree: async () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, false],
-      tableNulTextCount: async () => nulRows, fmtCount: n => String(n),
+      tableNulTextCount: async () => nulRows, fmtCount: n => String(n), splitStmts: () => [], warnFromWrites: () => [],
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
     };

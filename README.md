@@ -97,7 +97,11 @@ without opening a browser.
   in the editor; Save as from the tab's menu). The file keeps its line endings and byte order
   mark, and a tab whose text is not saved to its file shows a `*`.
 - Run the whole script, the selection, or the statement at the cursor. A procedure call, or a
-  script with several SELECTs, shows each result in a tab of its own.
+  script with several SELECTs, shows each result in a tab of its own. The output window logs each
+  run with the time, the tab and the statement, and how many rows it changed or returned and how
+  long it took - for a script, each statement on a line of its own. Lines are marked green, red or
+  amber; a click on an error selects its statement in the editor, and the output can be copied or
+  cleared.
 - Explain draws the plan: every table read as a card, a full scan in red and an index lookup in
   green, with the joins, sorts and subqueries around them. **Measure** runs the query and shows
   what really happened at each step - the rows read and the time taken - beside what was expected

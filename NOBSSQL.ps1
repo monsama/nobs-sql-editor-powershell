@@ -3814,7 +3814,7 @@ function Api-HistAdd { param($data)
     }
     # Only a full read tells how many lines there are now; cheap enough next to one run per request,
     # and it is only this check that pays for it - the append above never re-reads the file.
-    $all=Read-Hist
+    $all=@(Read-Hist)
     if($all.Count -gt ($limit + [Math]::Floor($limit/10))){
         $from=[Math]::Max(0, $all.Count-$limit)
         Write-Hist @($all[$from..($all.Count-1)])
@@ -3823,7 +3823,7 @@ function Api-HistAdd { param($data)
 }
 # Endpoint: every run, newest first. No paging - the window filters, groups and pages them in memory.
 function Api-HistList {
-    $items=Read-Hist; [array]::Reverse($items)
+    $items=@(Read-Hist); [array]::Reverse($items)
     $parts=@($items | ForEach-Object { ($_ | ConvertTo-Json -Depth 6 -Compress) })
     '{"ok":true,"items":['+($parts -join ',')+']}'
 }

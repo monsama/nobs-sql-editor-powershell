@@ -2009,6 +2009,13 @@ function Open-TxSession { param([string]$Id, $conn, [bool]$Tx = $true)
 # statement's. @@error_count was the first way of telling, and it is not one: the server resets it
 # only for a statement that reads a table, so after one error every USE and SET after it seemed to
 # fail too.
+#
+# Known gap this leaves: the marker's own SELECT, needed to find the boundary, is itself a
+# statement - so by the time the session's NEXT statement runs, ROW_COUNT() on the real connection
+# already reflects that SELECT (always -1), not the user's statement before it. A native driver
+# with no statement of its own between the two doesn't have this. Not fixable without dropping the
+# SELECT the boundary detection (SetsUntil) depends on, so a user statement that itself calls
+# ROW_COUNT() right after one that changed rows sees -1 here instead of the real count.
 function Invoke-TxStatements { param($s, [string[]]$Stmts, [int]$MaxRows, [switch]$Warnings)
     Initialize-DumpDb
     $sets = New-Object 'System.Collections.Generic.List[NobsResultSet]'
@@ -2103,6 +2110,7 @@ function Stop-TxSession { param($s)
 function Api-TxRun { param($conn, $data, [string]$Kind)
     $id = [string]$data.session
     $sql = [string]$data.sql
+    [string[]]$exactText = $data.exactText
     if (-not $sql.Trim()) { return '{"ok":false,"error":"Empty query."}' }
     # sessionTx is left out by callers from before a tab's connection outlived Auto-commit being on,
     # whose sessions were all transactions.
@@ -2112,41 +2120,101 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
     $entry = $null
     try {
         if ($rid) { $entry = [pscustomobject]@{ Process=$null; Cancelled=$false; TxSession=$s }; $script:RunningQueries[$rid] = $entry }
-        $stmts = [System.Collections.Generic.List[string]]::new()
         # The tab's connection stays open between runs, so each run from the editor sets the time limit
         # it is sent with - none included, to take off one an earlier run set. It was the one the
         # transaction had been opened with, whatever the connection said later.
-        if ($data.PSObject.Properties['timeLimit']) { $tl = Get-TimeLimitSql $conn $data.timeLimit -Zero; if ($tl) { $stmts.Add($tl) } }
-        if ($data.db) { $bt = [string][char]96; $stmts.Add("USE $bt$(([string]$data.db).Replace($bt, $bt+$bt))$bt") }
+        $setup = [System.Collections.Generic.List[string]]::new()
+        if ($data.PSObject.Properties['timeLimit']) { $tl = Get-TimeLimitSql $conn $data.timeLimit -Zero; if ($tl) { $setup.Add($tl) } }
+        if ($data.db) { $bt = [string][char]96; $setup.Add("USE $bt$(([string]$data.db).Replace($bt, $bt+$bt))$bt") }
         $user = [NobsTxSql]::Split($sql)
-        $batch = ($Kind -eq 'script') -and [bool]$data.transaction
-        if ($batch) { $stmts.Add('SAVEPOINT nobs_batch') }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        if ($Kind -eq 'script') {
+            # A script run this way is a tab's Apply (grid save) or a Run with a kept connection -
+            # each statement of its own, with SHOW WARNINGS read right after it, the same per-
+            # statement round trip Api-Script's own (session-less) path already pays, so this one
+            # does not quietly skip the warnings a grid save relies on to stop before Apply anyway.
+            $wantTx = [bool]$data.transaction
+            $failOnWarnings = [bool]$data.failOnWarnings
+            $warnings = New-Object 'System.Collections.Generic.List[object]'
+            if ($setup.Count -gt 0) {
+                $r0 = Invoke-TxStatements $s $setup.ToArray() 1
+                if ($r0.lost) { $null = $script:TxSessions.TryRemove($id, [ref]$null); return '{"ok":false,"error":'+(J-Str $script:TxLost)+'}' }
+                if ($r0.err) { return '{"ok":false,"error":'+(J-Str $r0.err)+'}' }
+            }
+            if ($wantTx) {
+                $rb = Invoke-TxStatements $s @('SAVEPOINT nobs_batch') 1
+                if ($rb.lost) { $null = $script:TxSessions.TryRemove($id, [ref]$null); return '{"ok":false,"error":'+(J-Str $script:TxLost)+'}' }
+                if ($rb.err) { return '{"ok":false,"error":'+(J-Str $rb.err)+'}' }
+            }
+            $affected = 0; $errMsg = $null; $lost = $false; $k = 0
+            foreach ($st in $user) {
+                $k++
+                if ($entry -and $entry.Cancelled) { $errMsg = 'Query cancelled.'; break }
+                $r1 = Invoke-TxStatements $s @($st) 50 -Warnings
+                if ($r1.lost) { $lost = $true; break }
+                if ($r1.err) { $errMsg = [string]$r1.err; break }
+                # SHOW WARNINGS, read right after the statement (see Invoke-TxStatements -Warnings),
+                # is the LAST result set this call produced - the statement's own, if it has one,
+                # came first.
+                if ($r1.sets.Count -gt 0) {
+                    $warnSet = $r1.sets[$r1.sets.Count - 1]
+                    foreach ($row in $warnSet.Rows) {
+                        if ($row.Length -ge 3) { $warnings.Add([pscustomobject]@{ stmt=$k; level=[string]$row[0]; code=[string]$row[1]; message=[string]$row[2] }) }
+                    }
+                }
+                $affected += [long]$r1.affected
+            }
+            if ($lost) { $null = $script:TxSessions.TryRemove($id, [ref]$null); return '{"ok":false,"error":'+(J-Str $script:TxLost)+'}' }
+            if ($entry -and $entry.Cancelled) {
+                if ($wantTx) { $null = Invoke-TxStatements $s @('ROLLBACK TO SAVEPOINT nobs_batch') 1 }
+                return '{"ok":false,"error":"Query cancelled.","cancelled":true}'
+            }
+            if ($errMsg) {
+                if ($wantTx) { $null = Invoke-TxStatements $s @('ROLLBACK TO SAVEPOINT nobs_batch') 1 }
+                $msg = $errMsg
+                if ($k -ge 1 -and $k -le $user.Count -and $user.Count -gt 1) {
+                    $pv = $user[$k-1]; if ($pv.Length -gt 120) { $pv = $pv.Substring(0, 120) + '...' }
+                    $msg = "Statement $k of $($user.Count) failed: $msg`n`n$pv"
+                }
+                if ($wantTx) { $msg += "`n`nNone of these changes were applied. The tab's transaction is still open." }
+                return '{"ok":false,"error":'+(J-Str $msg)+',"warnings":['+(Warnings-Json $warnings)+']}'
+            }
+            if ($failOnWarnings -and (Warnings-ChangeData $warnings $user)) {
+                if ($wantTx) { $null = Invoke-TxStatements $s @('ROLLBACK TO SAVEPOINT nobs_batch') 1 }
+                return '{"ok":false,"warned":true,"affected":0,"warnings":['+(Warnings-Json $warnings)+'],"error":"The server would not store every value as given, so nothing was saved."}'
+            }
+            if ($wantTx) {
+                $rr = Invoke-TxStatements $s @('RELEASE SAVEPOINT nobs_batch') 1
+                if ($rr.lost) { $null = $script:TxSessions.TryRemove($id, [ref]$null); return '{"ok":false,"error":'+(J-Str $script:TxLost)+'}' }
+                if ($rr.err) { return '{"ok":false,"error":'+(J-Str $rr.err)+'}' }
+            }
+            return '{"ok":true,"affected":'+$affected+',"warnings":['+(Warnings-Json $warnings)+']}'
+        }
+        # 'query' and 'script-results': the whole batch in one round trip - a query's own result
+        # already stands for itself, and script-results discards nothing a user asked to see, so
+        # neither needs the per-statement SHOW WARNINGS round trip above.
+        $stmts = [System.Collections.Generic.List[string]]::new()
+        $stmts.AddRange($setup)
         $first = $stmts.Count
         foreach ($x in $user) { $stmts.Add($x) }
-        if ($batch) { $stmts.Add('RELEASE SAVEPOINT nobs_batch') }
         # A query keeps up to a million rows and hands them to the grid a page at a time (below).
         $maxRows = 1000000
         if ($Kind -eq 'script-results') { $maxRows = [int]$data.maxRows; if ($maxRows -lt 1) { $maxRows = 1000 } }
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $r = Invoke-TxStatements $s $stmts.ToArray() $maxRows
         $sw.Stop()
         if ($r.lost) { $null = $script:TxSessions.TryRemove($id, [ref]$null); return '{"ok":false,"error":'+(J-Str $script:TxLost)+'}' }
         if ($entry -and $entry.Cancelled) {
-            if ($batch) { $null = Invoke-TxStatements $s @('ROLLBACK TO SAVEPOINT nobs_batch') 1 }
             return '{"ok":false,"error":"Query cancelled.","cancelled":true}'
         }
         if ($r.err) {
-            if ($batch) { $null = Invoke-TxStatements $s @('ROLLBACK TO SAVEPOINT nobs_batch') 1 }
             $k = [int]$r.at - $first
             $msg = [string]$r.err
             if ($k -ge 1 -and $k -le $user.Count -and $user.Count -gt 1) {
                 $pv = $user[$k-1]; if ($pv.Length -gt 120) { $pv = $pv.Substring(0, 120) + '...' }
                 $msg = "Statement $k of $($user.Count) failed: $msg`n`n$pv"
             }
-            if ($batch) { $msg += "`n`nNone of these changes were applied. The tab's transaction is still open." }
             return '{"ok":false,"error":'+(J-Str $msg)+'}'
         }
-        if ($Kind -eq 'script') { return '{"ok":true,"affected":' + [long]$r.affected + '}' }
         if ($Kind -eq 'query') {
             $set = $null; foreach ($x in $r.sets) { $set = $x }
             if ($null -eq $set) { return '{"ok":true,"columns":[],"rows":[],"elapsedMs":'+$sw.ElapsedMilliseconds+',"message":"Query OK. No result set."}' }
@@ -2156,15 +2224,27 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
                 $h = Get-ResultHeaders $conn ([string]$set.Statement) ([string]$data.db)
                 if ($h) { $set.Names.AddRange([string[]]@($h)) }
             }
+            $names = $set.Names
+            $rows = $set.Rows
+            # A table grid's query asks for its text columns again as hex, in trailing
+            # __nobs_exact_N columns (see Get-ExactTextMap); a kept session reads a query's whole
+            # result up front rather than streaming it, but still owes the grid the same stripped-
+            # and-spliced-back shape a live cursor (Open-QueryCursor) gives it.
+            if ($exactText.Count -gt 0 -and $names.Count -gt 0) {
+                $m = Get-ExactTextMap @($names) $exactText
+                if ($m.err) { return '{"ok":false,"error":'+(J-Str $m.err)+'}' }
+                $rows = [NobsXmlRows]::Exact($rows, $m.keep, $m.targets)
+                $names = $m.names
+            }
             # The session had to read the whole result before its next statement, so the rest of it is
             # already here: a cursor over it in memory gives the grid its pages the way a live one does.
             $ps = [int]$data.pageSize
-            if ($ps -gt 0 -and $set.Rows.Count -gt $ps) {
+            if ($ps -gt 0 -and $rows.Count -gt $ps) {
                 $cid = 'txmem' + [Guid]::NewGuid().ToString('N')
-                $script:OpenCursors[$cid] = [pscustomobject]@{ Memory=$set.Rows; At=$ps; Headers=[string[]]@($set.Names); Lock=(New-Object object); LastUsed=[DateTime]::UtcNow }
-                return '{"ok":true,"columns":'+(J-Arr @($set.Names))+',"rows":'+(J-RowsFast $set.Rows.GetRange(0, $ps))+',"hasMore":true,"cursorId":"'+$cid+'","elapsedMs":'+$sw.ElapsedMilliseconds+'}'
+                $script:OpenCursors[$cid] = [pscustomobject]@{ Memory=$rows; At=$ps; Headers=[string[]]@($names); Lock=(New-Object object); LastUsed=[DateTime]::UtcNow }
+                return '{"ok":true,"columns":'+(J-Arr @($names))+',"rows":'+(J-RowsFast $rows.GetRange(0, $ps))+',"hasMore":true,"cursorId":"'+$cid+'","elapsedMs":'+$sw.ElapsedMilliseconds+'}'
             }
-            return '{"ok":true,"columns":'+(J-Arr @($set.Names))+',"rows":'+(J-RowsFast $set.Rows)+',"elapsedMs":'+$sw.ElapsedMilliseconds+'}'
+            return '{"ok":true,"columns":'+(J-Arr @($names))+',"rows":'+(J-RowsFast $rows)+',"elapsedMs":'+$sw.ElapsedMilliseconds+'}'
         }
         $sb = New-Object System.Text.StringBuilder
         [void]$sb.Append('[')

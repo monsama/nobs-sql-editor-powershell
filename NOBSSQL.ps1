@@ -1714,6 +1714,12 @@ function Open-ScriptSession { param($conn)
         return $s
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
 }
+# A statement's own SHOW WARNINGS (-Warnings) can still be showing a marker SIGNAL from an
+# earlier call on the same session - START TRANSACTION/SAVEPOINT, the session's own opening
+# SELECT CONNECTION_ID() - whenever the statement that follows it does not fully clear the
+# diagnostics area itself (the same gap noted above @@error_count). Every marker SIGNAL raises
+# the exact same condition, so it is filtered out by shape rather than tracked down call by call.
+function Is-MarkerWarning { param($Row) $Row.Length -ge 3 -and [string]$Row[1] -eq '1644' -and [string]$Row[2] -match '^nobs_tx_[0-9a-f]{32}$' }
 function Warnings-Json { param([System.Collections.Generic.List[object]]$Warnings)
     ($Warnings | ForEach-Object { '{"statement":'+$_.stmt+',"level":'+(J-Str $_.level)+',"code":'+$_.code+',"message":'+(J-Str $_.message)+'}' }) -join ','
 }
@@ -1776,7 +1782,7 @@ function Api-Script { param($conn,$data)
             if ($r1.sets.Count -gt 0) {
                 $warnSet = $r1.sets[$r1.sets.Count - 1]
                 foreach ($row in $warnSet.Rows) {
-                    if ($row.Length -ge 3) { $warnings.Add([pscustomobject]@{ stmt=$n; level=[string]$row[0]; code=[string]$row[1]; message=[string]$row[2] }) }
+                    if ($row.Length -ge 3 -and -not (Is-MarkerWarning $row)) { $warnings.Add([pscustomobject]@{ stmt=$n; level=[string]$row[0]; code=[string]$row[1]; message=[string]$row[2] }) }
                 }
             }
             $statements.Add((Stmt-Report $n $st ([long]$r1.affected) $t0.Elapsed.TotalMilliseconds))
@@ -2165,7 +2171,7 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
                 if ($r1.sets.Count -gt 0) {
                     $warnSet = $r1.sets[$r1.sets.Count - 1]
                     foreach ($row in $warnSet.Rows) {
-                        if ($row.Length -ge 3) { $warnings.Add([pscustomobject]@{ stmt=$k; level=[string]$row[0]; code=[string]$row[1]; message=[string]$row[2] }) }
+                        if ($row.Length -ge 3 -and -not (Is-MarkerWarning $row)) { $warnings.Add([pscustomobject]@{ stmt=$k; level=[string]$row[0]; code=[string]$row[1]; message=[string]$row[2] }) }
                     }
                 }
                 $affected += [long]$r1.affected

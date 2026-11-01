@@ -2218,6 +2218,37 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
         if ($entry -and $entry.Cancelled) {
             return '{"ok":false,"error":"Query cancelled.","cancelled":true}'
         }
+        # script-results: mysql.exe stops at the first error, and the sets Invoke-TxStatements
+        # already collected before that (r.sets) are the results produced before it - built into
+        # JSON once, so both the error return below and the success return further down share it.
+        $resultsJson = $null
+        if ($Kind -eq 'script-results') {
+            # XML output leaves out the column names of a result without rows (see NobsXmlRows). A
+            # statement that is safe to repeat is run again on its own for them (Get-ResultHeaders)
+            # - but not when the script switches databases, where on its own it could read a
+            # different table; and never a CALL - same guard Api-ScriptResults itself uses.
+            $switchesDb = $sql -match '(?im)(^|;)\s*use\s'
+            $reruns = 0
+            foreach ($x in $r.sets) {
+                if ($x.Rows.Count -gt 0 -or $x.Names.Count -gt 0 -or $switchesDb -or $reruns -ge 20) { continue }
+                if (-not (Test-SqlSafeToRerun ([string]$x.Statement))) { continue }
+                $reruns++
+                $h = Get-ResultHeaders $conn ([string]$x.Statement) ([string]$data.db)
+                if ($h) { $x.Names.AddRange([string[]]@($h)) }
+            }
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.Append('[')
+            $n = 0
+            foreach ($x in $r.sets) {
+                if ($n -gt 0) { [void]$sb.Append(',') }
+                $n++
+                $stmt = [string]$x.Statement; if ($stmt.Length -gt 120) { $stmt = $stmt.Substring(0, 120) }
+                [void]$sb.Append('{"statement":' + $n + ',"sql":' + (J-Str $stmt) + ',"columns":' + (J-Arr @($x.Names)) + ',"rows":' + (J-RowsFast $x.Rows) +
+                                 ',"rowCount":' + $x.Count + ',"truncated":' + $(if ($x.Count -gt $x.Rows.Count) { 'true' } else { 'false' }) + '}')
+            }
+            [void]$sb.Append(']')
+            $resultsJson = $sb.ToString()
+        }
         if ($r.err) {
             $k = [int]$r.at - $first
             $msg = [string]$r.err
@@ -2225,6 +2256,7 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
                 $pv = $user[$k-1]; if ($pv.Length -gt 120) { $pv = $pv.Substring(0, 120) + '...' }
                 $msg = "Statement $k of $($user.Count) failed: $msg`n`n$pv"
             }
+            if ($Kind -eq 'script-results') { return '{"ok":false,"error":'+(J-Str $msg)+',"results":'+$resultsJson+'}' }
             return '{"ok":false,"error":'+(J-Str $msg)+'}'
         }
         if ($Kind -eq 'query') {
@@ -2258,18 +2290,7 @@ function Api-TxRun { param($conn, $data, [string]$Kind)
             }
             return '{"ok":true,"columns":'+(J-Arr @($names))+',"rows":'+(J-RowsFast $rows)+',"elapsedMs":'+$sw.ElapsedMilliseconds+'}'
         }
-        $sb = New-Object System.Text.StringBuilder
-        [void]$sb.Append('[')
-        $n = 0
-        foreach ($x in $r.sets) {
-            if ($n -gt 0) { [void]$sb.Append(',') }
-            $n++
-            $stmt = [string]$x.Statement; if ($stmt.Length -gt 120) { $stmt = $stmt.Substring(0, 120) }
-            [void]$sb.Append('{"statement":' + $n + ',"sql":' + (J-Str $stmt) + ',"columns":' + (J-Arr @($x.Names)) + ',"rows":' + (J-RowsFast $x.Rows) +
-                             ',"rowCount":' + $x.Count + ',"truncated":' + $(if ($x.Count -gt $x.Rows.Count) { 'true' } else { 'false' }) + '}')
-        }
-        [void]$sb.Append(']')
-        return '{"ok":true,"results":'+$sb.ToString()+'}'
+        return '{"ok":true,"results":'+$resultsJson+'}'
     } finally {
         if ($rid) { $null = $script:RunningQueries.TryRemove($rid, [ref]$null) }
         Exit-TxSession $s

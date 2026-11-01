@@ -2035,15 +2035,18 @@ function Invoke-TxStatements { param($s, [string[]]$Stmts, [int]$MaxRows, [switc
         # Read right after the statement, before the marker's own SIGNAL overwrites the diagnostics
         # area with its own (synthetic) condition - a separate SHOW WARNINGS call later would read
         # that instead of the statement's.
-        #
+        if ($Warnings) { $body += "SHOW WARNINGS;`n" }
         # ROW_COUNT() in the marker is what the statement before it changed, for the transaction's
-        # log - but SHOW WARNINGS is itself a statement that returns a result set, which resets
-        # ROW_COUNT() same as a SELECT does. With -Warnings, a SET right after the statement (which
-        # does not touch ROW_COUNT()) saves it into a session variable before SHOW WARNINGS can
-        # clobber it, and the marker reads that variable back instead of calling ROW_COUNT() fresh.
-        if ($Warnings) { $body += "SET @nobs_rc := ROW_COUNT();`nSHOW WARNINGS;`n" }
-        $rowsExpr = if ($Warnings) { '@nobs_rc' } else { 'ROW_COUNT()' }
-        $bytes = [Text.Encoding]::UTF8.GetBytes($body + "SELECT '$marker' AS nobs_marker, $rowsExpr AS nobs_rows;`nSIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='$marker';`n")
+        # log - but with -Warnings, SHOW WARNINGS has already run as its own statement by the time
+        # the marker reads it, and resets ROW_COUNT() same as a SELECT does (see the known gap
+        # above). A SET right after the real statement, saving it into a session variable before
+        # SHOW WARNINGS can clobber it, fixes ROW_COUNT() here - but on MySQL (unlike MariaDB) that
+        # SET itself seems to clear the warning list SHOW WARNINGS was about to read, trading a
+        # correct row count for an empty one. Warnings matter more (a grid Apply relies on them to
+        # stop before a cut-short value is saved) than a script's own "rows changed" log line, so
+        # with -Warnings this reads ROW_COUNT() as it stands after SHOW WARNINGS - usually -1,
+        # i.e. not counted - rather than risk the SET's side effect on every server.
+        $bytes = [Text.Encoding]::UTF8.GetBytes($body + "SELECT '$marker' AS nobs_marker, ROW_COUNT() AS nobs_rows;`nSIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='$marker';`n")
         try { $s.Process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length); $s.Process.StandardInput.BaseStream.Flush() }
         catch { return @{ sets=$sets; lost=$true; err=$script:TxLost } }
         $part = $s.Out.SetsUntil($MaxRows, $marker)

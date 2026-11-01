@@ -118,7 +118,10 @@ without opening a browser.
   listed too, but do not stand out.
 - Your own fonts and text sizes for the editor, the results and the interface, and an interface
   zoom (Settings → General).
-- Query history, and a reusable query library.
+- Query history: every query you run, with its time, connection, database, outcome (or error),
+  duration and rows, kept in a file (5,000 runs by default, set in Settings → General). Search it
+  and narrow it to this connection, errors or a time span; open, insert or copy a query again.
+- A reusable query library.
 
 **Results and editing**
 - Result grids with per-column filtering and sorting, column resize and show/hide, and a
@@ -139,7 +142,7 @@ without opening a browser.
 **Databases**
 - Browse databases, tables, views, procedures, functions, triggers and events, with quick filtering
   and search across all databases.
-- Table designer and DDL view and edit; routines and triggers edited and recreated in place.
+- Table designer: columns (moved up and down, UNSIGNED, collation), indexes, foreign keys and table options (engine, collation, comment, rename), shown as SQL you can read before it runs. DDL view and edit; routines and triggers edited and recreated in place.
 - Inspect a table: its details and sizes, its indexes with their columns in order, its foreign
   keys, and the tables that point at it.
 - ER diagrams: each table to the right of the tables it refers to, its columns with their types

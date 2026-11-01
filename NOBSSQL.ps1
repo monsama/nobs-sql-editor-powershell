@@ -3712,6 +3712,9 @@ function Api-Browse { param($data)
 # --- Saved connections (passwords encrypted with Windows DPAPI, per-user) ---
 $script:ConnFile = Join-Path $env:APPDATA 'NOBSSQL\connections.json'
 $script:LibFile = Join-Path $env:APPDATA 'NOBSSQL\library.json'
+$script:HistFile = Join-Path $env:APPDATA 'NOBSSQL\history.jsonl'
+# A run whose SQL is longer than this is not kept - matches the frontend's own check (histStart).
+$script:HistMaxSql = 1048576
 # Read the saved-query library from disk (library.json).
 function Load-Lib {
     if(-not (Test-Path $script:LibFile)){ return @() }
@@ -3761,6 +3764,86 @@ function Api-LibReplace { param($data)
         }
     }
     Save-Lib $list; '{"ok":true}'
+}
+# Query history: one run per line of history.jsonl, beside library.json - when it ran, on which
+# connection and database, the SQL, and what came of it (see histStart in the page). A run is added
+# at the end of the file (Api-HistAdd), so it costs one short append however long the history is.
+# Past the limit the oldest runs go, in one rewrite once the file holds a tenth more than the limit,
+# not at every run. The browser's storage, which held it before, is left to the open tabs (histMigrate).
+function Read-Hist {
+    if(-not (Test-Path $script:HistFile)){ return @() }
+    try {
+        $lines=[IO.File]::ReadAllLines($script:HistFile)
+        $acc=New-Object System.Collections.ArrayList
+        foreach($l in $lines){
+            if(-not $l.Trim()){ continue }
+            $o=$null; try { $o=$l | ConvertFrom-Json } catch { continue }
+            if($o -and $o.PSObject -and $o.PSObject.Properties['sql']){ [void]$acc.Add($o) }
+        }
+        return @($acc.ToArray())
+    } catch { return @() }
+}
+# Written whole to a file beside it, then put in its place, so a crash leaves the old one or the new.
+function Write-Hist { param($list)
+    Use-FileLock 'Hist' {
+        $d=Split-Path $script:HistFile; if(-not(Test-Path $d)){New-Item -ItemType Directory -Path $d -Force|Out-Null}
+        $tmp=$script:HistFile+'.tmp'
+        $lines=@(@($list) | ForEach-Object { ($_ | ConvertTo-Json -Depth 6 -Compress) })
+        $text=if($lines.Count){ ($lines -join "`n")+"`n" } else { '' }
+        [IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $script:HistFile -Force
+    }
+}
+# What may be kept: an object with SQL, not empty and not longer than HistMaxSql.
+function Test-HistKeep { param($e)
+    if(-not ($e -and $e.PSObject -and $e.PSObject.Properties['sql'])){ return $false }
+    $s=[string]$e.sql
+    return ($s.Trim().Length -gt 0) -and ($s.Length -le $script:HistMaxSql)
+}
+# Endpoint: add one run (data.entry) or several (data.entries - the one-time migration only).
+function Api-HistAdd { param($data)
+    $limit=5000; if($data.limit){ $limit=[Math]::Min(100000,[Math]::Max(100,[long]$data.limit)) }
+    $entries = if($data.entries){ @($data.entries) } else { @($data.entry) }
+    $keep=@($entries | Where-Object { Test-HistKeep $_ })
+    if($keep.Count){
+        Use-FileLock 'Hist' {
+            $d=Split-Path $script:HistFile; if(-not(Test-Path $d)){New-Item -ItemType Directory -Path $d -Force|Out-Null}
+            $lines=@($keep | ForEach-Object { ($_ | ConvertTo-Json -Depth 6 -Compress)+"`n" })
+            [IO.File]::AppendAllText($script:HistFile, ($lines -join ''), (New-Object System.Text.UTF8Encoding($false)))
+        }
+    }
+    # Only a full read tells how many lines there are now; cheap enough next to one run per request,
+    # and it is only this check that pays for it - the append above never re-reads the file.
+    $all=Read-Hist
+    if($all.Count -gt ($limit + [Math]::Floor($limit/10))){
+        $from=[Math]::Max(0, $all.Count-$limit)
+        Write-Hist @($all[$from..($all.Count-1)])
+    }
+    '{"ok":true,"added":'+$keep.Count+'}'
+}
+# Endpoint: every run, newest first. No paging - the window filters, groups and pages them in memory.
+function Api-HistList {
+    $items=Read-Hist; [array]::Reverse($items)
+    $parts=@($items | ForEach-Object { ($_ | ConvertTo-Json -Depth 6 -Compress) })
+    '{"ok":true,"items":['+($parts -join ',')+']}'
+}
+# Endpoint: take the given runs out of the history.
+function Api-HistDelete { param($data)
+    $ids=New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach($i in @($data.ids)){ [void]$ids.Add([string]$i) }
+    $left=@(Read-Hist | Where-Object { -not ($_.PSObject.Properties['id'] -and $ids.Contains([string]$_.id)) })
+    Write-Hist $left; '{"ok":true}'
+}
+# Endpoint: clear one connection's runs (data.only), or the whole history without it.
+function Api-HistClear { param($data)
+    if($data.only){
+        $only=[string]$data.only
+        $left=@(Read-Hist | Where-Object { [string]$_.conn -ne $only })
+        Write-Hist $left
+    } else {
+        Remove-Item -LiteralPath $script:HistFile -Force -ErrorAction SilentlyContinue
+    }
+    '{"ok":true}'
 }
 # Endpoint: delete ALL saved connections (used by Clear all app data).
 function Api-ConnClear { Save-Conns @(); '{"ok":true}' }
@@ -5603,7 +5686,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  .item.kbsel{background:var(--hover);outline:1px solid var(--accent);outline-offset:-1px}
  #acx{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9600;display:none;max-height:230px;overflow:auto;min-width:160px;font-family:var(--mono);font-size:12px}
  #acx .ai{padding:3px 10px;cursor:pointer;white-space:nowrap} #acx .ai.on{background:var(--accent);color:#fff} #allSchemasBtn.on{background:var(--accent);border-color:var(--accent);color:#fff}
- table.dz{border-collapse:collapse;width:100%} table.dz th{border:none;border-bottom:2px solid var(--bd);padding:4px 6px;text-align:left;color:var(--muted);font-weight:600;font-size:12px} table.dz td{border:none;border-bottom:1px solid var(--bd2);padding:4px} table.dz tr:last-child td{border-bottom:none} table.dz input,table.dz select{width:100%} table.dz{table-layout:fixed} table.dz th:nth-child(2){width:150px} table.dz th:nth-child(3){width:72px} table.dz th:nth-child(4),table.dz th:nth-child(5),table.dz th:nth-child(6){width:34px} table.dz th:nth-child(7){width:190px} table.dz th:nth-child(9){width:36px}
+ table.dz{border-collapse:collapse;width:100%} table.dz th{border:none;border-bottom:2px solid var(--bd);padding:4px 6px;text-align:left;color:var(--muted);font-weight:600;font-size:12px} table.dz td{border:none;border-bottom:1px solid var(--bd2);padding:4px} table.dz tr:last-child td{border-bottom:none} table.dz input,table.dz select{width:100%} table.dz{table-layout:fixed} table.dz th:nth-child(2){width:150px} table.dz th:nth-child(3){width:72px} table.dz th:nth-child(4),table.dz th:nth-child(5),table.dz th:nth-child(6),table.dz th:nth-child(7){width:34px} table.dz th:nth-child(8){width:150px} table.dz th:nth-child(9){width:170px} table.dz th:nth-child(11){width:96px} table.dz.dzx th:nth-child(n){width:auto} .dpanel{flex-direction:column;flex:1;min-height:60px} .dtab.on{font-weight:700;box-shadow:inset 0 -2px 0 var(--accent)}
 /* Nothing pending is the normal state, and an accent-coloured badge for it drew the eye to
    a zero all day; it only speaks up once there is something to apply. */
  .pill.quiet{background:var(--panel2);color:var(--muted)}
@@ -5684,6 +5767,11 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  .citem{padding:10px 14px;border-top:1px solid var(--bd2)} .citem:first-child{border-top:0} .citem:hover{background:var(--hover)}
  .citem-h{display:flex;align-items:center;gap:8px;margin-bottom:6px}
  .citem-t{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+ /* The history's rows: a dot for what came of the run, the time, the database, the SQL on one line. */
+ .citem.hist{padding:6px 14px} .citem.hist .citem-h{margin-bottom:0}
+ .hdot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--muted)} .hdot.hok{background:var(--erd-pk)} .hdot.herr{background:var(--err-line)} .hdot.hcan{background:var(--log-warn)}
+ .htime{flex:none;min-width:84px} .hdb{flex:none;font-weight:600} .hsql{font-family:var(--mono);font-size:12px}
+ .hcount{flex:none;font-size:11px;padding:0 6px;border-radius:var(--r-s);background:var(--panel)} .herrtext{color:var(--err-line);font-size:12px;margin:4px 0 6px;white-space:pre-wrap}
  .citem-a{display:flex;gap:6px;flex:none}
  .cempty{padding:28px 20px;text-align:center;color:var(--muted);font-size:13px}
  /* The file browser: a path to type into, and the folder as a list of name, date and size. */
@@ -6133,8 +6221,9 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 </div></div>
 
 <div class="modal floating" id="mHist"><div class="box" style="width:1200px;max-width:95vw;height:80vh;max-height:900px;display:flex;flex-direction:column;overflow:hidden;top:60px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mHist')" title="Drag to move"><h3 style="margin:0 0 10px">Query history</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mHist')" title="Maximize" id="maxBtn_mHist" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mHist')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
+ <div class="row" style="flex:none;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px"><input id="histQ" type="search" placeholder="Search the SQL, database or error" oninput="histRender()" style="flex:1;min-width:220px" spellcheck="false"><select id="histScope" onchange="histRender()" title="Whose runs"><option value="conn">This connection</option><option value="all">All connections</option></select><select id="histOut" onchange="histRender()" title="What came of them"><option value="">Any outcome</option><option value="ok">OK</option><option value="err">Errors</option><option value="cancel">Cancelled</option></select><select id="histWhen" onchange="histRender()" title="When they ran"><option value="0">Any time</option><option value="1">Today</option><option value="7">Last 7 days</option><option value="30">Last 30 days</option></select><span id="histCount" class="muted"></span></div>
  <div id="histList" class="clist" style="flex:1;min-height:0"></div>
- <div class="row" style="flex:none"><button class="warn" onclick="clearHistory()">Clear history</button><span style="flex:1"></span><button onclick="hide('mHist')">Close</button></div></div></div>
+ <div class="row" style="flex:none"><button class="warn" onclick="clearHistory(false)" title="Delete the runs of the connection you are on">Clear this connection's</button><button class="warn" onclick="clearHistory(true)" title="Delete the runs of every connection">Clear all</button><span style="flex:1"></span><button onclick="hide('mHist')">Close</button></div></div></div>
 <div class="modal floating" id="mPlan"><div class="box" style="width:780px;max-width:95vw;height:560px;display:flex;flex-direction:column;overflow:hidden;top:70px;left:160px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mPlan')" title="Drag to move"><h3 id="planTitle" style="margin:0 0 10px">Query plan</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mPlan')" title="Maximize" id="maxBtn_mPlan" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mPlan')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div id="planBody" style="overflow:auto;flex:1;min-height:0"></div>
  <div class="row" style="justify-content:flex-end;flex:none;align-items:center"><span id="planNote" class="muted" style="flex:1;font-size:12px"></span><button id="planMeasureBtn" onclick="planMeasure()" title="Run the query and show what really happened at each step - the rows read and the time taken - beside what the plan expected">Measure</button><button onclick="hide('mPlan')">Close</button></div></div></div>
@@ -6181,6 +6270,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
   <div class="setcard">
    <div class="setrow"><div class="setrl"><div class="setrt">Ask before UPDATE or DELETE without WHERE</div><div class="setnote">Asks for confirmation before running an UPDATE or DELETE that has no WHERE clause of its own, since it would change or remove every row of the table. A WHERE inside a subquery does not count.</div></div><div class="setrc"><input type="checkbox" id="cfgNoWhereAsk" onchange="setNoWhereAsk(this.checked)" title="Ask before running an UPDATE or DELETE that has no WHERE"></div></div>
    <div class="setrow"><div class="setrl"><div class="setrt">Keep each tab's connection between runs</div><div class="setnote">Each query tab runs on a connection of its own and keeps it, so what one run leaves - @variables, temporary tables, SET SESSION - is there for the next, as in the mysql client. Off, every run opens a new connection with nothing carried over. With Auto-commit off a tab always keeps its connection, for its transaction. The server counts one connection per tab that has run something.</div></div><div class="setrc"><input type="checkbox" id="cfgKeepConn" onchange="setKeepConn(this.checked)" title="Keep each query tab's connection between its runs"></div></div>
+   <div class="setrow"><div class="setrl"><div class="setrt">Query history</div><div class="setnote">Keeps each query you run - with its time, connection, database, outcome, duration and rows - in a file beside the library, for the History window. The oldest go once there are more than this many. A statement with a password is never kept.</div></div><div class="setrc" style="display:flex;gap:8px;align-items:center"><input type="number" id="cfgHistLimit" min="100" max="100000" step="100" style="width:90px" onchange="setHistLimit(this.value)" title="How many runs the history keeps"><input type="checkbox" id="cfgHistOn" onchange="setHistOn(this.checked)" title="Keep a query history"></div></div>
   </div>
   <div class="setgroup">Notifications</div>
   <div class="setcard">
@@ -6288,9 +6378,25 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="row" style="justify-content:flex-end;flex:none"><button class="warn" onclick="libClearAll()" title="Delete all saved queries">Clear all</button><button onclick="libExport()" title="Download the whole library as a JSON file">Export library</button><button onclick="$('libFile').click()" title="Load a query-library.json from another machine (merges)">Import library</button><input type="file" id="libFile" accept="application/json,.json" style="display:none" onchange="libImportFile(event)"><span style="flex:1"></span><button onclick="hide('mLib')">Close</button></div></div></div>
 
 <div class="modal floating" id="mDesign"><div class="box" style="width:960px;max-width:95vw;height:680px;display:flex;flex-direction:column;overflow:hidden;top:40px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mDesign')" title="Drag to move"><h3 id="dTitle" style="margin:0 0 10px">Table designer</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mDesign')" title="Maximize" id="maxBtn_mDesign" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mDesign')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
- <div class="row" style="flex:none"><span class="muted">Database</span> <input id="dSchema" style="width:280px"> <span class="muted">Table</span> <input id="dName" style="width:320px"> <span id="dMode" class="muted"></span></div>
- <div id="dColsWrap" style="overflow:auto;flex:1;min-height:60px"><table class="dz"><thead><tr><th>Column</th><th>Type</th><th>Length</th><th title="NOT NULL">NN</th><th title="AUTO_INCREMENT">AI</th><th title="PRIMARY KEY">PK</th><th>Default</th><th>Comment</th><th></th></tr></thead><tbody id="dCols"></tbody></table></div>
- <div class="row" style="flex:none"><button onclick="dAddCol()"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" style="margin-right:4px;flex:none"><path d="M12 5v14M5 12h14"/></svg>Column</button></div>
+ <div class="row" style="flex:none"><span class="muted">Database</span> <input id="dSchema" style="width:280px" onchange="dGen()"> <span class="muted">Table</span> <input id="dName" style="width:320px" onchange="dGen()"> <span id="dMode" class="muted"></span></div>
+ <div class="row" id="dTabs" style="flex:none;gap:4px"><button class="sm dtab on" data-p="dColsP" onclick="dTab(this)">Columns</button><button class="sm dtab" data-p="dIdxP" onclick="dTab(this)">Indexes</button><button class="sm dtab" data-p="dFkP" onclick="dTab(this)">Foreign keys</button><button class="sm dtab" data-p="dOptP" onclick="dTab(this)">Options</button></div>
+ <datalist id="dCollList"></datalist><datalist id="dEngList"></datalist>
+ <div id="dColsP" class="dpanel" style="display:flex">
+ <div id="dColsWrap" style="overflow:auto;flex:1;min-height:60px"><table class="dz"><thead><tr><th>Column</th><th>Type</th><th>Length</th><th title="NOT NULL">NN</th><th title="AUTO_INCREMENT">AI</th><th title="PRIMARY KEY">PK</th><th title="UNSIGNED">UN</th><th>Default</th><th title="Empty: the table's own">Collation</th><th>Comment</th><th></th></tr></thead><tbody id="dCols"></tbody></table></div>
+ <div class="row" style="flex:none"><button onclick="dAddCol()"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" style="margin-right:4px;flex:none"><path d="M12 5v14M5 12h14"/></svg>Column</button></div></div>
+ <div id="dIdxP" class="dpanel" style="display:none">
+ <div style="overflow:auto;flex:1;min-height:60px"><table class="dz dzx"><thead><tr><th>Name</th><th style="width:130px">Kind</th><th>Columns</th><th>Comment</th><th style="width:36px"></th></tr></thead><tbody id="dIdx"></tbody></table></div>
+ <div class="row" style="flex:none"><button onclick="dAddIdx();dGen()"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" style="margin-right:4px;flex:none"><path d="M12 5v14M5 12h14"/></svg>Index</button><span class="muted">The primary key is the PK ticks on the Columns tab. Columns are written a, b(10) DESC.</span></div></div>
+ <div id="dFkP" class="dpanel" style="display:none">
+ <div style="overflow:auto;flex:1;min-height:60px"><table class="dz dzx"><thead><tr><th>Name</th><th>Columns</th><th>References table</th><th>Its columns</th><th style="width:130px">On delete</th><th style="width:130px">On update</th><th style="width:36px"></th></tr></thead><tbody id="dFks"></tbody></table></div>
+ <div class="row" style="flex:none"><button onclick="dAddFk();dGen()"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" style="margin-right:4px;flex:none"><path d="M12 5v14M5 12h14"/></svg>Foreign key</button></div></div>
+ <div id="dOptP" class="dpanel" style="display:none">
+ <div style="display:grid;grid-template-columns:max-content minmax(0,420px);gap:8px 10px;align-items:center;padding:8px 0">
+  <span class="muted">Engine</span><input id="dEngine" list="dEngList" placeholder="(server default)" onchange="dGen()">
+  <span class="muted">Collation</span><input id="dColl" list="dCollList" placeholder="(database default)" title="The table's default for new text columns. The columns that have the old one keep it." onchange="dGen()">
+  <span class="muted">Comment</span><input id="dTblComment" onchange="dGen()">
+  <span></span><span class="muted">To rename the table, or move it to another database, change the names at the top.</span>
+ </div></div>
  <div class="row" style="flex:none;margin-top:6px"><span class="dsec">Generated SQL</span> <span id="dEditNote" class="muted" style="color:#b26a00"></span></div><textarea id="dSql" oninput="dMark()" style="width:100%;height:120px;font-family:var(--mono);flex:none"></textarea>
  <div class="row" style="justify-content:flex-end;flex:none"><button title="Rebuild the SQL from the column grid (discards manual edits in the box)" onclick="dGen(true)">Regenerate from columns</button><button class="go write" title="Run the SQL shown above against the database - creates the table if it's new, or alters it if it already exists" onclick="dApply()">Apply</button><button onclick="hide('mDesign')">Close</button></div>
  <div id="dLog" class="muted" style="white-space:pre-wrap;font-family:var(--mono);font-size:11px;max-height:220px;overflow:auto;margin-top:6px;flex:none"></div></div></div>
@@ -7057,7 +7163,7 @@ async function clearAllData(){if(!(await ask('Clear ALL app data?\n\nThis perman
 function setPage(p){const sv=document.querySelector('#mSettings .setfoot .go');if(sv)sv.style.visibility=p==='tools'?'':'hidden';document.querySelectorAll('#mSettings .setnav button').forEach(b=>b.classList.toggle('on',b.dataset.p===p));document.querySelectorAll('#mSettings .setpage').forEach(s=>s.classList.toggle('on',s.dataset.p===p));if(p==='about')aboutPage();}
 // The About page: its buttons get their icons when it is shown.
 function aboutPage(){const pg=document.querySelector('#mSettings .setpage[data-p="about"]');if(pg)decorateIcons(pg);}
-async function openSettings(){$('cfgLog').textContent='';uiSizesApply();try{const r=await api('/api/get-config');const c=(r&&r.config)||{};uiZoomShow(c);$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}if($('cfgUpdateCheck'))$('cfgUpdateCheck').checked=updateCheckOn();if($('cfgNoWhereAsk'))$('cfgNoWhereAsk').checked=noWhereAskOn();if($('cfgKeepConn'))$('cfgKeepConn').checked=keepConnOn();if($('cfgToastMs'))$('cfgToastMs').value=String(toastMs());show('mSettings');
+async function openSettings(){$('cfgLog').textContent='';uiSizesApply();try{const r=await api('/api/get-config');const c=(r&&r.config)||{};uiZoomShow(c);$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}if($('cfgUpdateCheck'))$('cfgUpdateCheck').checked=updateCheckOn();if($('cfgNoWhereAsk'))$('cfgNoWhereAsk').checked=noWhereAskOn();if($('cfgHistOn'))$('cfgHistOn').checked=histOn();if($('cfgHistLimit'))$('cfgHistLimit').value=histLimit();if($('cfgKeepConn'))$('cfgKeepConn').checked=keepConnOn();if($('cfgToastMs'))$('cfgToastMs').value=String(toastMs());show('mSettings');
  // The first call answers from what is remembered about each binary; the second re-reads them and
  // updates the cards if a tool was replaced behind the app's back.
  await refreshToolsStatus();setTimeout(()=>refreshToolsStatus(false,true),50);}
@@ -8822,7 +8928,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   // two independent buttons - stacked in one shared grid cell (both always in layout, only one
   // ever visible) so swapping between them on every run/cancel never shifts Run Query Selection/
   // Explain/Format, which display:none toggling used to do on every single query execution.
-  '<div class="toolbar"><span style="display:inline-grid"><button class="primary" id="runbtn_'+id+'" style="grid-area:1/1" title="Run the query (F5)" onclick="runTab(\''+id+'\')">Run Query</button><button class="warn" id="cancelbtn_'+id+'" style="grid-area:1/1;visibility:hidden" title="Cancel the running query" onclick="cancelQuery(\''+id+'\')">Cancel</button></span><button title="Run the selected text (Ctrl+Enter) - or, if nothing is selected, whichever statement the cursor is currently inside" onclick="runSel(\''+id+'\')" data-ic="runsel" data-fit="4">Run Selection</button><button title="Show how the server will run the current statement: the plan as a diagram, and the EXPLAIN table in the results" onclick="explainTab(\''+id+'\')" data-ic="explain" data-fit="4">Explain</button><button title="Reformat the query for readability (safe - only changes whitespace/line breaks, never the query itself)" onclick="formatTabSql(\''+id+'\')" data-ic="format" data-fit="3">Format</button>'+
+  '<div class="toolbar"><span style="display:inline-grid"><button class="primary" id="runbtn_'+id+'" style="grid-area:1/1" title="Run the query (F5)" onclick="runTab(\''+id+'\',true)">Run Query</button><button class="warn" id="cancelbtn_'+id+'" style="grid-area:1/1;visibility:hidden" title="Cancel the running query" onclick="cancelQuery(\''+id+'\')">Cancel</button></span><button title="Run the selected text (Ctrl+Enter) - or, if nothing is selected, whichever statement the cursor is currently inside" onclick="runSel(\''+id+'\')" data-ic="runsel" data-fit="4">Run Selection</button><button title="Show how the server will run the current statement: the plan as a diagram, and the EXPLAIN table in the results" onclick="explainTab(\''+id+'\')" data-ic="explain" data-fit="4">Explain</button><button title="Reformat the query for readability (safe - only changes whitespace/line breaks, never the query itself)" onclick="formatTabSql(\''+id+'\')" data-ic="format" data-fit="3">Format</button>'+
   '<span class="tbsep"></span>'+
   lastBtn+selBtn+applyBtn+
   '<span class="tbsep"></span>'+
@@ -8878,7 +8984,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   if((e.ctrlKey||e.metaKey)&&!e.altKey&&['f','h'].includes(e.key.toLowerCase())){e.preventDefault();acHide();findOpen(id,e.key.toLowerCase()==='h');return;}
   if(e.key==='F3'){e.preventDefault();if($('fr_'+id)&&$('fr_'+id).style.display!=='none')findStep(id,e.shiftKey?-1:1);else findOpen(id,false);return;}
   if(e.key==='Escape'&&$('fr_'+id)&&$('fr_'+id).style.display!=='none'){e.preventDefault();findClose(id);return;}
-  if(e.key==='F5'||e.key==='F9'){e.preventDefault();runTab(id);}
+  if(e.key==='F5'||e.key==='F9'){e.preventDefault();runTab(id,true);}
   else if(e.ctrlKey&&e.key==='Enter'){e.preventDefault();runSel(id);}
   else if(e.ctrlKey&&e.code==='Space'){e.preventDefault();acUpdate(id,true);}
   else if(e.ctrlKey&&!e.shiftKey&&!e.altKey&&e.key.toLowerCase()==='d'){
@@ -9066,7 +9172,9 @@ function saveSession(key){let k,json;try{k=key||sessionKeyFor();json=JSON.string
   filters:t.table&&!t.sqlEdited&&t.filterClauses&&t.filterClauses.length?t.filterClauses.slice():undefined,
   file:t.file?{name:t.file.name,path:t.file.path,bom:t.file.bom,eol:t.file.eol,dirty:sqlFileDirty(t)}:undefined})));}catch(e){return;}
  try{localStorage.setItem('session:'+k,json);return;}catch(e){}
- try{const h=hist();localStorage.setItem('history',JSON.stringify(h.slice(0,20)));localStorage.setItem('session:'+k,json);return;}catch(e){}
+ // A history the storage still holds from before goes to its file (histMigrate), and the tabs are
+ // saved again once it has made room.
+ try{if(localStorage.getItem('history')!=null){histMigrate().then(done=>{if(done)saveSession(key);});return;}}catch(e){}
  if(!window._sessionSaveWarned){window._sessionSaveWarned=true;const m='The open tabs could not be saved - the browser storage for this app is full. Copy anything you need out of them before closing the app.';toast(m,true);log(m);}}
 function restoreSessionFor(key){if(tabs.length)return;let arr=[];try{const raw=localStorage.getItem('session:'+key);if(raw!=null){arr=JSON.parse(raw);}else if(!localStorage.getItem('_sessionMigrated')){const old=localStorage.getItem('session');if(old)arr=JSON.parse(old);localStorage.setItem('_sessionMigrated','1');}}catch(e){}if(Array.isArray(arr)&&arr.length){arr.forEach(t=>{
   // Table tabs are always bounded (LIMIT 1000), so it's safe to auto-run them on restore -
@@ -9203,7 +9311,9 @@ function splitStmts(sql,withPos){let out=[],cur='',curStart=0,i=0,q=null,delim='
 // On the tab of a procedure, function or trigger, Run is Apply: its SQL drops the object and creates
 // it again, and Apply puts the previous version back when the new one fails. Run went straight to the
 // server, and on MySQL a CREATE that failed after the DROP left the routine gone.
-async function runTab(id){const t=T(id);if(t&&t.ddl&&/^(procedure|function|trigger)$/.test(t.ddl.type)){await applyDdl(id);return;}await runSql(id,$('ed_'+id).value);}
+// user: started by the user (the Run button, F5), and so kept in the history; opening a table runs
+// its tab too, and that is not.
+async function runTab(id,user){const t=T(id);if(t&&t.ddl&&/^(procedure|function|trigger)$/.test(t.ddl.type)){await applyDdl(id);return;}if(user&&t)t._histNext=true;await runSql(id,$('ed_'+id).value);}
 async function explainTab(id){
  const ta=$('ed_'+id);const sel=ta.value.substring(ta.selectionStart,ta.selectionEnd).trim();
  // Without a selection, the statement the cursor is in, as Run at the cursor takes it - it used to
@@ -9213,6 +9323,7 @@ async function explainTab(id){
  else{const hit=stmtAtCursor(ta.value,ta.selectionStart);stmt=hit!=null?hit:ta.value;}
  stmt=String(stmt).trim().replace(/;+\s*$/,'');
  if(!stmt){toast('Nothing to explain.',true);return;}
+ if(T(id))T(id)._histNext=true;
  await runSql(id,'EXPLAIN '+stmt);
  planShow(id,stmt);
 }
@@ -9461,7 +9572,7 @@ function formatTabSql(id){const ta=$('ed_'+id);
  if(!ok||ta.value!==next)ta.value=next;
  syncHl(id);markEdited(id);log('Formatted query.');}
 async function runSel(id){
- const ta=$('ed_'+id);
+ const ta=$('ed_'+id);if(T(id))T(id)._histNext=true;
  const sel=ta.value.substring(ta.selectionStart,ta.selectionEnd).trim();
  if(sel){await runSql(id,sel);return;}
  // No selection: run whichever statement the cursor is currently positioned within, rather
@@ -9614,12 +9725,12 @@ function timeLimitNote(err,reading){err=String(err==null?'':err);
  if(reading)return err+'\n\n'+lim+' ended the query while its rows were still being read: the server counts the time a result stays open. The rows shown are all that arrived. Add a LIMIT, or raise the time limit in the connection, to read more.';
  return err+'\n\n'+lim+' stopped it. Edit the connection to change the limit.';}
 // runSql(): send the editor SQL to the server and show the rows (or the error).
-async function runSql(id,sql,paging){const t=T(id);if(!t)return;
+async function runSql(id,sql,paging){const t=T(id);if(!t)return;const userRun=!!t._histNext;t._histNext=false;
  if(!paging&&!(await okToRunUnfiltered(t,splitStmts(String(sql==null?'':sql)).filter(s=>!isCommentOnly(s))))){const s0=$('st_'+id);if(s0){s0.className='status';s0.textContent='Not run.';}return;}
  if(sql!=null&&sql!==t.curRun){t.prevRun=t.curRun;t.curRun=sql;}const st=$('st_'+id);st.className='status';st.textContent='Running\u2026';
  if(runSessOf(t))await sessFree(t,true); // the tab's kept connection holds the cursor of a result still being read: the close is waited for
  closeCursorFor(t);
- addHistory(sql);
+ const hr=(!paging&&userRun)?histStart(t,sql):null;
  const stmts=splitStmts(sql).filter(s=>!isCommentOnly(s));
  const lastStmt=(stmts[stmts.length-1]||sql).trim();
  // Any multi-statement input is now eligible to show a result grid, as long as its FINAL
@@ -9658,7 +9769,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
  const stale=()=>!T(id)||t.runSeq!==seq;
  try{
   if(multiResult){
-    await runScriptResults(id,sql,reqId,seq);
+    await runScriptResults(id,sql,reqId,seq);if(hr&&t.resultSets)hr.results=t.resultSets.length;
   } else if(isSelect){
     if(needsScriptStep){
       // Each leading statement was already correctly, individually extracted by splitStmts()
@@ -9740,6 +9851,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
     renderGrid(id);updatePager(id);
     updateStatusLine(id);
     updateSchemaBadge(id);
+    if(hr){hr.rows=t.rows.length;if(t.hasMore)hr.more=true;}
   } else {
     if(roBlock()){st.className='status';st.textContent='Read-only mode: statement blocked.';return;}
     const continueOnError=!!($('coe_'+id)&&$('coe_'+id).checked);
@@ -9769,7 +9881,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
         runLog(id,'SCRIPT: '+r.succeeded+' of '+r.total+' succeeded'+succNote+(ra!=null?', '+rowsAffected(ra):'')+'.'+(r.statements&&r.statements.length?'\n'+stmtLines(r.statements,r.total).join('\n'):'')+'\n\nFailed:\n'+detail,'err',{sql,n:r.failures[0].index});
       }
       if(t.db)loadObjects(t.db);
-    } else if(r.ok){const sts=r.statements,ra=scriptAffected(sts);
+    } else if(r.ok){if(hr&&r.affected!=null)hr.affected=+r.affected;const sts=r.statements,ra=scriptAffected(sts);
       st.textContent='OK. '+stmts.length+' statement(s) executed'+(ra!=null?', '+rowsAffected(ra):'')+'.';
       if(sts&&sts.length===1)runLog(id,sts[0].sql+' -> '+stmtOutcome(sts[0]));
       else runLog(id,'SCRIPT OK ('+stmts.length+' statements'+(ra!=null?', '+rowsAffected(ra):'')+(r.elapsedMs!=null?', '+fmtMs(r.elapsedMs):'')+')'+(sts?'\n'+stmtLines(sts,sts.length).join('\n'):''));
@@ -9780,6 +9892,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;
   }
  } finally {
   if(!stale()){t.runningReqId=null;t.abortCtrl=null;setRunning(id,false);}
+  histEnd(hr,stale()?null:st);
  }
 }
 
@@ -9993,7 +10106,7 @@ function updatePager(id){const t=T(id);const p=$('pager_'+id);if(!p)return;const
  if(filtered&&loaded){p.innerHTML='<span class="muted">'+fmtCount(total)+' of '+fmtCount(loaded)+(t.hasMore?'+':'')+' loaded row(s) match'+at+'</span>';return;}
  // Unfiltered, the count is the status line's to give.
  p.innerHTML='';}
-function toggleLast(id){const t=T(id);const ta=$('ed_'+id);if(t.prevRun==null){log('No previous query to toggle to yet.');return;}edSetAll(id,t.prevRun);runSql(id,t.prevRun);}
+function toggleLast(id){const t=T(id);const ta=$('ed_'+id);if(t.prevRun==null){log('No previous query to toggle to yet.');return;}edSetAll(id,t.prevRun);t._histNext=true;runSql(id,t.prevRun);}
 function toggleAll(id){const t=T(id);if(!t.table)return;const ta=$('ed_'+id);const base='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+';';const cur=(ta.value||'').trim();if(cur!==base.trim()){t.beforeAll=ta.value;edSetAll(id,base);}else if(t.beforeAll!=null){edSetAll(id,t.beforeAll);}else{edSetAll(id,base);}runSql(id,ta.value);}
 function selBtnHtml(id,table){return table?'<button title="Toggle between your query and SELECT * (the whole table)" onclick="toggleAll(\''+id+'\')" data-ic="wholetable" data-fit="2">Show all</button>':'';}
 // t.table (and thus row-edit capability, export-as-table, quick filter, ...) used to be fixed
@@ -12388,18 +12501,44 @@ async function dlBinary(blob,name){
  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();}
 
 // ---- history ----
-function hist(){try{return JSON.parse(localStorage.getItem('history')||'[]');}catch(e){return[];}}
-// A statement that carries a password - CREATE/ALTER USER ... IDENTIFIED BY '...', SET PASSWORD,
-// a replication password - is not kept: history lives in plain text in the browser's storage, and
-// a copy with the password masked would set that mask as the password if it were run again.
-// Writing can fail once the storage is full; that used to throw before the query was even sent,
-// and the tab sat at "Running..." for good.
-function addHistory(sql){sql=sql.trim();if(!sql)return;
- // A statement that carries a password is not kept: in single or double quotes, and in any
- // ..._PASSWORD = (MASTER_, SOURCE_) or PASSWORD 'x' (CREATE SERVER) form. Double quotes and the
- // newer names used to go into the history as typed.
- if(/\b(identified\b[\s\S]*?\b(by|as|using)|set\s+password\b[^;]*?=|\w*password\s*(\(|=)?)\s*['"]/i.test(sql))return;
- try{let h=hist().filter(x=>x!==sql);h.unshift(sql);h=h.slice(0,200);localStorage.setItem('history',JSON.stringify(h));}catch(e){}}
+// Each run the user starts - Run, Run selection or the statement at the cursor, Explain, Last query -
+// is kept in the history file (Api-Hist*): when, on which connection and database, from which tab,
+// the SQL, and what came of it - OK, the error, or cancelled - with how long it took and the rows it
+// returned or changed. The app's own runs (opening a table, paging, a quick filter, the reload after
+// Apply) are not: they would bury the user's. The history used to be plain SQL in the browser's
+// storage: 200 entries shared by every connection, cut to 20 when the storage filled up.
+function histOn(){try{return localStorage.getItem('histOn')!=='off';}catch(e){return true;}}
+function setHistOn(on){try{localStorage.setItem('histOn',on?'on':'off');}catch(e){}}
+function histLimit(){let n=NaN;try{n=parseInt(localStorage.getItem('histLimit')||'',10);}catch(e){}return n>=100?Math.min(n,100000):5000;}
+function setHistLimit(v){const n=Math.max(100,Math.min(100000,parseInt(v,10)||5000));try{localStorage.setItem('histLimit',String(n));}catch(e){}const el=$('cfgHistLimit');if(el)el.value=n;}
+// A statement that carries a password is not kept: a copy with the password masked would set that
+// mask as the password if it were run again. In single or double quotes, and in any ..._PASSWORD =
+// (MASTER_, SOURCE_) or PASSWORD 'x' (CREATE SERVER) form.
+function histSecret(sql){return /\b(identified\b[\s\S]*?\b(by|as|using)|set\s+password\b[^;]*?=|\w*password\s*(\(|=)?)\s*['"]/i.test(String(sql));}
+// The connection a run belongs to: its saved name, or user@host:port for one typed in.
+function histConn(){const cn=$('connlist')?$('connlist').value:'';if(cn)return cn;return ($('user')?$('user').value:'')+'@'+($('host')?$('host').value:'')+':'+($('port')?$('port').value:'');}
+// A run's entry, begun when it starts; null when it is not kept.
+function histStart(t,sql){sql=String(sql==null?'':sql).trim();if(!histOn()||!sql||sql.length>1048576||histSecret(sql))return null;
+ return {id:Date.now().toString(36)+Math.random().toString(36).slice(2,8),ts:Date.now(),conn:histConn(),db:dbOf(t)||'',tab:t.title,sql,
+  n:splitStmts(sql).filter(x=>!isCommentOnly(x)).length,_t0:performance.now()};}
+// Ended, and kept. What came of it is what the run's status line says: an error there (or a statement
+// read-only mode blocked) is an error, a cancel is a cancel. st is null when a newer run in the same
+// tab took over before this one finished.
+async function histEnd(hr,st){if(!hr)return;hr.ms=Math.round(performance.now()-hr._t0);delete hr._t0;
+ const txt=st?String(st.textContent||''):'';
+ if(st&&(st.classList.contains('err')||/^Read-only mode/.test(txt))){hr.o='err';hr.err=clip(txt.split('\n')[0],300);}
+ else if(!st||/cancel/i.test(txt))hr.o='cancel';
+ else hr.o='ok';
+ await histMigrate();_histItems=null;
+ const r=await api('/api/hist-add',{entry:hr,limit:histLimit()});
+ if(r&&r.ok===false&&!window._histWarned){window._histWarned=true;log('The query history could not be written: '+r.error);}}
+// The history the browser's storage held before is moved into the file once, oldest first, marked
+// as imported: it has no time, connection or outcome.
+async function histMigrate(){let old=null;try{old=localStorage.getItem('history');}catch(e){}if(old==null)return false;
+ let list=[];try{list=JSON.parse(old)||[];}catch(e){}
+ const entries=(Array.isArray(list)?list:[]).filter(x=>typeof x==='string'&&x.trim()).reverse().map((sql,i)=>({id:'imp'+i+Date.now().toString(36),ts:0,conn:'',db:'',sql:sql.trim(),imported:true}));
+ const r=entries.length?await api('/api/hist-add',{entries,limit:histLimit()}):{ok:true};
+ if(r&&r.ok!==false){try{localStorage.removeItem('history');return true;}catch(e){}}return false;}
 function codeBlockStartHeight(text){const lines=String(text||'').split('\n').length;return Math.min(140,Math.max(40,lines*17+13))+'px';}
 // max-width:100% keeps a drag-resize from ever growing wider than the box it's already filling
 // (effectively horizontal-only-if-there-was-room-to-begin-with, i.e. no overstretch past the
@@ -12407,16 +12546,73 @@ function codeBlockStartHeight(text){const lines=String(text||'').split('\n').len
 // block past the visible window - without both, an unbounded resize:both could be dragged to an
 // enormous size and made the whole window unresponsive while it repainted.
 function codeBlockStyle(text){return "display:block;background:var(--log);color:var(--logfg);font-family:var(--mono);font-size:11px;line-height:1.5;padding:6px 8px;border-radius:var(--r-s);white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;overflow:auto;resize:both;max-width:100%;max-height:calc(100vh - 40px);height:"+codeBlockStartHeight(text);}
-function openHistory(){const box=$('histList');const h=hist();box.innerHTML=h.length?'':'<div class="cempty">No history yet - the queries you run show here.</div>';h.forEach(sql=>{const d=document.createElement('div');d.className='citem';const code=document.createElement('code');code.style.cssText=codeBlockStyle(sql);code.textContent=sql;const bar=document.createElement('div');bar.className='citem-h';const kw=document.createElement('span');kw.className='citem-t muted';kw.textContent=(sql.trim().match(/^\w+/)||[''])[0].toUpperCase();bar.appendChild(kw);const sv=document.createElement('button');sv.className='sm';sv.textContent='Save to library';sv.title='Keep this query in the library under a name';sv.onclick=e=>{e.stopPropagation();histSaveToLib(sql);};bar.appendChild(sv);const op=document.createElement('button');op.className='sm';op.textContent='Open';op.title='Open this query in a new tab';op.style.marginLeft='6px';const open=()=>{hide('mHist');openTab('history',sql,curSchema,false,null);};op.onclick=e=>{e.stopPropagation();open();};bar.appendChild(op);code.ondblclick=open;code.title='Double-click to open in a new tab';d.appendChild(bar);d.appendChild(code);box.appendChild(d);});show('mHist');}
+// The window: a list to search and narrow down - this connection or all, by outcome, by time - with
+// each SQL text once, the newest run of it first and how many times it ran. A click opens an entry:
+// the whole SQL, the error, and what can be done with it.
+let _histItems=null;
+async function openHistory(){show('mHist');await histMigrate();
+ if(!_histItems){const r=await api('/api/hist-list');_histItems=(r&&r.ok&&Array.isArray(r.items))?r.items:[];if(r&&r.ok===false)toast('Could not read the history: '+r.error,true);}
+ histRender();}
+function histWhen(ts){if(!ts)return 'imported';const d=new Date(ts),now=new Date(),p=n=>String(n).padStart(2,'0'),hm=p(d.getHours())+':'+p(d.getMinutes());
+ return d.toDateString()===now.toDateString()?hm:(d.getFullYear()===now.getFullYear()?p(d.getDate())+'.'+p(d.getMonth()+1)+'. '+hm:d.toISOString().slice(0,10)+' '+hm);}
+// The runs the filters let through, folded: one group per SQL text, connection and database.
+function histGroups(items,f){const conn=histConn(),q=String(f.q||'').toLowerCase().trim(),from=f.days>0?new Date(new Date().toDateString()).getTime()-(f.days-1)*86400000:0;
+ const groups=new Map();
+ for(const e of items||[]){
+  if(f.scope==='conn'&&e.conn!==conn&&!e.imported)continue;
+  if(f.out&&e.o!==f.out)continue;
+  if(from&&!(e.ts>=from))continue;
+  if(q&&!(String(e.sql).toLowerCase().includes(q)||String(e.db||'').toLowerCase().includes(q)||String(e.err||'').toLowerCase().includes(q)))continue;
+  const k=e.sql+'\u0001'+(e.conn||'')+'\u0001'+(e.db||'');let g=groups.get(k);
+  if(!g){g={last:e,count:0,ids:[],errs:0};groups.set(k,g);}
+  g.count++;g.ids.push(e.id);if(e.o==='err')g.errs++;}
+ return [...groups.values()];}
+function histRender(){const box=$('histList');if(!box)return;
+ const f={q:$('histQ').value,scope:$('histScope').value,out:$('histOut').value,days:+$('histWhen').value||0};
+ const gs=histGroups(_histItems,f),SHOW=500;
+ $('histCount').textContent=gs.length?(gs.length+' quer'+(gs.length===1?'y':'ies')+(gs.length>SHOW?', the newest '+SHOW+' shown':'')):'';
+ box.innerHTML=gs.length?'':'<div class="cempty">'+((_histItems||[]).length?'Nothing matches.':'No history yet - the queries you run show here.')+'</div>';
+ gs.slice(0,SHOW).forEach(g=>box.appendChild(histRow(g,f.scope==='all')));}
+function histRow(g,showConn){const e=g.last,d=document.createElement('div');d.className='citem hist';
+ const h=document.createElement('div');h.className='citem-h';h.style.cursor='pointer';h.title='Click to show the whole query and what can be done with it';
+ const st=e.o==='err'?['herr','Error']:e.o==='cancel'?['hcan','Cancelled']:e.o==='ok'?['hok','OK']:['','Imported - no outcome kept'];
+ const res=e.o!=='ok'?'':e.rows!=null?fmtCount(e.rows)+(e.more?'+':'')+' row'+(e.rows===1&&!e.more?'':'s'):e.affected!=null?fmtCount(e.affected)+' affected':'';
+ h.innerHTML='<span class="hdot '+st[0]+'" title="'+st[1]+'"></span><span class="muted htime">'+esc(histWhen(e.ts))+'</span>'+
+  (showConn&&e.conn?'<span class="muted">'+esc(e.conn)+'</span>':'')+(e.db?'<span class="hdb">'+esc(e.db)+'</span>':'')+
+  '<span class="citem-t hsql">'+esc(String(e.sql).replace(/\s+/g,' '))+'</span>'+
+  (res?'<span class="muted">'+esc(res)+'</span>':'')+(e.ms!=null?'<span class="muted">'+esc(fmtMs(e.ms))+'</span>':'')+
+  (g.count>1?'<span class="hcount" title="Ran '+g.count+' times'+(g.errs?', '+g.errs+' with an error':'')+'">×'+g.count+'</span>':'');
+ const body=document.createElement('div');body.style.display='none';
+ h.onclick=()=>{const open=body.style.display==='none';body.style.display=open?'':'none';if(open&&!body.firstChild)histDetail(body,g);};
+ d.appendChild(h);d.appendChild(body);return d;}
+function histDetail(body,g){const e=g.last;
+ const code=document.createElement('code');code.style.cssText=codeBlockStyle(e.sql);code.textContent=e.sql;code.title='Double-click to open in a new tab';code.ondblclick=()=>histOpen(e);
+ if(e.err){const er=document.createElement('div');er.className='herrtext';er.textContent=e.err;body.appendChild(er);}
+ const bar=document.createElement('div');bar.className='citem-h';bar.style.margin='6px 0 0';
+ const btn=(label,title,fn,cls)=>{const b=document.createElement('button');b.className='sm'+(cls?' '+cls:'');b.textContent=label;b.title=title;b.onclick=ev=>{ev.stopPropagation();fn();};bar.appendChild(b);};
+ btn('Open','Open this query in a new tab, on its database',()=>histOpen(e));
+ btn('Insert','Insert it into the editor of the current tab, at the cursor',()=>histInsert(e));
+ btn('Copy','Copy the query',()=>copyText(e.sql,'Copied the query.'));
+ btn('Save to library','Keep this query in the library under a name',()=>histSaveToLib(e.sql,e.db));
+ const sp=document.createElement('span');sp.style.flex='1';bar.appendChild(sp);
+ btn(g.count>1?'Delete '+g.count+' runs':'Delete','Take '+(g.count>1?'these runs':'this run')+' out of the history',()=>histDelete(g.ids),'warn');
+ body.appendChild(code);body.appendChild(bar);}
+function histOpen(e){hide('mHist');openTab('history',e.sql,e.db||curSchema,false,null);}
+function histInsert(e){const id=activeTab,ta=id&&$('ed_'+id);if(!ta){histOpen(e);return;}hide('mHist');edReplaceRange(id,ta.selectionStart,ta.selectionEnd,e.sql);syncHl(id);}
+async function histDelete(ids){const r=await api('/api/hist-delete',{ids});if(r&&r.ok===false){toast('Could not delete: '+r.error,true);return;}
+ const drop=new Set(ids);_histItems=(_histItems||[]).filter(x=>!drop.has(x.id));histRender();}
 // A query from the history, kept in the library: asked for a name, with the SQL there to trim
-// before it is saved. The history keeps no schema, so it is saved against the current one.
-async function histSaveToLib(sql){const res=await inputBox({title:'Save to library',okText:'Save',fields:[{key:'name',label:'Name',value:''},{key:'sql',label:'SQL',type:'textarea',value:sql}]});
+// before it is saved, under the database it ran on.
+async function histSaveToLib(sql,db){const res=await inputBox({title:'Save to library',okText:'Save',fields:[{key:'name',label:'Name',value:''},{key:'sql',label:'SQL',type:'textarea',value:sql}]});
  if(!res)return;const name=(res.name||'').trim(),q=res.sql||'';
  if(!name){toast('Enter a name for the query.',true);return;}if(!q.trim()){toast('The query is empty.',true);return;}
  await libLoad();if(libAll().some(x=>x.name===name)&&!(await ask('A saved query named "'+name+'" already exists. Replace it?')))return;
- const r=await api('/api/lib-save',{name:name,sql:q,schema:curSchema||'',ts:Date.now()});if(!r.ok){toast(r.error||'Save failed',true);return;}
+ const r=await api('/api/lib-save',{name:name,sql:q,schema:db||curSchema||'',ts:Date.now()});if(!r.ok){toast(r.error||'Save failed',true);return;}
  await libLoad();libRender();toast('Saved "'+name+'" to the library.');log('Saved query "'+name+'" to library.');}
-async function clearHistory(){if(await ask('Clear query history?')){localStorage.removeItem('history');openHistory();}}
+async function clearHistory(all){const what=all?'the whole query history, of every connection':'the query history of '+histConn();
+ if(!(await ask('Delete '+what+'?')))return;
+ const r=await api('/api/hist-clear',all?{}:{only:histConn()});if(r&&r.ok===false){toast('Could not clear: '+r.error,true);return;}
+ _histItems=null;await openHistory();}
 let _libCache=[];
 function libAll(){return _libCache.slice();}
 // --- Query library: saved queries, kept on the server so they survive restarts.
@@ -13491,9 +13687,10 @@ function dColFromInfo(row,isMaria,tableColl){
  }
  const onUp=/on update\s+(\S+)/i.exec(extra);
  const generated=/GENERATED/i.test(extra.replace(/DEFAULT_GENERATED/ig,''));
- const col={name,type,len,nn:nullable==='NO',def:defShown,ai:/auto_increment/i.test(extra),pk:key==='PRI',comment:comment||''};
+ // un and coll are shown and can be edited; coll is the column's actual collation, inherited or not.
+ const col={name,type,len,nn:nullable==='NO',def:defShown,ai:/auto_increment/i.test(extra),pk:key==='PRI',comment:comment||'',un:/UNSIGNED/.test(mods),coll:coll||''};
  const inherits=!!coll&&coll===tableColl;
- col.keep={origName:name,origType:type,origLen:len,mods,cs:inherits?'':(cs||''),coll:inherits?'':(coll||''),onUpdate:onUp?onUp[1]:'',
+ col.keep={origName:name,origType:type,origLen:len,mods,cs:inherits?'':(cs||''),coll:inherits?'':(coll||''),origCs:cs||'',origColl:coll||'',tableColl:tableColl||null,onUpdate:onUp?onUp[1]:'',
    invisible:/\bINVISIBLE\b/i.test(extra),defShown,defSql,generated,genExpr:genExpr||''};
  return col;
 }
@@ -13509,11 +13706,20 @@ function dKeepFromCreate(col,line){if(!line||!col.keep)return;
  if(at>=0){let d=0,ok=true;const open=bare.indexOf('(',at);for(let i=open;i<bare.length;i++){if(bare[i]==='(')d++;else if(bare[i]===')'){d--;if(d===0){ok=!bare.slice(i+1).trim();break;}}}
   if(ok&&d===0)col.keep.check=line.slice(at).trim();}
  const sr=/\/\*!80003 SRID (\d+) \*\//.exec(line);if(sr)col.keep.srid=sr[1];}
-function colDef(c){
+// The character set a collation belongs to: from the server's own list when the designer has read
+// it, otherwise the part before the first _ (latin1_german2_ci, utf8mb4_uca1400_ai_ci, binary).
+function dCsOf(coll){coll=String(coll||'');const m=typeof window!=='undefined'&&window._dCollCs;if(m&&m[coll.toLowerCase()])return m[coll.toLowerCase()];const i=coll.indexOf('_');return i<0?coll:coll.slice(0,i);}
+// tableColl: the collation the table will have. A text column whose collation is that one gets no
+// clause - it inherits it - and any other collation is written out, so a column that inherited the
+// old one keeps it when the table's default changes. Left out, the one the column was read with.
+function colDef(c,tableColl){
  const k=c.keep||{};
  let s=qid(c.name)+' '+c.type;if(c.len)s+='('+c.len+')';
- if(k.mods&&D_NUMERIC.test(c.type))s+=' '+k.mods;
- if(k.cs&&D_TEXTY.test(c.type))s+=' CHARACTER SET '+k.cs+(k.coll?' COLLATE '+k.coll:'');
+ // UNSIGNED as ticked; ZEROFILL, which the form does not show, stays while the column is unsigned.
+ const un=c.un!==undefined?!!c.un:/UNSIGNED/.test(k.mods||'');
+ if(un&&D_NUMERIC.test(c.type))s+=' UNSIGNED'+(/ZEROFILL/.test(k.mods||'')?' ZEROFILL':'');
+ const coll=c.coll!==undefined?c.coll:(k.coll||''),tc=tableColl!==undefined?tableColl:k.tableColl;
+ if(coll&&coll!==tc&&D_TEXTY.test(c.type))s+=' CHARACTER SET '+(coll===k.origColl&&k.origCs?k.origCs:(k.cs&&coll===k.coll?k.cs:dCsOf(coll)))+' COLLATE '+coll;
  if(c.nn)s+=' NOT NULL';if(c.ai)s+=' AUTO_INCREMENT';
  // An untouched default is written back exactly as it was read - including an empty-string
  // default, which the form cannot tell apart from "no default" by looking at the box.
@@ -13535,24 +13741,92 @@ function colDef(c){
  if(c.comment)s+=' COMMENT '+strLit(c.comment);
  if(k.check&&sameType)s+=' '+k.check;
  return s;}
+// A list of key parts as typed in the Indexes and Foreign keys tabs: "a, `b c`(10) DESC". Each is
+// {name, len, desc}; a name may be in backticks, and a backtick inside is doubled.
+function dIdList(s){s=String(s||'');const out=[];let i=0;const sp=()=>{while(i<s.length&&/\s/.test(s[i]))i++;};
+ while(i<s.length){sp();if(i>=s.length)break;let name='';
+  if(s[i]==='`'){i++;for(;i<s.length;i++){if(s[i]==='`'){if(s[i+1]==='`'){name+='`';i++;continue;}i++;break;}name+=s[i];}}
+  else while(i<s.length&&!/[\s,(]/.test(s[i]))name+=s[i++];
+  sp();let len='';if(s[i]==='('){const j=s.indexOf(')',i);len=s.slice(i+1,j<0?s.length:j).trim();i=j<0?s.length:j+1;sp();}
+  let desc=false;const m=/^(ASC|DESC)\b/i.exec(s.slice(i));if(m){desc=m[1].toUpperCase()==='DESC';i+=m[0].length;}
+  while(i<s.length&&s[i]!==',')i++;i++;
+  if(name)out.push({name,len,desc});}
+ return out;}
+function dIdName(n){return /^[A-Za-z0-9_$]+$/.test(n)?n:'`'+String(n).replace(/`/g,'``')+'`';}
+function dIdText(parts){return parts.map(p=>dIdName(p.name)+(p.len?'('+p.len+')':'')+(p.desc?' DESC':'')).join(', ');}
+function dIdSql(parts){return parts.map(p=>qid(p.name)+(p.len?'('+p.len+')':'')+(p.desc?' DESC':'')).join(',');}
+// The referenced table as typed: "t", "db.t" or "`my db`.`t`". Without a database, the table's own.
+function dRefTbl(s,db){s=String(s||'').trim();const one=()=>{let n='';if(s[0]==='`'){let i=1;for(;i<s.length;i++){if(s[i]==='`'){if(s[i+1]==='`'){n+='`';i++;continue;}i++;break;}n+=s[i];}s=s.slice(i);}else{const m=/^[^.]*/.exec(s)[0];n=m.trim();s=s.slice(m.length);}return n;};
+ const a=one();if(s[0]==='.'){s=s.slice(1).trim();return {db:a,name:one()};}return {db:db||'',name:a};}
+function dRefText(r,db){return (r.db&&r.db!==db?dIdName(r.db)+'.':'')+dIdName(r.name);}
+// Indexes from information_schema.STATISTICS (SELECT *, so a column one server has and another has
+// not - IS_VISIBLE and EXPRESSION on MySQL 8, IGNORED on MariaDB - is read where it is there). The
+// primary key is left out: it is the PK ticks on the Columns tab.
+function dIdxFromStats(columns,rows){const at={};(columns||[]).forEach((c,i)=>{at[String(c&&c.name!=null?c.name:c).toUpperCase()]=i;});
+ const g=(r,n)=>at[n]==null?null:r[at[n]];const by=new Map();
+ (rows||[]).forEach(r=>{const name=String(g(r,'INDEX_NAME'));if(name==='PRIMARY')return;
+  let ix=by.get(name);
+  if(!ix){const t=String(g(r,'INDEX_TYPE')||'').toUpperCase();
+   const kind=t==='FULLTEXT'?'FULLTEXT':t==='SPATIAL'?'SPATIAL':String(g(r,'NON_UNIQUE'))==='0'?'UNIQUE':'INDEX';
+   ix={name,kind,parts:[],comment:String(g(r,'INDEX_COMMENT')||''),keep:{origName:name,using:t==='HASH'?'HASH':'',invisible:String(g(r,'IS_VISIBLE')||'').toUpperCase()==='NO',ignored:String(g(r,'IGNORED')||'').toUpperCase()==='YES',expr:[]}};by.set(name,ix);}
+  const ex=g(r,'EXPRESSION');
+  if(ex!=null&&ex!==''){ix.keep.expr.push('('+String(ex)+')'+(String(g(r,'COLLATION'))==='D'?' DESC':''));return;}
+  ix.parts.push({name:String(g(r,'COLUMN_NAME')),len:g(r,'SUB_PART')==null?'':String(g(r,'SUB_PART')),desc:String(g(r,'COLLATION'))==='D'});});
+ return [...by.values()].map(ix=>{const e=ix.keep.expr.length;ix.cols=e?ix.keep.expr.join(', '):dIdText(ix.parts);if(!e)delete ix.keep.expr;delete ix.parts;return ix;});}
+// Foreign keys from KEY_COLUMN_USAGE joined to REFERENTIAL_CONSTRAINTS, one row per column: constraint
+// name, column, referenced database, table, column, ON UPDATE, ON DELETE.
+function dFksFromInfo(rows,db){const by=new Map();
+ (rows||[]).forEach(([name,col,rdb,rtbl,rcol,upd,del])=>{let f=by.get(name);
+  if(!f){f={name:String(name),cols:[],ref:dRefText({db:String(rdb||''),name:String(rtbl)},db),refCols:[],onDel:String(del||'').toUpperCase(),onUpd:String(upd||'').toUpperCase(),keep:{origName:String(name)}};by.set(name,f);}
+  f.cols.push({name:String(col)});f.refCols.push({name:String(rcol)});});
+ return [...by.values()].map(f=>({...f,cols:dIdText(f.cols),refCols:dIdText(f.refCols)}));}
+const D_IDXKW={INDEX:'INDEX',UNIQUE:'UNIQUE INDEX',FULLTEXT:'FULLTEXT INDEX',SPATIAL:'SPATIAL INDEX'};
+function dIdxDef(ix){const k=ix.keep||{};
+ return (D_IDXKW[ix.kind]||'INDEX')+(ix.name?' '+qid(ix.name):'')+' ('+(k.expr&&k.expr.length?k.expr.join(','):dIdSql(dIdList(ix.cols)))+')'+(k.using?' USING '+k.using:'')+(ix.comment?' COMMENT '+strLit(ix.comment):'')+(k.invisible?' INVISIBLE':'')+(k.ignored?' IGNORED':'');}
+function dFkDef(f,db){const r=dRefTbl(f.ref,db);
+ return (f.name?'CONSTRAINT '+qid(f.name)+' ':'')+'FOREIGN KEY ('+dIdSql(dIdList(f.cols))+') REFERENCES '+(r.db&&r.db!==db?qid(r.db)+'.':'')+qid(r.name)+' ('+dIdSql(dIdList(f.refCols))+')'+(f.onDel?' ON DELETE '+f.onDel:'')+(f.onUpd?' ON UPDATE '+f.onUpd:'');}
+// Table options: {engine, coll, comment}. Only what differs from what was read is written.
+function dOptSql(o,was){was=was||{};const out=[];
+ if(o.engine&&o.engine!==(was.engine||''))out.push('ENGINE='+o.engine);
+ if(o.coll&&o.coll!==(was.coll||''))out.push('DEFAULT CHARACTER SET '+dCsOf(o.coll)+' COLLATE '+o.coll);
+ if((o.comment||'')!==(was.comment||'')&&(o.comment||was.comment))out.push('COMMENT='+strLit(o.comment||''));
+ return out;}
+// The longest run of columns that are already in their new order, as positions in cols: those stay,
+// and only the rest are moved, each to just after the column before it.
+function dStay(oi){const idx=[];oi.forEach((v,i)=>{if(v>=0)idx.push(i);});
+ const n=idx.length,len=Array(n).fill(1),prev=Array(n).fill(-1);
+ for(let j=0;j<n;j++)for(let k=0;k<j;k++)if(oi[idx[k]]<oi[idx[j]]&&len[k]+1>len[j]){len[j]=len[k]+1;prev[j]=k;}
+ let best=-1;for(let j=0;j<n;j++)if(best<0||len[j]>len[best])best=j;
+ const s=new Set();for(let j=best;j>=0;j=prev[j])s.add(idx[j]);return s;}
 // The ALTER for a set of edited columns against what was read. A row keeps the name it was read
 // with, so renaming one is a CHANGE COLUMN; it used to be DROP COLUMN old + ADD COLUMN new, which
 // throws away every value in it.
-function dAlterSql(orig,cols,tbl){
- const alt=[],notes=[];
+// x (optional) holds the other tabs: idx/idxOrig, fk/fkOrig, opt/optOrig, the table's database
+// (db) and its new name (newTbl). A foreign key that changes is dropped in an ALTER of its own
+// first: dropping and re-adding one name in a single ALTER is refused.
+function dAlterSql(orig,cols,tbl,x){
+ x=x||{};
+ const alt=[],notes=[],pre=[];
  const seen=new Set();
- const same=(o,c)=>JSON.stringify({t:o.type,l:''+o.len,nn:o.nn,ai:o.ai,d:o.def,cm:o.comment})===JSON.stringify({t:c.type,l:''+c.len,nn:c.nn,ai:c.ai,d:c.def,cm:c.comment});
- cols.forEach(c=>{
-  const on=c.keep&&c.keep.origName;
-  const o=on!=null?orig.find(x=>x.name===on):null;
-  if(!o){alt.push('ADD COLUMN '+colDef(c));return;}
+ const tc=x.opt&&x.opt.coll?x.opt.coll:(x.optOrig&&x.optOrig.coll?x.optOrig.coll:undefined);
+ const def=c=>colDef(c,tc);
+ const same=(o,c)=>JSON.stringify({t:o.type,l:''+o.len,nn:o.nn,ai:o.ai,d:o.def,cm:o.comment,un:o.un,co:o.coll})===JSON.stringify({t:c.type,l:''+c.len,nn:c.nn,ai:c.ai,d:c.def,cm:c.comment,un:c.un,co:c.coll});
+ // Where each row was, and which stay put. A new column at the end is just added; one anywhere
+ // else, and a column moved, says where it goes - after the one before it, which by then is in place.
+ const oi=cols.map(c=>{const on=c.keep&&c.keep.origName;return on!=null?orig.findIndex(o=>o.name===on):-1;});
+ const stay=dStay(oi);
+ cols.forEach((c,i)=>{
+  const o=oi[i]>=0?orig[oi[i]]:null;
+  const moved=o?!stay.has(i):oi.slice(i).some(v=>v>=0);
+  const pos=moved?(i===0?' FIRST':' AFTER '+qid(cols[i-1].name)):'';
+  if(!o){alt.push('ADD COLUMN '+def(c)+pos);return;}
   seen.add(o.name);
   const renamed=c.name!==o.name;
-  if(!renamed&&same(o,c))return;
+  if(!renamed&&!pos&&same(o,c))return;
   // A generated column's expression comes back from information_schema with its quoting
   // mangled on some versions, so rewriting it is not safe. Leave it, and say so.
-  if(o.keep&&o.keep.generated){notes.push('-- '+qid(o.name)+' is a generated column; change it with SQL, not the designer (left unchanged)');return;}
-  alt.push((renamed?'CHANGE COLUMN '+qid(o.name)+' ':'MODIFY COLUMN ')+colDef(c));
+  if(o.keep&&o.keep.generated){notes.push('-- '+qid(o.name)+' is a generated column; change or move it with SQL, not the designer (left unchanged)');return;}
+  alt.push((renamed?'CHANGE COLUMN '+qid(o.name)+' ':'MODIFY COLUMN ')+def(c)+pos);
  });
  orig.filter(o=>!seen.has(o.name)).forEach(o=>alt.push('DROP COLUMN '+qid(o.name)));
  // The key keeps the order it has: its own columns first, as they were, then any newly ticked.
@@ -13560,10 +13834,36 @@ function dAlterSql(orig,cols,tbl){
  const ticked=cols.filter(c=>c.pk),pkCols=[...oldOrder.map(n=>ticked.find(c=>was(c)===n)).filter(Boolean),...ticked.filter(c=>!oldOrder.includes(was(c)))];
  const oldPk=oldOrder.join(','),newPk=pkCols.map(was).join(',');
  if(oldPk!==newPk){if(oldPk)alt.push('DROP PRIMARY KEY');if(pkCols.length)alt.push('ADD PRIMARY KEY ('+pkCols.map(c=>qid(c.name)).join(',')+')');}
+ // Indexes and keys name columns as they are now; compared with what was read, a column renamed
+ // on the Columns tab counts as its old name, so the server's own renaming of it is enough.
+ const ren=new Map(cols.filter(c=>c.keep&&c.keep.origName!=null).map(c=>[c.name.toLowerCase(),c.keep.origName]));
+ const part=(t,map)=>dIdList(t).map(p=>((map&&ren.get(p.name.toLowerCase()))||p.name).toLowerCase()+'('+p.len+')'+(p.desc?'D':'')).join(',');
+ if(x.idx){const io=x.idxOrig||[];
+  const key=(ix,map)=>JSON.stringify([ix.name,ix.kind,ix.keep&&ix.keep.expr?ix.cols:part(ix.cols,map),ix.comment||'']);
+  io.forEach(o=>{const c=x.idx.find(i=>i.keep&&i.keep.origName===o.name);
+   if(!c||key(o,false)!==key(c,true)){alt.push('DROP INDEX '+qid(o.name));if(c)alt.push('ADD '+dIdxDef(c));}});
+  x.idx.filter(i=>!(i.keep&&i.keep.origName!=null&&io.some(o=>o.name===i.keep.origName))).forEach(i=>{if(i.cols.trim())alt.push('ADD '+dIdxDef(i));});}
+ if(x.fk){const fo=x.fkOrig||[],db=x.db;
+  const key=(f,map)=>{const r=dRefTbl(f.ref,db);return JSON.stringify([f.name,part(f.cols,map),r.db.toLowerCase(),r.name.toLowerCase(),part(f.refCols,false),f.onDel||'',f.onUpd||'']);};
+  fo.forEach(o=>{const c=x.fk.find(f=>f.keep&&f.keep.origName===o.name);
+   if(!c||key(o,false)!==key(c,true)){pre.push('DROP FOREIGN KEY '+qid(o.name));if(c)alt.push('ADD '+dFkDef(c,db));}});
+  x.fk.filter(f=>!(f.keep&&f.keep.origName!=null&&fo.some(o=>o.name===f.keep.origName))).forEach(f=>{if(f.cols.trim()&&f.ref.trim())alt.push('ADD '+dFkDef(f,db));});}
+ if(x.opt)alt.push(...dOptSql(x.opt,x.optOrig));
+ if(x.newTbl&&x.newTbl!==tbl)alt.push('RENAME TO '+x.newTbl);
  if(alt.length)notes.push(...dTsNotes(cols.filter(c=>{const on=c.keep&&c.keep.origName;const o=on!=null?orig.find(x=>x.name===on):null;return !o||alt.some(a=>a.includes(qid(c.name)));})));
  const head=notes.length?notes.join('\n')+'\n':'';
- return alt.length?head+'ALTER TABLE '+tbl+'\n  '+alt.join(',\n  ')+';':head+'-- no changes detected';
+ const out=[pre,alt].filter(a=>a.length).map(a=>'ALTER TABLE '+tbl+'\n  '+a.join(',\n  ')+';').join('\n');
+ return out?head+out:head+'-- no changes detected';
 }
+// The CREATE TABLE for a new table, with the other tabs as in dAlterSql.
+function dCreateSql(cols,tbl,x){x=x||{};const tc=x.opt&&x.opt.coll?x.opt.coll:null;
+ const tsn=dTsNotes(cols),pk=cols.filter(c=>c.pk).map(c=>qid(c.name));
+ const lines=cols.map(c=>colDef(c,tc));
+ if(pk.length)lines.push('PRIMARY KEY ('+pk.join(',')+')');
+ (x.idx||[]).filter(i=>i.cols.trim()).forEach(i=>lines.push(dIdxDef(i)));
+ (x.fk||[]).filter(f=>f.cols.trim()&&f.ref.trim()).forEach(f=>lines.push(dFkDef(f,x.db)));
+ const opts=x.opt?dOptSql(x.opt,{}).map(o=>o.replace(/^DEFAULT CHARACTER SET /,'DEFAULT CHARSET=').replace(/ COLLATE /,' COLLATE=')):[];
+ return (tsn.length?tsn.join('\n')+'\n':'')+'CREATE TABLE '+tbl+' (\n  '+lines.join(',\n  ')+'\n)'+(opts.length?' '+opts.join(' '):'')+';';}
 // With explicit_defaults_for_timestamp OFF (MariaDB's default before 10.10, and a setting some MySQL
 // servers keep), a TIMESTAMP NOT NULL written without a default is given DEFAULT CURRENT_TIMESTAMP ON
 // UPDATE CURRENT_TIMESTAMP when it is the table's first - measured on MySQL 8: a MODIFY that only
@@ -13573,11 +13873,25 @@ async function dReadTimestampMode(){window._dTsAuto=false;try{const r=await api(
 function dTsNotes(cols){if(typeof window==='undefined'||!window._dTsAuto)return [];
  return cols.filter(c=>c.type==='TIMESTAMP'&&c.nn&&(c.def==null||c.def==='')&&!(c.keep&&c.keep.onUpdate)&&!(c.keep&&c.keep.defSql!=null&&c.def===c.keep.defShown))
   .map(c=>'-- explicit_defaults_for_timestamp is OFF on this server: '+qid(c.name)+' as written here may be given DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP. Give it a default to prevent that.');}
-async function designTable(name,db){dEdited=false;await dReadTimestampMode();db=db||curSchema||'';$('dSchema').value=db;$('dName').value=name||'';$('dCols').innerHTML='';$('dLog').textContent='';dOrig=null;
+let dIdxOrig=null,dFkOrig=null,dOptOrig=null,dTblOrig=null;
+// The server's collations and engines, for the lists the collation and engine boxes offer, and
+// each collation's character set (dCsOf).
+async function dReadLists(){
+ if(!window._dCollCs){const r=await api('/api/query',{sql:'SHOW COLLATION'});if(r&&r.ok){window._dCollCs={};r.rows.forEach(x=>{if(x[0]&&x[1])window._dCollCs[String(x[0]).toLowerCase()]=String(x[1]);});
+  $('dCollList').innerHTML=Object.keys(window._dCollCs).sort().map(c=>'<option value="'+esc(c)+'">').join('');}}
+ const e=await api('/api/query',{sql:'SHOW ENGINES'});
+ if(e&&e.ok)$('dEngList').innerHTML=e.rows.filter(x=>/^(YES|DEFAULT)$/i.test(String(x[1]))).map(x=>'<option value="'+esc(x[0])+'">').join('');}
+async function designTable(name,db){dEdited=false;await dReadTimestampMode();db=db||curSchema||'';$('dSchema').value=db;$('dName').value=name||'';
+ ['dCols','dIdx','dFks'].forEach(id=>$(id).innerHTML='');$('dLog').textContent='';dOrig=dIdxOrig=dFkOrig=dOptOrig=dTblOrig=null;
+ $('dEngine').value='';$('dColl').value='';$('dTblComment').value='';dTab($('dTabs').querySelector('.dtab'));
+ await dReadLists();
  if(name){$('dTitle').textContent='Alter table';$('dMode').textContent='(existing - generates ALTER)';
    const r=await api('/api/query',{sql:"SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA,COLUMN_KEY,COLUMN_COMMENT,CHARACTER_SET_NAME,COLLATION_NAME,GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)+" ORDER BY ORDINAL_POSITION"});
-   const tc=await api('/api/query',{sql:"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)});
+   const tc=await api('/api/query',{sql:"SELECT TABLE_COLLATION,ENGINE,TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)});
    const tableColl=tc.ok&&tc.rows[0]?tc.rows[0][0]:null;
+   dOptOrig={coll:tableColl||'',engine:tc.ok&&tc.rows[0]&&tc.rows[0][1]||'',comment:tc.ok&&tc.rows[0]&&tc.rows[0][2]||''};
+   $('dColl').value=dOptOrig.coll;$('dEngine').value=dOptOrig.engine;$('dTblComment').value=dOptOrig.comment;
+   dTblOrig={db,name};
    // What information_schema does not say about a column, the server's own CREATE line does: a
    // column-level CHECK (MariaDB writes one for every JSON column, json_valid) and MySQL's SRID. A
    // MODIFY built without them dropped both - invalid JSON was accepted afterwards, and a spatial
@@ -13593,30 +13907,69 @@ async function designTable(name,db){dEdited=false;await dReadTimestampMode();db=
    dOrig=[];if(pkOrder)dOrig.pkOrder=pkOrder;
    if(r.ok)r.rows.forEach(row=>{const col=dColFromInfo(row,!!window.mariadb,tableColl);if(pkOrder)col.pk=pkOrder.includes(col.name);dKeepFromCreate(col,lines[String(col.name).toLowerCase()]);dOrig.push(col);dAddCol(col);});
    else{$('dLog').textContent='Could not read the table: '+r.error;}
+   const st=await api('/api/query',{sql:"SELECT * FROM information_schema.STATISTICS WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)+" ORDER BY INDEX_NAME,SEQ_IN_INDEX"});
+   dIdxOrig=st.ok?dIdxFromStats(st.columns,st.rows):[];dIdxOrig.forEach(ix=>dAddIdx(ix));
+   const fk=await api('/api/query',{sql:"SELECT k.CONSTRAINT_NAME,k.COLUMN_NAME,k.REFERENCED_TABLE_SCHEMA,k.REFERENCED_TABLE_NAME,k.REFERENCED_COLUMN_NAME,c.UPDATE_RULE,c.DELETE_RULE FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS c ON c.CONSTRAINT_SCHEMA=k.CONSTRAINT_SCHEMA AND c.CONSTRAINT_NAME=k.CONSTRAINT_NAME AND c.TABLE_NAME=k.TABLE_NAME WHERE k.TABLE_SCHEMA="+lit(db)+" AND k.TABLE_NAME="+lit(name)+" AND k.REFERENCED_TABLE_NAME IS NOT NULL ORDER BY k.CONSTRAINT_NAME,k.ORDINAL_POSITION"});
+   dFkOrig=fk.ok?dFksFromInfo(fk.rows,db):[];dFkOrig.forEach(f=>dAddFk(f));
  } else {$('dTitle').textContent='Create table';$('dMode').textContent='(new - generates CREATE)';dAddCol({name:'id',type:'INT',len:'',nn:true,ai:true,pk:true,def:null,comment:''});dAddCol({name:'',type:'VARCHAR',len:'255',nn:false,ai:false,pk:false,def:null,comment:''});}
  dGen();show('mDesign');}
-function dAddCol(c){c=c||{name:'',type:'VARCHAR',len:'255',nn:false,ai:false,pk:false,def:null,comment:''};const tr=document.createElement('tr');
+function dTab(b){if(!b)return;$('dTabs').querySelectorAll('.dtab').forEach(t=>{const on=t===b;t.classList.toggle('on',on);$(t.dataset.p).style.display=on?'flex':'none';});}
+// UNSIGNED only for a number, a collation only for text: the boxes that do not apply are greyed.
+function dRowState(tr){const t=tr.querySelector('.dt').value;tr.querySelector('.dun').disabled=!D_NUMERIC.test(t);tr.querySelector('.dco').disabled=!D_TEXTY.test(t);}
+function dMove(b,by){const tr=b.closest('tr'),to=by<0?tr.previousElementSibling:tr.nextElementSibling;if(!to)return;if(by<0)to.before(tr);else to.after(tr);dGen();}
+// A column renamed on the Columns tab is renamed in the index and key lists too, as the server does.
+function dRenameRefs(from,to){if(!from||from===to)return;
+ document.querySelectorAll('#dIdx .dic:not(:disabled),#dFks .dfc').forEach(el=>{const p=dIdList(el.value);let hit=false;p.forEach(x=>{if(x.name.toLowerCase()===from.toLowerCase()){x.name=to;hit=true;}});if(hit)el.value=dIdText(p);});}
+function dAddCol(c){c=c||{name:'',type:'VARCHAR',len:'255',nn:false,ai:false,pk:false,def:null,comment:'',un:false,coll:''};const tr=document.createElement('tr');
  // A type the list does not carry (SET, TINYTEXT, GEOMETRY...) must still be offered, or the
  // select falls back to its first entry and the column is silently read back as INT.
  const types=DTYPES.includes(c.type)?DTYPES:DTYPES.concat([c.type]);
  tr.innerHTML='<td><input class="dn" value="'+esc(c.name)+'"></td><td><select class="dt">'+types.map(t=>'<option'+(t===c.type?' selected':'')+'>'+esc(t)+'</option>').join('')+'</select></td>'+
   '<td><input class="dl" value="'+esc(c.len==null?'':c.len)+'"></td><td><input type="checkbox" class="dnn"'+(c.nn?' checked':'')+'></td>'+
   '<td><input type="checkbox" class="dai"'+(c.ai?' checked':'')+'></td><td><input type="checkbox" class="dpk"'+(c.pk?' checked':'')+'></td>'+
-  '<td><input class="dd" value="'+esc(c.def==null?'':c.def)+'"></td><td><input class="dc" value="'+esc(c.comment||'')+'"></td>'+
-  '<td><button class="sm" title="Remove this column" onclick="this.closest(\'tr\').remove();dGen()">&times;</button></td>';
+  '<td><input type="checkbox" class="dun" title="UNSIGNED"'+(c.un?' checked':'')+'></td>'+
+  '<td><input class="dd" value="'+esc(c.def==null?'':c.def)+'"></td><td><input class="dco" list="dCollList" placeholder="(table\'s)" value="'+esc(c.coll||'')+'"></td><td><input class="dc" value="'+esc(c.comment||'')+'"></td>'+
+  '<td style="white-space:nowrap"><button class="sm" title="Move up" onclick="dMove(this,-1)">&#8593;</button><button class="sm" title="Move down" onclick="dMove(this,1)">&#8595;</button><button class="sm" title="Remove this column" onclick="this.closest(\'tr\').remove();dGen()">&times;</button></td>';
  tr._keep=c.keep||null;
- if(c.keep){const hint=[c.keep.mods,c.keep.cs&&('CHARACTER SET '+c.keep.cs),c.keep.onUpdate&&('ON UPDATE '+c.keep.onUpdate),c.keep.invisible&&'INVISIBLE',c.keep.generated&&'GENERATED'].filter(Boolean).join(', ');if(hint)tr.title='Kept as is: '+hint;}
- $('dCols').appendChild(tr);tr.querySelectorAll('input,select').forEach(el=>el.addEventListener('change',dGen));}
+ if(c.keep){const hint=[/ZEROFILL/.test(c.keep.mods||'')&&'ZEROFILL',c.keep.onUpdate&&('ON UPDATE '+c.keep.onUpdate),c.keep.invisible&&'INVISIBLE',c.keep.generated&&'GENERATED'].filter(Boolean).join(', ');if(hint)tr.title='Kept as is: '+hint;}
+ $('dCols').appendChild(tr);dRowState(tr);
+ const nm=tr.querySelector('.dn');nm.dataset.prev=c.name||'';nm.addEventListener('change',()=>{dRenameRefs(nm.dataset.prev,nm.value.replace(/\s+$/,''));nm.dataset.prev=nm.value.replace(/\s+$/,'');});
+ tr.querySelector('.dt').addEventListener('change',()=>dRowState(tr));
+ tr.querySelectorAll('input,select').forEach(el=>el.addEventListener('change',dGen));}
+const D_RULES=['','RESTRICT','CASCADE','SET NULL','NO ACTION','SET DEFAULT'];
+function dAddIdx(ix){ix=ix||{name:'',kind:'INDEX',cols:'',comment:''};const tr=document.createElement('tr'),expr=!!(ix.keep&&ix.keep.expr),dis=expr?' disabled':'';
+ tr.innerHTML='<td><input class="din" value="'+esc(ix.name)+'"'+dis+'></td><td><select class="dik"'+dis+'>'+Object.keys(D_IDXKW).map(k=>'<option'+(k===ix.kind?' selected':'')+'>'+k+'</option>').join('')+'</select></td>'+
+  '<td><input class="dic" placeholder="a, b(10) DESC" value="'+esc(ix.cols)+'"'+dis+'></td><td><input class="dim" value="'+esc(ix.comment||'')+'"'+dis+'></td>'+
+  '<td><button class="sm" title="Remove this index" onclick="this.closest(\'tr\').remove();dGen()">&times;</button></td>';
+ tr._keep=ix.keep||null;if(expr)tr.title='An index on an expression: change it with SQL. It can be removed here.';
+ $('dIdx').appendChild(tr);tr.querySelectorAll('input,select').forEach(el=>el.addEventListener('change',dGen));}
+function dAddFk(f){f=f||{name:'',cols:'',ref:'',refCols:'',onDel:'RESTRICT',onUpd:'RESTRICT'};const tr=document.createElement('tr');
+ const rules=v=>(D_RULES.includes(v)?D_RULES:D_RULES.concat([v])).map(r=>'<option value="'+esc(r)+'"'+(r===v?' selected':'')+'>'+esc(r||'(server default)')+'</option>').join('');
+ tr.innerHTML='<td><input class="dfn" value="'+esc(f.name)+'"></td><td><input class="dfc" placeholder="a, b" value="'+esc(f.cols)+'"></td>'+
+  '<td><input class="dfr" placeholder="table or db.table" value="'+esc(f.ref)+'"></td><td><input class="dfrc" placeholder="id" value="'+esc(f.refCols)+'"></td>'+
+  '<td><select class="dfd">'+rules(f.onDel)+'</select></td><td><select class="dfu">'+rules(f.onUpd)+'</select></td>'+
+  '<td><button class="sm" title="Remove this foreign key" onclick="this.closest(\'tr\').remove();dGen()">&times;</button></td>';
+ tr._keep=f.keep||null;$('dFks').appendChild(tr);tr.querySelectorAll('input,select').forEach(el=>el.addEventListener('change',dGen));}
 function dMark(){dEdited=true;$('dEditNote').textContent='✎ manually edited - auto-update paused; use Regenerate to rebuild';}
 // Names lose trailing spaces only - a name cannot end in one, but may begin with one, and trimming
 // both ends renamed a column called " a" to "a" on the next Apply. A comment is kept exactly as it
 // is: trimmed, it no longer matched the table's own, and any change to that column rewrote it.
-function dReadCols(){return [...$('dCols').children].map(tr=>({name:tr.querySelector('.dn').value.replace(/\s+$/,''),type:tr.querySelector('.dt').value,len:tr.querySelector('.dl').value.trim(),nn:tr.querySelector('.dnn').checked,ai:tr.querySelector('.dai').checked,pk:tr.querySelector('.dpk').checked,def:tr.querySelector('.dd').value,comment:tr.querySelector('.dc').value,keep:tr._keep||null})).filter(c=>c.name.trim());}
-function dGen(force){if(dEdited&&!force)return;const db=$('dSchema').value.replace(/\s+$/,''),name=$('dName').value.replace(/\s+$/,'');const cols=dReadCols();const pk=cols.filter(c=>c.pk).map(c=>qid(c.name));
+function dReadCols(){return [...$('dCols').children].map(tr=>({name:tr.querySelector('.dn').value.replace(/\s+$/,''),type:tr.querySelector('.dt').value,len:tr.querySelector('.dl').value.trim(),nn:tr.querySelector('.dnn').checked,ai:tr.querySelector('.dai').checked,pk:tr.querySelector('.dpk').checked,un:tr.querySelector('.dun').checked,def:tr.querySelector('.dd').value,coll:tr.querySelector('.dco').value.trim(),comment:tr.querySelector('.dc').value,keep:tr._keep||null})).filter(c=>c.name.trim());}
+function dReadIdx(){return [...$('dIdx').children].map(tr=>({name:tr.querySelector('.din').value.replace(/\s+$/,''),kind:tr.querySelector('.dik').value,cols:tr.querySelector('.dic').value,comment:tr.querySelector('.dim').value,keep:tr._keep||null}));}
+function dReadFks(){return [...$('dFks').children].map(tr=>({name:tr.querySelector('.dfn').value.replace(/\s+$/,''),cols:tr.querySelector('.dfc').value,ref:tr.querySelector('.dfr').value,refCols:tr.querySelector('.dfrc').value,onDel:tr.querySelector('.dfd').value,onUpd:tr.querySelector('.dfu').value,keep:tr._keep||null}));}
+function dGen(force){if(dEdited&&!force)return;const db=$('dSchema').value.replace(/\s+$/,''),name=$('dName').value.replace(/\s+$/,'');const cols=dReadCols();
  if(!name){$('dSql').value='-- enter a table name';return;}const tbl=qid(db)+'.'+qid(name);
- if(!dOrig){const tsn=dTsNotes(cols);let s=(tsn.length?tsn.join('\n')+'\n':'')+'CREATE TABLE '+tbl+' (\n  '+cols.map(colDef).join(',\n  ');if(pk.length)s+=',\n  PRIMARY KEY ('+pk.join(',')+')';s+='\n);';$('dSql').value=s;dEdited=false;$('dEditNote').textContent='';return;}
- $('dSql').value=dAlterSql(dOrig,cols,tbl);dEdited=false;$('dEditNote').textContent='';}
-async function dApply(){if(roBlock())return;const sql=$('dSql').value;$('dLog').textContent='Applying...';const r=await api('/api/script',{sql,db:curSchema});if(r.ok){$('dLog').textContent='Applied OK.';log('DESIGN OK');if(curSchema)loadObjects(curSchema);}else{const _n=ddlFailureNote(r.error,sql);$('dLog').textContent=_n;log('DESIGN error: '+_n);}}
+ const x={db,idx:dReadIdx(),fk:dReadFks(),opt:{engine:$('dEngine').value.trim(),coll:$('dColl').value.trim(),comment:$('dTblComment').value}};
+ if(!dOrig){$('dSql').value=dCreateSql(cols,tbl,x);dEdited=false;$('dEditNote').textContent='';return;}
+ // Changing the name or the database box renames (or moves) the table.
+ const otbl=qid(dTblOrig.db)+'.'+qid(dTblOrig.name);
+ Object.assign(x,{idxOrig:dIdxOrig,fkOrig:dFkOrig,optOrig:dOptOrig,newTbl:tbl});
+ $('dSql').value=dAlterSql(dOrig,cols,otbl,x);dEdited=false;$('dEditNote').textContent='';}
+// After an Apply the designer reads the table again, so a second Apply starts from what is there now.
+async function dApply(){if(roBlock())return;const sql=$('dSql').value;$('dLog').textContent='Applying...';const r=await api('/api/script',{sql,db:curSchema});
+ if(r.ok){log('DESIGN OK');if(curSchema)loadObjects(curSchema);const db=$('dSchema').value.replace(/\s+$/,''),name=$('dName').value.replace(/\s+$/,'');
+  if(name)await designTable(name,db);$('dLog').textContent='Applied OK.';}
+ else{const _n=ddlFailureNote(r.error,sql);$('dLog').textContent=_n;log('DESIGN error: '+_n);}}
 
 // ---- export/import ----
 // [key, label, default, what it does, group, the mysqldump option]. Include is always on show; the
@@ -14792,7 +15145,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ToolsDirOld','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','TxSessions','TxLost','Tunnels','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','AppVersion','ReleasesRepo','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload','BrowseCharsets') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ToolsDirOld','ConnFile','LibFile','HistFile','HistMaxSql','ReservedSet','RunningQueries','RunningJobs','OpenCursors','TxSessions','TxLost','Tunnels','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','AppVersion','ReleasesRepo','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload','BrowseCharsets') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }
@@ -14924,6 +15277,10 @@ $RequestHandler = {
                 '/api/lib-delete'  { Send-Json $client (Api-LibDelete $data) }
                 '/api/lib-clear'   { Send-Json $client (Api-LibClear) }
                 '/api/lib-replace' { Send-Json $client (Api-LibReplace $data) }
+                '/api/hist-add'    { Send-Json $client (Api-HistAdd $data) }
+                '/api/hist-list'   { Send-Json $client (Api-HistList) }
+                '/api/hist-delete' { Send-Json $client (Api-HistDelete $data) }
+                '/api/hist-clear'  { Send-Json $client (Api-HistClear $data) }
                 default        { Send-Json $client '{"ok":false,"error":"unknown"}' }
             }
         } else {

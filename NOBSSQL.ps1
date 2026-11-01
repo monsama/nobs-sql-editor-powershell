@@ -2029,9 +2029,15 @@ function Invoke-TxStatements { param($s, [string[]]$Stmts, [int]$MaxRows, [switc
         # Read right after the statement, before the marker's own SIGNAL overwrites the diagnostics
         # area with its own (synthetic) condition - a separate SHOW WARNINGS call later would read
         # that instead of the statement's.
-        if ($Warnings) { $body += "SHOW WARNINGS;`n" }
-        # ROW_COUNT() in the marker is what the statement before it changed, for the transaction's log.
-        $bytes = [Text.Encoding]::UTF8.GetBytes($body + "SELECT '$marker' AS nobs_marker, ROW_COUNT() AS nobs_rows;`nSIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='$marker';`n")
+        #
+        # ROW_COUNT() in the marker is what the statement before it changed, for the transaction's
+        # log - but SHOW WARNINGS is itself a statement that returns a result set, which resets
+        # ROW_COUNT() same as a SELECT does. With -Warnings, a SET right after the statement (which
+        # does not touch ROW_COUNT()) saves it into a session variable before SHOW WARNINGS can
+        # clobber it, and the marker reads that variable back instead of calling ROW_COUNT() fresh.
+        if ($Warnings) { $body += "SET @nobs_rc := ROW_COUNT();`nSHOW WARNINGS;`n" }
+        $rowsExpr = if ($Warnings) { '@nobs_rc' } else { 'ROW_COUNT()' }
+        $bytes = [Text.Encoding]::UTF8.GetBytes($body + "SELECT '$marker' AS nobs_marker, $rowsExpr AS nobs_rows;`nSIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='$marker';`n")
         try { $s.Process.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length); $s.Process.StandardInput.BaseStream.Flush() }
         catch { return @{ sets=$sets; lost=$true; err=$script:TxLost } }
         $part = $s.Out.SetsUntil($MaxRows, $marker)

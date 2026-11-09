@@ -260,7 +260,8 @@ eq(L.litAs('NULL', false), "'NULL'", "the text 'NULL' is quoted");
 eq(L.litAs('0x41', null), '0x41', 'with the type unknown it is lit(), as before');
 eq(/keyWhere\(t,ri,bc,kt\)/.test(applyBody), true, 'applyChanges finds rows through keyWhere');
 eq(/litAs\(v,bc\?bc\[ci\]:null\)/.test(extractFunction(src, 'keyWhere')), true, 'which writes row keys by column type');
-eq(/litAs\(byRow\[ri\]\[ci\]/.test(applyBody), true, 'applyChanges writes changed cells by column type');
+// A plain integer for a BIT column goes through as a number (the bit pattern); anything else by litAs.
+eq(/litCol=\(ci,v\)=>.*litAs\(v,bc\?bc\[ci\]:null\)/.test(applyBody) && /litCol\(\+ci,byRow\[ri\]\[ci\]\)/.test(applyBody), true, 'applyChanges writes changed cells by column type');
 for (const f of ['insertsText', 'exportFull']) {
   eq(extractFunction(src, f).includes('litAs('), true, f + ' writes rows by column type');
 }
@@ -286,6 +287,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull', 'copyInserts']) {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, runLog: () => {}, invalidateTableCache: () => {},
       openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, sessFree: async () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, true, false],
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m), fmtCount: n => String(n), splitStmts: () => [], warnFromWrites: () => [],
+      histStart: () => null, histKeep: () => {}, clip: v => String(v), ONE_ROW_REFUSED: '', warnText: () => '',
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
     };
     const keys = Object.keys(env);
@@ -382,6 +384,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull', 'copyInserts']) {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, runLog: () => {}, invalidateTableCache: () => {},
       openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, sessFree: async () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, false],
       tableNulTextCount: async () => nulRows, fmtCount: n => String(n), splitStmts: () => [], warnFromWrites: () => [],
+      histStart: () => null, histKeep: () => {}, clip: v => String(v), ONE_ROW_REFUSED: '', warnText: () => '',
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
     };

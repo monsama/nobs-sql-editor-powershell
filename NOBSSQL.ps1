@@ -5748,6 +5748,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  .delcell{color:#c00;cursor:pointer;text-align:center;width:22px}
  .status{padding:3px 8px;font-size:12px;color:var(--fg);border-top:1px solid var(--bd2);background:var(--panel)} .status.err{color:#e06}
  #loghdr{background:#333;color:#ddd;padding:2px 8px;font-size:11px;display:flex;justify-content:space-between}
+ #logResize{height:5px;cursor:row-resize;background:var(--panel2);border-top:1px solid var(--bd);flex:0 0 auto;touch-action:none} #logResize:hover,#logResize.drag{background:var(--bd2)}
  #log{height:104px;overflow:auto;background:var(--log);color:var(--logfg);font-family:var(--mono);font-size:12px;padding:6px 8px;white-space:pre-wrap}
  #log .ln{border-left:3px solid transparent;padding-left:6px;margin-left:-6px} #log .ln.ok{border-left-color:var(--erd-pk)}
  #log .ln.warn{border-left-color:var(--log-warn)} #log .ln.err{border-left-color:var(--err-line);color:#f2b8b0}
@@ -6131,7 +6132,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="sideResize" title="Drag to resize the sidebar (double-click to fit the names)"><span id="sideFold" class="edfold vert toedge left" title="Hide the sidebar" onmousedown="event.stopPropagation()" onclick="toggleSide()">&#9666;</span></div>
  <div id="content"><div id="tabsbar"></div><div id="panes" style="flex:1;display:flex;flex-direction:column;min-height:0"><div id="overview" style="display:none;flex:1;overflow:auto;padding:14px"></div></div></div>
 </div>
-<div id="loghdr"><span style="cursor:pointer;user-select:none" onclick="toggleLog()" title="Show or hide the output"><span id="logCaret">&#9662;</span> Action Output</span><span style="display:inline-flex;gap:12px"><span style="cursor:pointer" onclick="event.stopPropagation();logCopy()" title="Copy the whole output">copy</span><span style="cursor:pointer" onclick="event.stopPropagation();document.getElementById('log').textContent=''" title="Empty the output">clear</span></span></div><div id="log"></div>
+<div id="logResize" title="Drag to resize the output (double-click to reset)" onmousedown="logDrag(event)" ondblclick="setLogH(LOG_H0)"></div><div id="loghdr"><span style="cursor:pointer;user-select:none" onclick="toggleLog()" title="Show or hide the output"><span id="logCaret">&#9662;</span> Action Output</span><span style="display:inline-flex;gap:12px"><span style="cursor:pointer" onclick="event.stopPropagation();logCopy()" title="Copy the whole output">copy</span><span style="cursor:pointer" onclick="event.stopPropagation();document.getElementById('log').textContent=''" title="Empty the output">clear</span></span></div><div id="log"></div>
 <div id="ctx"></div>
 <div id="minimizedTray" style="display:none;position:fixed;bottom:10px;right:10px;gap:8px;z-index:9500;max-width:70vw;flex-wrap:wrap;justify-content:flex-end"></div>
 <div id="colPicker"></div>
@@ -6684,6 +6685,20 @@ function setLogFolded(on){const l=$('log'),c=$('logCaret');if(!l)return;l.style.
  try{localStorage.setItem('logFolded',on?'1':'');}catch(e){}}
 function toggleLog(){setLogFolded($('log').style.display!=='none');}
 try{if(localStorage.getItem('logFolded'))setLogFolded(true);}catch(e){}
+// Its height is dragged by the divider above its header: at least two lines, and never so tall that
+// the editor and results above have no room left. Kept like its folding.
+const LOG_H0=104;
+function logMaxH(){return Math.max(60,window.innerHeight-260);}
+function setLogH(h,keep){const l=$('log');if(!l)return;h=Math.round(Math.max(40,Math.min(logMaxH(),h)));l.style.height=h+'px';
+ if(keep!==false)try{localStorage.setItem('logH',h===LOG_H0?'':String(h));}catch(e){}}
+function logDrag(e){if(e.button!==0)return;e.preventDefault();const l=$('log'),rz=$('logResize');if(!l)return;
+ // A folded output opens as it is dragged, from nothing.
+ const folded=l.style.display==='none',sy=e.clientY,sh=folded?0:l.offsetHeight;
+ const mv=ev=>{const h=sh-(ev.clientY-sy);if(l.style.display==='none'){if(h<20)return;setLogFolded(false);}setLogH(h,false);};
+ const up=()=>{document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up);document.body.style.userSelect='';if(rz)rz.classList.remove('drag');
+  if(l.style.display!=='none')setLogH(l.offsetHeight);};
+ if(rz)rz.classList.add('drag');document.body.style.userSelect='none';document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up);}
+try{const h=parseInt(localStorage.getItem('logH')||'',10);if(h>0)setLogH(h,false);}catch(e){}
 // kind: true (legacy) or 'err' -> red, 6s; 'ok' -> green success, 3.5s; omitted/falsy -> neutral
 // info, 3.5s. The boolean form is kept working so none of this function's many existing callers
 // needed to change - only call sites that want the new green "success" variant pass 'ok'.
@@ -7244,12 +7259,12 @@ function _clearKeys(includeAll){const keys=[];for(let i=0;i<localStorage.length;
 // back out of, and "Clear all app data" is far too big a hammer: it takes the connections with it.
 // One reset for all of it - the layout, the theme and the message timing here, the fonts, text sizes
 // and zoom through uiSizesReset(). A setting added to Appearance belongs in one of the two.
-const APPEARANCE_KEYS=['sideW','sideFolded','logFolded','objCollapsed','ovFolded','theme','toastMs','dlgGeom'];
+const APPEARANCE_KEYS=['sideW','sideFolded','logFolded','logH','objCollapsed','ovFolded','theme','toastMs','dlgGeom'];
 async function resetAppearance(){
  if(!(await ask('Restore the default appearance?\n\nThe layout, the size and place of every window, the theme, fonts, text sizes, zoom and notification duration are reset to their defaults. Connections, the query library, history and pinned tables are not affected.')))return;
  // What is on screen now, without waiting for a restart.
  try{setSideFolded(false);}catch(e){}
- try{setLogFolded(false);}catch(e){}
+ try{setLogFolded(false);setLogH(LOG_H0,false);}catch(e){}
  const sd=$('side');if(sd)sd.style.width='280px';
  document.querySelectorAll('.tabpane').forEach(p=>p.classList.remove('edfolded-editor','edfolded-results'));
  document.querySelectorAll('[id^="ew_"]').forEach(ew=>{ew.style.height='';});
@@ -9955,6 +9970,9 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;const userRun=!!
       try{const ct=await api('/api/query',{sql:"SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(t.db)+" AND TABLE_NAME="+lit(t.table)});
         if(ct.ok){t.colTypes={};ct.rows.forEach(row=>{t.colTypes[row[0]]=row[1];});t.bitCols=t.cols.map(c=>!!(t.colTypes[c]&&/^bit\(/i.test(t.colTypes[c])));t.binCols=colTypesBinCols(t.cols,t.colTypes)||[];}
       }catch(e){}
+      // The full column metadata (NULL-ability, enum lists) is read in the background; the header
+      // shows each column's type once it is in.
+      getColType(id,t.cols[0]).then(()=>{const sr=$('sortrow_'+id);if(sr&&T(id)===t&&t.table){sr.innerHTML=sortHeader(id,!!t.pk);syncFilterRowTop(id);wireColResize(id);}});
       if(objData && objData.db===t.db && objData.rowCounts && (t.table in objData.rowCounts) && objData.rowCounts[t.table]!=null){
         t.estRows=+objData.rowCounts[t.table];
       } else {
@@ -10642,7 +10660,7 @@ function syncFilterRowTop(id){
 // all of it left. Hung on the next cell instead, the overhang goes the other way, over a
 // neighbour that paints earlier - the whole band is there, centred on the line, at 100%, 125% and
 // 150% display scaling alike. The last column's handle goes on the filler cell at the end.
-function sortHeader(id,ed){const t=T(id);const H=28;let h='<th style="width:22px;height:'+H+'px;padding:0"><span style="display:flex;align-items:center;justify-content:center;height:'+H+'px"><input type="checkbox" title="Select/clear all shown rows" onclick="selAll(\''+id+'\',this.checked)"></span></th>'+(ed?'<th></th>':'');t.cols.forEach((c,ci)=>{const ar=t.sortCol===ci?(t.sortDir>0?' \u25B2':' \u25BC'):'';const isPk=t.pk&&t.pk.indexOf(c)>=0;const isFk=t.fk&&t.fk.indexOf(c)>=0;const kb=(isPk?' <span class="muted" style="font-size:10px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-pk,#5dcaa5)" title="Primary key">PK</span>':'')+(isFk?' <span class="muted" style="font-size:10px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-line,#7aa8d8)" title="Foreign key">FK</span>':'');const gf=gridFocusOf(id);h+='<th'+(gf&&gf.ci===ci?' class="kbcol"':'')+' style="cursor:pointer;height:'+H+'px;padding:0 8px" title="'+esc(c)+' - click to sort (drag edge to resize, double-click edge to auto-fit)" onclick="sortBy(\''+id+'\','+ci+')">'+(ci?'<span class="rz" data-ci="'+(ci-1)+'"></span>':'')+'<span style="display:flex;align-items:center;gap:4px;height:'+H+'px;min-width:0"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0">'+esc(c)+'</span>'+kb+ar+'</span></th>';});return h+'<th>'+(t.cols.length?'<span class="rz" data-ci="'+(t.cols.length-1)+'"></span>':'')+'</th>';}
+function sortHeader(id,ed){const t=T(id);const H=28;let h='<th style="width:22px;height:'+H+'px;padding:0"><span style="display:flex;align-items:center;justify-content:center;height:'+H+'px"><input type="checkbox" title="Select/clear all shown rows" onclick="selAll(\''+id+'\',this.checked)"></span></th>'+(ed?'<th></th>':'');t.cols.forEach((c,ci)=>{const ar=t.sortCol===ci?(t.sortDir>0?' \u25B2':' \u25BC'):'';const isPk=t.pk&&t.pk.indexOf(c)>=0;const isFk=t.fk&&t.fk.indexOf(c)>=0;const kb=(isPk?' <span class="muted" style="font-size:10px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-pk,#5dcaa5)" title="Primary key">PK</span>':'')+(isFk?' <span class="muted" style="font-size:10px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-line,#7aa8d8)" title="Foreign key">FK</span>':'');const ty=t.table&&t._colMetaP&&t.colTypes?String(t.colTypes[c]||''):'';const tyb=ty?'<span class="muted" style="font-size:10px;font-weight:400;line-height:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex-shrink:2">'+esc(ty)+'</span>':'';const gf=gridFocusOf(id);h+='<th'+(gf&&gf.ci===ci?' class="kbcol"':'')+' style="cursor:pointer;height:'+H+'px;padding:0 8px" title="'+esc(c)+(ty?' '+esc(ty):'')+' - click to sort (drag edge to resize, double-click edge to auto-fit)" onclick="sortBy(\''+id+'\','+ci+')">'+(ci?'<span class="rz" data-ci="'+(ci-1)+'"></span>':'')+'<span style="display:flex;align-items:center;gap:4px;height:'+H+'px;min-width:0"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0">'+esc(c)+'</span>'+kb+tyb+ar+'</span></th>';});return h+'<th>'+(t.cols.length?'<span class="rz" data-ci="'+(t.cols.length-1)+'"></span>':'')+'</th>';}
 // Typed into a column filter or the search box: a result of thousands of rows is filtered again once
 // the typing pauses, not at every key, which made each key wait for a pass over all of it. A small
 // result follows the typing at once.
@@ -11968,7 +11986,11 @@ async function inlineEdit(td,id,ri,ci,opts){const t=T(id);const key=ri+':'+ci;co
  // No inp.select() here on purpose - auto-selecting the whole value made entering edit mode look
  // like a big blue highlight box instead of just dropping into the text, so the cursor is placed
  // at the end of the existing value instead (still lets you type to replace via Home+shift, etc).
- td.classList.add('cellEditing');td.innerHTML=(isMulti?'':td.innerHTML)+'<div class="celled'+(isMulti?'':' over')+'">'+(isMulti?'<textarea rows="'+Math.min(8,Math.max(2,String(cur).split(/\r\n|\r|\n/).length))+'"></textarea>':'<input>')+(nullOk?'<button tabindex="-1" title="Set NULL">&empty;</button>':'')+'</div>';const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('.celled button');inp.value=(cur===null?'':cur);inp.focus();const vlen=inp.value.length;inp.setSelectionRange(vlen,vlen);let done=false,dirty=!!opts;
+ td.classList.add('cellEditing');td.innerHTML=(isMulti?'':td.innerHTML)+'<div class="celled'+(isMulti?'':' over')+'">'+(isMulti?'<textarea rows="'+Math.min(8,Math.max(2,String(cur).split(/\r\n|\r|\n/).length))+'"></textarea>':'<input>')+(nullOk?'<button tabindex="-1" title="Set NULL">&empty;</button>':'')+'</div>';const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('.celled button');
+ // A BIT value comes as bytes (0x01) but the cell shows it as a number, and the box shows what the
+ // cell did; a number typed back is stored as that bit pattern (see bitAt in applyChangesRun).
+ const bitHex=!opts&&!!(t.bitCols&&t.bitCols[ci])&&typeof cur==='string'&&/^0x[0-9A-Fa-f]+$/.test(cur);
+ inp.value=(cur===null?'':bitHex?hexToBitNumber(cur):cur);inp.focus();const vlen=inp.value.length;inp.setSelectionRange(vlen,vlen);let done=false,dirty=!!opts;
  // Opened by typing, the box did not wait for the column types; once they are in, the button goes
  // if none of these columns can hold NULL after all.
  if(nb&&opts)colMeta(id).then(()=>{if(!nullCols.some(c=>canNull(id,c)))nb.remove();});
@@ -12304,6 +12326,11 @@ async function applyChanges(id,preview,anyway){if(roBlock())return;const t=T(id)
  try{return await applyChangesRun(id,preview,anyway);}finally{W.noBackslashEscapes=nbe0;}}
 async function applyChangesRun(id,preview,anyway){const t=T(id);const S=[];const tbl=qid(t.db)+'.'+qid(t.table);
  const bc=await gridBinCols(id);
+ // A BIT cell is shown and edited as the number it stands for, and MySQL reads a bare integer
+ // bound for a BIT column as that bit pattern - so a plain integer there goes through unquoted,
+ // as 0x01/0x00 always did. Any other column takes the value as litAs writes it.
+ const bitAt=ci=>!!(t.bitCols&&t.bitCols[ci]),isPlainInt=v=>/^-?\d+$/.test(String(v));
+ const litCol=(ci,v)=>v!==null&&v!==undefined&&bitAt(ci)&&isPlainInt(v)?String(v):litAs(v,bc?bc[ci]:null);
  // Screened before any SQL is built, so a bad paste writes nothing at all rather than part of a
  // batch. Covers inline cell edits and new rows alike - the grid is the other way into a binary
  // column, and the value editor's guard never sees it.
@@ -12331,7 +12358,7 @@ async function applyChangesRun(id,preview,anyway){const t=T(id);const S=[];const
  // Deletes come after the updates, so a row that was both edited and deleted is checked as it is
  // by then. One change is written exactly as before.
  const updWh=[],updSql=[],delWh=[];
- Object.keys(byRow).forEach(ri=>{ri=+ri;const sets=Object.keys(byRow[ri]).map(ci=>qid(t.cols[ci])+'='+litAs(byRow[ri][ci],bc?bc[ci]:null));
+ Object.keys(byRow).forEach(ri=>{ri=+ri;const sets=Object.keys(byRow[ri]).map(ci=>qid(t.cols[ci])+'='+litCol(+ci,byRow[ri][ci]));
    const wh=keyWhere(t,ri,bc,kt);if(wh==null){noKey=true;return;}updWh.push(wh);updSql.push('UPDATE '+tbl+' SET '+sets.join(',')+' WHERE '+wh+' LIMIT 1;');});
  t.pending.del.forEach(ri=>{const wh=keyWhere(t,ri,bc,kt);if(wh==null){noKey=true;return;}delWh.push(wh);});
  const chunks=(a,n)=>{const out=[];for(let i=0;i<a.length;i+=n)out.push(a.slice(i,i+n));return out;};
@@ -12340,7 +12367,7 @@ async function applyChangesRun(id,preview,anyway){const t=T(id);const S=[];const
  if(delWh.length===1){S.push(oneRowGuard(tbl,delWh[0]));S.push('DELETE FROM '+tbl+' WHERE '+delWh[0]+' LIMIT 1;');}
  else if(delWh.length){chunks(delWh,200).forEach(c=>{S.push(oneRowGuardMany(tbl,c));S.push('DELETE FROM '+tbl+' WHERE '+c.map(w=>'('+w+')').join(' OR ')+' LIMIT '+c.length+';');});}
  if(noKey){toast('Nothing was saved: the result does not include every key column ('+t.pk.join(', ')+'), so the rows cannot be found exactly. Include the key in the query.',true);return;}
- t.pending.ins.forEach(row=>{const cols=Object.keys(row);if(!cols.length)return;S.push('INSERT INTO '+tbl+' ('+cols.map(qid).join(',')+') VALUES ('+cols.map(c=>litAs(row[c],bc?bc[t.cols.indexOf(c)]:null)).join(',')+');');});
+ t.pending.ins.forEach(row=>{const cols=Object.keys(row);if(!cols.length)return;S.push('INSERT INTO '+tbl+' ('+cols.map(qid).join(',')+') VALUES ('+cols.map(c=>litCol(t.cols.indexOf(c),row[c])).join(',')+');');});
  // A BIT or binary column round-trips as 0x..., and lit() passes that through unquoted. Anything
  // else is quoted, and MySQL then stores the BYTES of the text: typing 8 into a BIT(8) cell
  // stored 56 - the byte value of the character '8' - silently, with no error, because one byte
@@ -12358,16 +12385,16 @@ async function applyChangesRun(id,preview,anyway){const t=T(id);const S=[];const
  Object.keys(t.pending.upd).forEach(k=>{const [ri,ci]=k.split(':').map(Number);
   if(!binAt(ci,ri))return;
   const v=t.pending.upd[k];
-  if(v!==null&&v!==''&&!isHex(v)) badBin.push(t.cols[ci]+' = '+JSON.stringify(String(v)));
+  if(v!==null&&v!==''&&!isHex(v)&&!(bitAt(ci)&&isPlainInt(v))) badBin.push(t.cols[ci]+' = '+JSON.stringify(String(v)));
  });
  t.pending.ins.forEach(row=>{Object.keys(row).forEach(cn=>{const ci=t.cols.indexOf(cn);
   if(ci<0||!binAt(ci,null))return;
   const v=row[cn];
-  if(v!==null&&v!==''&&!isHex(v)) badBin.push(cn+' = '+JSON.stringify(String(v)));
+  if(v!==null&&v!==''&&!isHex(v)&&!(bitAt(ci)&&isPlainInt(v))) badBin.push(cn+' = '+JSON.stringify(String(v)));
  });});
  if(badBin.length){
-  toast('These are binary/BIT columns and only accept a 0x value:\n'+badBin.join('\n')
-    +'\nUse 0x01 for 1, 0x00 for zero. A plain number would be stored as the bytes of its text '
+  toast('These are binary/BIT columns and only accept a 0x value (a BIT column also a plain integer):\n'+badBin.join('\n')
+    +'\nUse 1 or 0x01 for on, 0 or 0x00 for zero. Other text would be stored as its bytes '
     +'(8 becomes 56), which MySQL accepts without an error.',true);
   return;
  }
@@ -12379,21 +12406,32 @@ async function applyChangesRun(id,preview,anyway){const t=T(id);const S=[];const
  // Rows, not statements: several deletes go in one statement.
  const changes=S.filter(s=>!s.startsWith('SELECT 1 FROM (SELECT 1 AS x')&&!s.startsWith('DELETE FROM')).length+delWh.length;
  if(preview){viewText('SQL that Apply would run - '+changes+' change'+(changes===1?'':'s'),S.join('\n'),{readonly:true});return false;}
- runLog(id,'APPLY:\n'+S.join('\n'),'-');
+ // The row guards are the app's own check, not the user's edit: the output window and the history
+ // show the user's statements alone, and a failure or warning is numbered among those.
+ const isGuard=x=>String(x).startsWith('SELECT 1 FROM (SELECT 1 AS x'),US=S.filter(x=>!isGuard(x)),uNo=n=>S.slice(0,n).filter(x=>!isGuard(x)).length;
+ const uErr=e=>{e=String(e||'');const m=/^Statement (\d+) of \d+ failed: /.exec(e);if(!m)return e;const n=+m[1],parts=e.split('\n\n');
+  // A guard that fails means a row no longer matches exactly one; the guard's SQL says nothing to the user.
+  if(isGuard(S[n-1]))return [/Result consisted of more than one row/.test(e)?ONE_ROW_REFUSED:parts[0].replace(m[0],'Checking statement '+uNo(n+1)+' of '+US.length+' failed: '),...parts.slice(2)].join('\n\n');
+  return e.replace(m[0],'Statement '+uNo(n)+' of '+US.length+' failed: ');};
+ runLog(id,'APPLY:\n'+US.join('\n'),'-');
  // Runs as one transaction, so a failure part-way leaves the table exactly as it was.
  // Foreign keys are NOT disabled here: they were, which let an edit point a row at a
  // parent that does not exist and silently break referential integrity the schema was
  // written to guarantee.
  await sessFree(t);
+ // The statements Apply runs are kept in the query history like a run of the user's own: they are
+ // the user's edit, and a failed one is worth finding again.
+ const hr=histStart(t,US.join('\n'));
  const r=await api('/api/script',{sql:S.join('\n'),transaction:true,session:sessOf(t),failOnWarnings:!anyway});
- const stmts=splitStmts(S.join('\n')),ws=warnFromWrites(r.warnings,stmts);
+ const stmts=US,ws=warnFromWrites(r.warnings,splitStmts(S.join('\n'))).map(x=>Object.assign({},x,{statement:uNo(x.statement)})),err=r.ok?'':uErr(r.error);
+ if(hr){if(r.ok){hr.o='ok';if(r.affected!=null)hr.affected=+r.affected;}else{hr.o='err';hr.err=clip(String(r.warned?'Stopped: '+warnText(ws):err).split('\n')[0],300);}histKeep(hr);}
  if(!r.ok&&r.warned){log('APPLY stopped: '+warnText(ws)+'\n'+ws.map(x=>'  '+warnLine(x,stmts)).join('\n'));
   warnOpen(t.title+' - Apply',ws,stmts,()=>applyChanges(id,false,true));return false;}
  // true once saved, so Commit (txEnd) can tell whether to go on; it waits for the grid to show what
  // was saved, since until then the reload is still reading on the tab's connection.
  // What was done, by kind: rows updated (however many of their cells), inserted and deleted.
  const nIns=S.filter(x=>x.startsWith('INSERT INTO')).length,what=[[updWh.length,'updated'],[nIns,'inserted'],[delWh.length,'deleted']].filter(x=>x[0]).map(x=>fmtCount(x[0])+' row'+(x[0]===1?'':'s')+' '+x[1]).join(', ');
- if(r.ok){runLog(id,'Applied '+changes+' change(s): '+what+'.');toast('Applied '+changes+' change(s)'+(ws.length?', with '+warnText(ws):'')+'.','ok');invalidateTableCache(t.db,t.table);await openRun(id);refreshTabDirty(id);if(ws.length)setRunWarnings(id,ws,stmts);return true;}else{runLog(id,'APPLY error: '+r.error,'err');toast(/Result consisted of more than one row/.test(String(r.error))?ONE_ROW_REFUSED:'Apply failed: '+r.error,true);return false;}}
+ if(r.ok){runLog(id,'Applied '+changes+' change(s): '+what+'.');toast('Applied '+changes+' change(s)'+(ws.length?', with '+warnText(ws):'')+'.','ok');invalidateTableCache(t.db,t.table);await openRun(id);refreshTabDirty(id);if(ws.length)setRunWarnings(id,ws,stmts);return true;}else{runLog(id,'APPLY error: '+err,'err');toast(/Result consisted of more than one row/.test(String(r.error))?ONE_ROW_REFUSED:'Apply failed: '+err,true);return false;}}
 
 function ddlFailureNote(err, sql){
  const e = String(err || "");
@@ -12640,11 +12678,14 @@ function histStart(t,sql){sql=String(sql==null?'':sql).trim();if(!histOn()||!sql
 // Ended, and kept. What came of it is what the run's status line says: an error there (or a statement
 // read-only mode blocked) is an error, a cancel is a cancel. st is null when a newer run in the same
 // tab took over before this one finished.
-async function histEnd(hr,st){if(!hr)return;hr.ms=Math.round(performance.now()-hr._t0);delete hr._t0;
+async function histEnd(hr,st){if(!hr)return;
  const txt=st?String(st.textContent||''):'';
  if(st&&(st.classList.contains('err')||/^Read-only mode/.test(txt))){hr.o='err';hr.err=clip(txt.split('\n')[0],300);}
  else if(!st||/cancel/i.test(txt))hr.o='cancel';
  else hr.o='ok';
+ await histKeep(hr);}
+// Kept, with the outcome already set on it (o, and err for an error).
+async function histKeep(hr){if(!hr)return;hr.ms=Math.round(performance.now()-hr._t0);delete hr._t0;
  await histMigrate();_histItems=null;
  const r=await api('/api/hist-add',{entry:hr,limit:histLimit()});
  if(r&&r.ok===false&&!window._histWarned){window._histWarned=true;log('The query history could not be written: '+r.error);}}

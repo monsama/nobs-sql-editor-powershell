@@ -102,6 +102,13 @@ jobs:
         shell: pwsh
         run: ./tests/DumpTarget.Tests.ps1 ./NOBSSQL.ps1
 
+      # A per-table export folder went in by name: a view that read a view sorting after it failed
+      # with 1146, and the routines file ran before the tables after it, so an event could run
+      # before its tables were there. Every order of a modelled export is imported and checked.
+      - name: Run import order tests
+        shell: pwsh
+        run: ./tests/ImportOrder.Tests.ps1 ./NOBSSQL.ps1
+
       # Result rows come from mysql --xml, the only output that tells NULL from the text 'NULL'.
       # The reader is checked against real output from both clients (MySQL's writes CRLF).
       - name: Run result row tests

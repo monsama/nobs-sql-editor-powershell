@@ -344,6 +344,65 @@ try {
     Check ($cleanLine -match '^OK  ' -and $clean.errorsSkipped -eq 0) 'a clean import is still a plain OK' "log: $cleanLine errorsSkipped=$($clean.errorsSkipped)"
     Remove-Item -LiteralPath $badSql, $goodSql -Force -ErrorAction SilentlyContinue
 
+    # --- 4b2. A per-table export folder restores everything in it, whatever order it comes in ----
+    # Written by the real dump tool and restored by the real client, with its files handed over in
+    # name order (as Add folder lists them), backwards, and shuffled: three tables, two with a
+    # trigger; an event, a function and a procedure; a chain of three views, the middle one calling
+    # the function, each named so the alphabet puts it before what it reads. In name order the
+    # views failed with 1146 and the event came before its tables. Then the name order with two
+    # scripts of the user's own, one to run first and one last. (Get-DumpImportOrder)
+    $oSrc = 'nobs_order_src'; $oDst = 'nobs_order_dst'
+    # Made from inside the database, as a user would, so the dump names nothing by its database.
+    foreach ($s in @("DROP DATABASE IF EXISTS $oSrc", "DROP DATABASE IF EXISTS $oDst", "CREATE DATABASE $oSrc")) { $null = Api '/api/exec' @{ conn = $conn; sql = $s } }
+    foreach ($s in @("CREATE TABLE customers (id INT PRIMARY KEY)", "CREATE TABLE orders (id INT PRIMARY KEY)", "CREATE TABLE zeta (id INT PRIMARY KEY)",
+                     "INSERT INTO customers VALUES (1)", "INSERT INTO orders VALUES (1),(2)", "INSERT INTO zeta VALUES (1)",
+                     "CREATE TRIGGER tr_orders BEFORE INSERT ON orders FOR EACH ROW SET @x=1",
+                     "CREATE TRIGGER tr_zeta BEFORE INSERT ON zeta FOR EACH ROW SET @y=1",
+                     "CREATE FUNCTION fn_one() RETURNS INT DETERMINISTIC RETURN 1",
+                     "CREATE PROCEDURE pr_one() SELECT COUNT(*) FROM zeta",
+                     "CREATE EVENT ev_one ON SCHEDULE EVERY 1 HOUR DO DELETE FROM zeta WHERE id < 0",
+                     "CREATE VIEW z_view AS SELECT id FROM orders", "CREATE VIEW m_view AS SELECT id, fn_one() AS n FROM z_view",
+                     "CREATE VIEW a_view AS SELECT id, n FROM m_view")) {
+        $sr = Api '/api/exec' @{ conn = $conn; sql = "USE $oSrc; $s" }; if (-not $sr.ok) { "  note  setup: $($sr.error)" }
+    }
+    $orderDir = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-order-$PID"
+    Remove-Item $orderDir -Recurse -Force -ErrorAction SilentlyContinue
+    $oe = Api '/api/export' @{ conn = $conn; dbs = @($oSrc); folder = $orderDir; mode = 'table'
+                              options = @{ charset = 'utf8mb4'; routines = $true; triggers = $true; events = $true; quick = $true; extinsert = $true } }
+    $oFiles = [string[]]@(Get-ChildItem -LiteralPath $orderDir -Filter '*.sql' | ForEach-Object FullName); [Array]::Sort($oFiles, [StringComparer]::Ordinal)
+    Check ($oe.ok -and $oFiles.Count -eq 7) 'a per-table export of tables, routines, an event and views writes seven files' "$($oFiles.Count) $($oe | ConvertTo-Json -Compress)"
+    $restore = {
+        param([string[]]$given)
+        $r = Api '/api/import' @{ conn = $conn; files = $given; targetDb = $oDst; createDb = $true }
+        $counts = Scalar ("SELECT CONCAT_WS('/', " +
+            "(SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA='$oDst'), " +
+            "(SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='$oDst'), " +
+            "(SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA='$oDst'), " +
+            "(SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA='$oDst'), " +
+            "(SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='$oDst' AND TABLE_TYPE='BASE TABLE'))")
+        $read = Scalar "SELECT CONCAT(COUNT(*), '/', COALESCE(SUM(n), 0)) FROM $oDst.a_view"
+        $null = Api '/api/exec' @{ conn = $conn; sql = "DROP DATABASE IF EXISTS $oDst" }
+        @{ r = $r; counts = $counts; read = $read }
+    }
+    $orders = [ordered]@{ 'by name' = $oFiles; 'backwards' = [string[]]@($oFiles[($oFiles.Count - 1)..0]) }
+    $rng = New-Object Random 7
+    for ($k = 0; $k -lt 6; $k++) { $orders["shuffled $k"] = [string[]]@($oFiles | Sort-Object { $rng.Next() }) }
+    foreach ($what in $orders.Keys) {
+        $res = & $restore $orders[$what]
+        $failedLines = @($res.r.log | Where-Object { "$_" -match '^FAILED' })
+        Check ($res.r.ok -and -not $failedLines.Count -and $res.counts -eq '3/2/1/2/3' -and $res.read -eq '2/2') "restored $what : every view, routine, event, trigger and table, and the last view reads through the others" "views/routines/events/triggers/tables=$($res.counts) a_view=$($res.read) $($failedLines -join ' | ')"
+    }
+    # The user's own scripts keep their place: one that sets up first, one that runs last and needs
+    # the procedure and the last table.
+    $setup = Join-Path $orderDir '00_setup.sql'; [IO.File]::WriteAllText($setup, "CREATE TABLE helper (id INT);`n")
+    $after = Join-Path $orderDir 'zz_after.sql'; [IO.File]::WriteAllText($after, "CALL pr_one();`nINSERT INTO zeta VALUES (9);`nINSERT INTO helper VALUES (1);`n")
+    $withScripts = [string[]]@($oFiles + $setup + $after); [Array]::Sort($withScripts, [StringComparer]::Ordinal)
+    $ws = Api '/api/import' @{ conn = $conn; files = $withScripts; targetDb = $oDst; createDb = $true }
+    $wsShape = Scalar "SELECT CONCAT((SELECT COUNT(*) FROM $oDst.zeta), '/', (SELECT COUNT(*) FROM $oDst.helper))"
+    Check ($ws.ok -and -not @($ws.log | Where-Object { "$_" -match '^FAILED' }).Count -and $wsShape -eq '2/1') 'scripts of the user''s own run where they were, the last one after the routines and every table' "zeta/helper=$wsShape $(@($ws.log) -join ' | ')"
+    foreach ($s in "DROP DATABASE IF EXISTS $oSrc", "DROP DATABASE IF EXISTS $oDst") { $null = Api '/api/exec' @{ conn = $conn; sql = $s } }
+    Remove-Item $orderDir -Recurse -Force -ErrorAction SilentlyContinue
+
     # --- 4c. CSV import: NULL and the empty string must stay different ------------------------
     # A CSV field is just text, so the only thing separating "this cell is NULL" from "this cell
     # is an empty string" is the null marker. Collapsing the two silently changes data on the way

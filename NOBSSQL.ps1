@@ -3519,27 +3519,104 @@ function Get-ImportWarnings { param([string]$out)
     $harmless = '1287','1681','1906','3090','3719','3720','3778'
     foreach ($l in ($out -split "`r?`n")) { $t = $l.Trim(); if ($t -match '^Warning \(Code (\d+)\)' -and $harmless -notcontains $Matches[1]) { $t } }
 }
-# Whether a dump file is a view's: mysqldump heads a view's section "Temporary view structure for
-# view" (MySQL 8), "Temporary table structure for view" (MariaDB and older) or "Final view structure
-# for view", and a per-table file starts with its object's section.
-function Test-DumpFileIsView { param([string]$Path)
-    try {
-        $fs = [IO.File]::OpenRead($Path)
-        try { $buf = New-Object byte[] 65536; $n = $fs.Read($buf, 0, $buf.Length) } finally { $fs.Dispose() }
-        $head = [Text.Encoding]::UTF8.GetString($buf, 0, $n)
-        foreach ($l in ($head -split "`r?`n")) {
-            if ($l -match '^-- (Table structure for table|Dumping data for table|Temporary view structure for view|Temporary table structure for view|Final view structure for view)') { return ($l -match 'for view') }
+# ---------- The order a set of dump files is imported in ----------
+# A per-table export folder holds each object in a file of its own, and files go in by name, which
+# is not the order they need:
+# - "active_customers" ran before "customers" and failed with 1146, leaving the view out of the
+#   restore, and a view could run before a view it reads the same way. Views go last, each after
+#   the ones it reads.
+# - Procedures and functions are created without their tables being there, but an event starts
+#   running as soon as it is created, with the tables after it in the alphabet missing or half
+#   loaded. The routines file goes after the tables, and before the views, which can call its
+#   functions.
+# A file is told by what is in it, never by its name: the section headings mysqldump and
+# mariadb-dump write. A file without them - a script of the user's own, another tool's dump - is
+# Other, and keeps its place among everything but the tables: a script that ran after the routines
+# still does, and one that ran first still does. The same as nobs-sql-editor's dump_import_order.
+#
+# What a dump file holds: Tables, Routines, View or Other. A trigger has no heading of its own: it
+# is in its table's file, after the table's rows, and goes with it. Told from the start of the
+# file. Any table heading makes it Tables: a whole-database dump can open with a view's stand-in
+# (its views come first in the alphabet) and has its tables after it, and runs as the one file it
+# is. Otherwise the first heading decides.
+function Get-DumpKind { param([string]$Head)
+    $lines = @($Head -split "`n" | ForEach-Object { $_.TrimEnd("`r") })
+    $isTable = { param($l) $l.StartsWith('-- Table structure for table ', [StringComparison]::Ordinal) -or $l.StartsWith('-- Dumping data for table ', [StringComparison]::Ordinal) }
+    $isView = { param($l) $l.StartsWith('-- Temporary view structure for view ', [StringComparison]::Ordinal) -or $l.StartsWith('-- Temporary table structure for view ', [StringComparison]::Ordinal) -or $l.StartsWith('-- Final view structure for view ', [StringComparison]::Ordinal) }
+    $isRoutines = { param($l) $l.StartsWith('-- Dumping events for database ', [StringComparison]::Ordinal) -or $l.StartsWith('-- Dumping routines for database ', [StringComparison]::Ordinal) }
+    foreach ($l in $lines) { if (& $isTable $l) { return 'Tables' } }
+    foreach ($l in $lines) {
+        if (& $isView $l) { return 'View' }
+        if (& $isRoutines $l) { return 'Routines' }
+    }
+    return 'Other'
+}
+# A view's name and its definition: the section after its "Final view structure" heading.
+function Get-DumpViewOf { param([string]$Text)
+    $at = $Text.IndexOf('-- Final view structure for view ', [StringComparison]::Ordinal)
+    if ($at -lt 0) { return @{ View = $null; Def = '' } }
+    $def = $Text.Substring($at)
+    $first = ($def -split "`n", 2)[0].TrimEnd("`r")
+    $name = $null
+    if ($first -match '^-- Final view structure for view `((?:[^`]|``)*)`') { $name = $Matches[1].Replace('``', '`') }
+    return @{ View = $name; Def = $def }
+}
+# What the order is decided on, read from one file. The headings are near the start: 64 KB is past
+# the opening lines of either tool, and a view's file is far shorter than the 1 MB read for its
+# definition.
+function Get-DumpFileInfo { param([string]$Path)
+    $read = { param([int]$limit)
+        try {
+            $fs = [IO.File]::OpenRead($Path)
+            try { $buf = New-Object byte[] $limit; $n = 0; while ($n -lt $limit) { $k = $fs.Read($buf, $n, $limit - $n); if ($k -le 0) { break }; $n += $k } } finally { $fs.Dispose() }
+            [Text.Encoding]::UTF8.GetString($buf, 0, $n)
+        } catch { '' }
+    }
+    $kind = Get-DumpKind (& $read 65536)
+    $v = if ($kind -eq 'View') { Get-DumpViewOf (& $read 1048576) } else { @{ View = $null; Def = '' } }
+    [pscustomobject]@{ Kind = $kind; View = $v.View; Def = $v.Def }
+}
+# The order to run the files in, as indexes into them.
+function Get-DumpImportOrder { param([object[]]$Files)
+    $views = New-Object System.Collections.Generic.List[int]; $rest = New-Object System.Collections.Generic.List[int]
+    for ($i = 0; $i -lt $Files.Count; $i++) { if ($Files[$i].Kind -eq 'View') { $views.Add($i) } else { $rest.Add($i) } }
+    # From the first routines file to the last table, the tables move to the front of the stretch,
+    # so every table is in before an event can run. Nothing else changes place.
+    $s = -1; $e = -1
+    for ($k = 0; $k -lt $rest.Count; $k++) { if ($s -lt 0 -and $Files[$rest[$k]].Kind -eq 'Routines') { $s = $k }; if ($Files[$rest[$k]].Kind -eq 'Tables') { $e = $k } }
+    if ($s -ge 0 -and $e -ge 0 -and $s -lt $e) {
+        $stretch = $rest.GetRange($s, $e - $s + 1)
+        $moved = @($stretch | Where-Object { $Files[$_].Kind -eq 'Tables' }) + @($stretch | Where-Object { $Files[$_].Kind -ne 'Tables' })
+        $rest.RemoveRange($s, $e - $s + 1); $rest.InsertRange($s, [int[]]$moved)
+    }
+    # Each view after the views it reads, which its definition names in backquotes. A name that
+    # only looks like one (a column called as a view is) moves a file needlessly and harms nothing;
+    # with no way forward - views that seem to read each other - the order is kept.
+    $left = $views
+    while ($left.Count -gt 0) {
+        $next = 0
+        for ($a = 0; $a -lt $left.Count; $a++) {
+            $i = $left[$a]; $waits = $false
+            foreach ($o in $left) {
+                if ($o -ne $i -and $null -ne $Files[$o].View -and $Files[$o].View -cne $Files[$i].View -and
+                    $Files[$i].Def.Contains('`' + $Files[$o].View.Replace('`', '``') + '`')) { $waits = $true; break }
+            }
+            if (-not $waits) { $next = $a; break }
         }
-    } catch { }
-    return $false
+        $rest.Add($left[$next]); $left.RemoveAt($next)
+    }
+    return ,([int[]]$rest.ToArray())
+}
+function Get-DumpFilesInImportOrder { param([string[]]$Files)
+    $info = @($Files | ForEach-Object { Get-DumpFileInfo $_ })
+    $order = Get-DumpImportOrder $info
+    return ,([string[]]@($order | ForEach-Object { $Files[$_] }))
 }
 function Api-Import { param($conn,$data)
     $files=@($data.files); if($files.Count -eq 0){ return '{"ok":false,"error":"No files."}' }
     foreach($f in $files){ if(Test-DataPathBad ([string]$f)){ return '{"ok":false,"error":'+(J-Str ("Not a file: "+$f))+'}' } }
-    # A per-table export folder holds each view in a file of its own, and files went in by name:
-    # "active_customers" ran before "customers" and failed with 1146, leaving the view out of the
-    # restore. Views go after everything else; the order within each is kept.
-    $files = @(@($files | Where-Object { -not (Test-DumpFileIsView ([string]$_)) }) + @($files | Where-Object { Test-DumpFileIsView ([string]$_) }))
+    # In the order they need, not the one they came in (see Get-DumpImportOrder).
+    $files = Get-DumpFilesInImportOrder ([string[]]$files)
     $mysql = Get-ToolFor $conn 'mysql'
     if(-not $mysql -or -not (Test-Path $mysql)){ return '{"ok":false,"error":"mysql.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
     $cnf=New-Cnf $conn -Tool $mysql; $log=New-Object System.Collections.ArrayList

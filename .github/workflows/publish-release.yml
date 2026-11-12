@@ -29,4 +29,4 @@ jobs:
           # The drafted body ends with GitHub's generated "Full Changelog" line, which the notes carry already.
           grep -v '^\*\*Full Changelog\*\*' drafted.md > drafted-trim.md || true
           cat ".github/release-notes/$TAG.md" drafted-trim.md > body.md
-          gh api -X PATCH "repos/${{ github.repository }}/releases/$ID" -f tag_name="$TAG" -F draft=false -F make_latest=true -F body=@body.md
+          gh api -X PATCH "repos/${{ github.repository }}/releases/$ID" -f tag_name="$TAG" -F draft=false -f make_latest=true -F body=@body.md

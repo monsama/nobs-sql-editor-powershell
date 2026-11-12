@@ -1,0 +1,70 @@
+name: cut-release
+
+# Makes a release in one step: Actions -> cut-release -> Run workflow, with the version. It sets
+# $script:AppVersion in NOBSSQL.ps1, commits that to main, tags it and starts release.yml on the
+# tag, which publishes the script and its checksum. The same as the desktop edition's release.yml.
+#
+# For notes written by hand, commit .github/release-notes/v<version>.md to main first; without
+# it the release carries GitHub's generated changelog.
+#
+# It runs with this job's own token, which may push a tag where a git client from outside may not.
+# A tag pushed that way fires no other workflow (GitHub's rule against loops), so release.yml is
+# started here by name.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 1.8.1 (no leading v)"
+        required: true
+
+permissions:
+  contents: write
+  actions: write   # to start release.yml on the new tag
+
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+jobs:
+  bump-tag-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Validate the version and check no such tag exists yet
+        run: |
+          V="${{ github.event.inputs.version }}"
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$V' doesn't look like major.minor.patch (e.g. 1.8.1) - no leading v, no suffix."
+            exit 1
+          fi
+          if git rev-parse "v$V" >/dev/null 2>&1 || git ls-remote --tags origin "refs/tags/v$V" | grep -q .; then
+            echo "::error::Tag v$V already exists."
+            exit 1
+          fi
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      # The line the app's update check and release.yml both read the version from.
+      - name: Set the version in NOBSSQL.ps1
+        run: |
+          sed -i -E "s/^\\\$script:AppVersion = '[^']*'/\$script:AppVersion = '$VERSION'/" NOBSSQL.ps1
+          grep -q "^\$script:AppVersion = '$VERSION'\$" NOBSSQL.ps1 || { echo "::error::could not set the version in NOBSSQL.ps1"; exit 1; }
+
+      - name: Commit, tag and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add NOBSSQL.ps1
+          # Already at this version (bumped by hand, say): nothing to commit, only the tag is missing.
+          git diff --cached --quiet || git commit -m "$VERSION"
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push origin HEAD:main
+          git push origin "v$VERSION"
+
+      - name: Start the release on the new tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release.yml --ref "v$VERSION" -f tag="v$VERSION"

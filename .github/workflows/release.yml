@@ -1,7 +1,8 @@
 name: release
 
-# Drafts the release for a version tag: the script itself, its SHA-256 in a file and in the notes,
-# and generated changelog. Review the notes, then publish.
+# Publishes the release for a version tag: the script itself, its SHA-256 in a file and in the
+# notes, and the notes - written by hand in .github/release-notes/<tag>.md when that file is there
+# at the tag, GitHub's generated changelog otherwise. cut-release.yml makes the tag and starts this.
 #
 # This exists because the download here is a PowerShell script that people are told to run with
 # -ExecutionPolicy Bypass, and until now it was the one download of this project that published
@@ -12,18 +13,24 @@ name: release
 on:
   push:
     tags: ["v*"]
-  # So a draft can be rebuilt without moving a tag.
+  # cut-release.yml starts it this way (a tag it pushes fires no push trigger), and so a release can
+  # be made again for a tag without moving it.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to draft a release for'
+        description: 'Tag to release'
         required: true
 
 permissions:
   contents: write
 
+# One release at a time: two runs for one tag would make two releases.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  draft:
+  release:
     # Nothing here needs Windows: it hashes one file and writes two.
     runs-on: ubuntu-latest
     steps:
@@ -58,16 +65,42 @@ jobs:
             echo 'See [CODE_SIGNING.md](https://github.com/monsama/nobs-sql-editor/blob/main/CODE_SIGNING.md) for what this does and does not prove.'
           } > release-notes-append.md
 
-      # A draft, like the desktop edition: the notes are written by hand, the checksum block is not.
-      - name: Draft the release
+      # The hand-written notes go first, then the checksum block. Without a notes file, GitHub's
+      # generated changelog stands in for them.
+      - name: Notes
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          if [ -f ".github/release-notes/${tag}.md" ]; then
+            cat ".github/release-notes/${tag}.md" release-notes-append.md > release-notes.md
+            echo "GENERATED=false" >> "$GITHUB_ENV"
+          else
+            cp release-notes-append.md release-notes.md
+            echo "GENERATED=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Publish the release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
+          name: ${{ inputs.tag || github.ref_name }}
           files: |
             NOBSSQL.ps1
             SHA256SUMS.txt
-          draft: true
-          generate_release_notes: true
-          append_body: true
-          body_path: release-notes-append.md
+          draft: false
+          make_latest: true
+          generate_release_notes: ${{ env.GENERATED == 'true' }}
+          append_body: ${{ env.GENERATED == 'true' }}
+          body_path: release-notes.md
           fail_on_unmatched_files: true
+
+      # The action sometimes fails to find the tag it was given and leaves the release a draft
+      # named "untagged-<sha>" instead (it did to the desktop edition's 1.9.0). Found by its name
+      # and set right, every time: on a release that came out right this changes nothing.
+      - name: Set the release's tag and publish it, if the action did not
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          id=$(gh api "repos/${{ github.repository }}/releases" --jq ".[] | select(.name == \"$tag\") | .id" | head -n1)
+          [ -n "$id" ] || { echo "::error::no release named $tag"; exit 1; }
+          gh api -X PATCH "repos/${{ github.repository }}/releases/$id" -f tag_name="$tag" -F draft=false -f make_latest=true > /dev/null

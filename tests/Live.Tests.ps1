@@ -371,16 +371,18 @@ try {
                               options = @{ charset = 'utf8mb4'; routines = $true; triggers = $true; events = $true; quick = $true; extinsert = $true } }
     $oFiles = [string[]]@(Get-ChildItem -LiteralPath $orderDir -Filter '*.sql' | ForEach-Object FullName); [Array]::Sort($oFiles, [StringComparer]::Ordinal)
     Check ($oe.ok -and $oFiles.Count -eq 7) 'a per-table export of tables, routines, an event and views writes seven files' "$($oFiles.Count) $($oe | ConvertTo-Json -Compress)"
+    # Each CAST(... AS CHAR): MySQL 5.7 and MariaDB before 10.11 type a CONCAT of numbers as binary,
+    # which this edition shows as hex.
     $restore = {
         param([string[]]$given)
         $r = Api '/api/import' @{ conn = $conn; files = $given; targetDb = $oDst; createDb = $true }
-        $counts = Scalar ("SELECT CONCAT_WS('/', " +
+        $counts = Scalar ("SELECT CAST(CONCAT_WS('/', " +
             "(SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA='$oDst'), " +
             "(SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='$oDst'), " +
             "(SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA='$oDst'), " +
             "(SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA='$oDst'), " +
-            "(SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='$oDst' AND TABLE_TYPE='BASE TABLE'))")
-        $read = Scalar "SELECT CONCAT(COUNT(*), '/', COALESCE(SUM(n), 0)) FROM $oDst.a_view"
+            "(SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='$oDst' AND TABLE_TYPE='BASE TABLE')) AS CHAR)")
+        $read = Scalar "SELECT CAST(CONCAT(COUNT(*), '/', COALESCE(SUM(n), 0)) AS CHAR) FROM $oDst.a_view"
         $null = Api '/api/exec' @{ conn = $conn; sql = "DROP DATABASE IF EXISTS $oDst" }
         @{ r = $r; counts = $counts; read = $read }
     }
@@ -398,7 +400,7 @@ try {
     $after = Join-Path $orderDir 'zz_after.sql'; [IO.File]::WriteAllText($after, "CALL pr_one();`nINSERT INTO zeta VALUES (9);`nINSERT INTO helper VALUES (1);`n")
     $withScripts = [string[]]@($oFiles + $setup + $after); [Array]::Sort($withScripts, [StringComparer]::Ordinal)
     $ws = Api '/api/import' @{ conn = $conn; files = $withScripts; targetDb = $oDst; createDb = $true }
-    $wsShape = Scalar "SELECT CONCAT((SELECT COUNT(*) FROM $oDst.zeta), '/', (SELECT COUNT(*) FROM $oDst.helper))"
+    $wsShape = Scalar "SELECT CAST(CONCAT((SELECT COUNT(*) FROM $oDst.zeta), '/', (SELECT COUNT(*) FROM $oDst.helper)) AS CHAR)"
     Check ($ws.ok -and -not @($ws.log | Where-Object { "$_" -match '^FAILED' }).Count -and $wsShape -eq '2/1') 'scripts of the user''s own run where they were, the last one after the routines and every table' "zeta/helper=$wsShape $(@($ws.log) -join ' | ')"
     foreach ($s in "DROP DATABASE IF EXISTS $oSrc", "DROP DATABASE IF EXISTS $oDst") { $null = Api '/api/exec' @{ conn = $conn; sql = $s } }
     Remove-Item $orderDir -Recurse -Force -ErrorAction SilentlyContinue

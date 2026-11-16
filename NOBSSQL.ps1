@@ -4028,12 +4028,19 @@ function Api-HistAdd { param($data)
             [IO.File]::AppendAllText($script:HistFile, ($lines -join ''), (New-Object System.Text.UTF8Encoding($false)))
         }
     }
-    # Only a full read tells how many lines there are now; cheap enough next to one run per request,
-    # and it is only this check that pays for it - the append above never re-reads the file.
-    $all=@(Read-Hist)
-    if($all.Count -gt ($limit + [Math]::Floor($limit/10))){
-        $from=[Math]::Max(0, $all.Count-$limit)
-        Write-Hist @($all[$from..($all.Count-1)])
+    # Whether the file has grown past its limit is told from its lines, counted - not parsed: every
+    # run is kept, and parsing thousands of JSON lines in PowerShell on each one made the run that
+    # added it wait, long enough for a GUI test to look for the entry before it was there. Only when
+    # it has to be cut is it read in full. A line that would not parse counts here and is dropped
+    # then, which only ever makes the cut come a little sooner.
+    $count=0
+    if(Test-Path $script:HistFile){ try { foreach($l in [IO.File]::ReadLines($script:HistFile)){ if($l.Length){ $count++ } } } catch { $count=0 } }
+    if($count -gt ($limit + [Math]::Floor($limit/10))){
+        $all=@(Read-Hist)
+        if($all.Count -gt $limit){
+            $from=[Math]::Max(0, $all.Count-$limit)
+            Write-Hist @($all[$from..($all.Count-1)])
+        }
     }
     '{"ok":true,"added":'+$keep.Count+'}'
 }

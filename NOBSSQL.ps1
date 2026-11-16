@@ -3725,7 +3725,12 @@ function Read-Request { param($client)
                 return @{ method=$parts[0]; path=$parts[1]; body=$body; host=$hostHdr; origin=$originHdr; ctype=$ctypeHdr }
             }
         }
-    } catch { }
+    } catch {
+        # A request that did not arrive whole (the 8-second read timeout, a dropped connection) was
+        # answered as a GET of the page, so an API call got the page or a 403 back - which the page
+        # could only report as the app having stopped. It is now told as what it is.
+        return @{ method='GET'; path='/'; body=''; bad=$_.Exception.Message }
+    }
     return @{ method='GET'; path='/'; body='' }
 }
 # The token check for every /api/* route. The token has to be a string: -ne against an array filters
@@ -6908,7 +6913,13 @@ async function apiCall(path,p,signal){p=p||{};p.token=TOKEN;
   if(p.browse&&p.conn)p.conn=Object.assign({},p.conn,{charset:window.browseCharset});
  }
  if(p)delete p.browse;
- busyStart();try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p),signal});return await r.json();}catch(e){if(e&&e.name==='AbortError')return {ok:false,aborted:true};showDead();return {ok:false,error:'Server unavailable'};}finally{busyStop();}}
+ // An answer that is not JSON comes from a server that is there - a refusal (403), or an error in the
+ // request handler (500) - and is said as such, with the request it answered, rather than as the app
+ // having stopped. No answer at all is the app stopping, and the request it was is logged with it:
+ // a "Server unavailable" that came and went could not otherwise be traced to anything.
+ busyStart();try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p),signal});
+  const txt=await r.text();try{return JSON.parse(txt);}catch(je){const m='The app\'s own server answered '+path+' with '+r.status+' '+(r.statusText||'')+' and no result: '+clip(String(txt).replace(/\s+/g,' ').trim(),200);log(m,{kind:'err'});return {ok:false,error:m};}}
+ catch(e){if(e&&e.name==='AbortError')return {ok:false,aborted:true};try{log('Server unavailable: no answer to '+path+' ('+(e&&e.message?e.message:String(e))+')',{kind:'err'});}catch(le){}showDead();return {ok:false,error:'Server unavailable'};}finally{busyStop();}}
 // Floating (draggable, non-blocking) modals remember where they were left, keyed by id, and
 // get bumped to the top of the floating stack whenever they're (re)opened or clicked - a plain
 // z-index counter that only ever increases, so "last touched" is always visually on top without
@@ -15963,6 +15974,7 @@ $RequestHandler = {
     param($client, $Token, $Html)
     try {
         $req = Read-Request $client
+        if ($req.bad) { Send-Http $client '400 Bad Request' 'application/json' ([Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":'+(J-Str ("The request did not reach the app's server whole: " + $req.bad))+'}')); return }
         # Only a request addressed to this machine by its own name is answered. A web page on
         # another site can make its own host name resolve to 127.0.0.1 (DNS rebinding) and then
         # read this page like a page of its own - the token in it included, and with the token,

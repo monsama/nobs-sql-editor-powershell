@@ -6918,7 +6918,10 @@ async function apiCall(path,p,signal){p=p||{};p.token=TOKEN;
  // having stopped. No answer at all is the app stopping, and the request it was is logged with it:
  // a "Server unavailable" that came and went could not otherwise be traced to anything.
  busyStart();try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p),signal});
-  const txt=await r.text();try{return JSON.parse(txt);}catch(je){const m='The app\'s own server answered '+path+' with '+r.status+' '+(r.statusText||'')+' and no result: '+clip(String(txt).replace(/\s+/g,' ').trim(),200);log(m,{kind:'err'});return {ok:false,error:m};}}
+  const st=r.status|0,ct=(r.headers&&r.headers.get&&r.headers.get('content-type'))||'';
+  const said=(m)=>{m='The app\'s own server answered '+path+' with '+(st||'no status')+' and no result'+(m?': '+m:'');log(m,{kind:'err'});return {ok:false,error:m};};
+  if(st>=400&&!/json/i.test(ct)){let txt='';try{txt=await r.text();}catch(te){}return said(clip(String(txt).replace(/\s+/g,' ').trim(),200));}
+  try{return await r.json();}catch(je){return said('');}}
  catch(e){if(e&&e.name==='AbortError')return {ok:false,aborted:true};try{log('Server unavailable: no answer to '+path+' ('+(e&&e.message?e.message:String(e))+')',{kind:'err'});}catch(le){}showDead();return {ok:false,error:'Server unavailable'};}finally{busyStop();}}
 // Floating (draggable, non-blocking) modals remember where they were left, keyed by id, and
 // get bumped to the top of the floating stack whenever they're (re)opened or clicked - a plain

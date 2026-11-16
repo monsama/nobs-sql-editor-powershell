@@ -1,9 +1,11 @@
 # The SQL formatter, whether a run only reads, ENUM members, CSV and Markdown, run against the UI inline in
 # NOBSSQL.ps1.
 #
-# The JavaScript below is the same test file the Tauri edition (nobs-sql-editor,
-# tests/ui/sql-text.test.mjs) runs against its ui/index.html - both editions share the UI, so they share
-# the test. Generated from that file; keep the two in step.
+# The JavaScript below came from the Tauri edition's sql-text test (nobs-sql-editor, tests/ui, as of
+# v1.10.1). Unlike the other shared tests it is this edition's own copy now, and SharedUiTests does
+# not hold it to the editor's: since nobs-sql-editor#147 the editor's Format button lays queries out
+# with the sql-formatter library (ui/vendor), which this single-file edition does not carry, and the
+# editor's test needs that library. What else changes in the editor's test is ported here by hand.
 #
 #   pwsh -NoProfile -File tests/SqlText.Tests.ps1 ./NOBSSQL.ps1
 param([Parameter(Mandatory)][string]$ScriptPath)

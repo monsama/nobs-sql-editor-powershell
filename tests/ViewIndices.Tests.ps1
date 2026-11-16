@@ -33,7 +33,7 @@ function extractFunction(src, name) {
 }
 
 const src = readFileSync(process.argv[2], 'utf8');
-const viewIndicesSrc = extractFunction(src, 'viewIndices') + '\n' + extractFunction(src, 'viewIndicesFresh');
+const viewIndicesSrc = extractFunction(src, 'viewIndices') + '\n' + extractFunction(src, 'viewIndicesFresh') + '\n' + extractFunction(src, 'wildMatcher');
 const rowHasTextSrc = extractFunction(src, 'rowHasText');
 const stepSrc = extractFunction(src, 'gridSearchStep');
 
@@ -76,6 +76,22 @@ eq(sortColumn(['banana','apple','cherry']), ['apple','banana','cherry'],
 // non-numeric value puts the whole column on the text path, so the order stays defined.
 eq(sortColumn(['10','9','1abc']), ['10','1abc','9'],
    'a column that only looks numeric is not treated as numeric');
+
+// A * in a column filter stands for any run of characters, and nothing else is special (#139).
+{
+  const vals = ['core_value', 'CORE attribute VALUE', 'value core', 'a.b', 'axb', 'cv'];
+  eq(sortColumn(vals, { filters: { 0: 'core*value' } }), ['CORE attribute VALUE', 'core_value'], 'a * in a column filter matches any run of characters');
+  eq(sortColumn(vals, { filters: { 0: '*' } }).length, vals.length, 'a filter of only * matches everything');
+  eq(sortColumn(vals, { filters: { 0: 'a.b' } }), ['a.b'], 'a dot is a dot, not any character');
+  eq(sortColumn(vals, { filters: { 0: 'c*v' } }), ['CORE attribute VALUE', 'core_value', 'cv'], 'and * may stand for nothing');
+}
+// The objects filter: the term's letters and digits, in order, anywhere in the name.
+{
+  const m = new Function(`${extractFunction(src, 'objNameMatcher')}
+return objNameMatcher;`)()('corevalue');
+  eq(['core_value', 'core_attribute_value', 'colgrevadimlue', 'CoreValue'].every(n => m(n)), true, 'the objects filter matches letters in order, ignoring other characters and case');
+  eq(['value_core', 'corevalu', 'orders'].some(n => m(n)), false, 'and not out of order or short');
+}
 
 eq(sortColumn(['10.00', null, '2.00']), ['2.00','10.00',null],
    'NULLs sort last and do not make the column non-numeric');

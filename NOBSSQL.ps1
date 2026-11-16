@@ -561,12 +561,15 @@ function New-Cnf {
     # (Compare's connections), this and the SET NAMES above share the statement when wanted.
     # And the time limit of a run from the editor (Add-TimeLimit).
     $limitSql = [string]$conn.timeLimitSql
+    # And, for a result read a page at a time, how long the server waits for it (Add-CursorWait).
+    $waitSql = [string]$conn.cursorWaitSql
     $initParts = @()
-    if ($names -and ($conn.utc -or $browseCs -or $limitSql)) { $initParts += $names }
-    if ($guard -and ($conn.utc -or $browseCs -or $limitSql)) { $initParts += $guard }
+    if ($names -and ($conn.utc -or $browseCs -or $limitSql -or $waitSql)) { $initParts += $names }
+    if ($guard -and ($conn.utc -or $browseCs -or $limitSql -or $waitSql)) { $initParts += $guard }
     if ($conn.utc) { $initParts += "SET time_zone='+00:00'" }
     if ($browseCs) { $initParts += 'SET SESSION TRANSACTION READ ONLY' }
     if ($limitSql) { $initParts += $limitSql }
+    if ($waitSql) { $initParts += $waitSql }
     if ($initParts.Count) {
         [void]$sb.AppendLine('[mysql]')
         [void]$sb.AppendLine("init-command=`"$($initParts -join '; ')`"")
@@ -610,6 +613,17 @@ function Add-TimeLimit { param($conn, $Seconds)
     if (-not $sql) { return $conn }
     $c = $conn.PSObject.Copy()
     $c | Add-Member -NotePropertyName timeLimitSql -NotePropertyValue $sql -Force
+    return $c
+}
+# A result read a page at a time is a mysql.exe --quick left running: between pages nobody reads
+# its output, the pipe fills, mysql.exe stops reading from the server, and the server gave up on it
+# after net_write_timeout (60 seconds by default) - the next page, a scroll to the bottom or Load all
+# rows, then failed with "connection forcibly closed". The server now waits as long as the app keeps
+# such a result open: an idle one is closed after 10 minutes (the sweep in the request loop), so 15.
+# The same as the desktop edition's cursors (nobs-sql-editor#151).
+function Add-CursorWait { param($conn)
+    $c = $conn.PSObject.Copy()
+    $c | Add-Member -NotePropertyName cursorWaitSql -NotePropertyValue 'SET SESSION net_write_timeout=900' -Force
     return $c
 }
 # Safely quote a single command-line argument for the external tools.
@@ -1174,6 +1188,7 @@ function Open-QueryCursor {
     param($conn,$sql,$db,$RequestId,[int]$PageSize=1000,[string[]]$ExactText)
     if ($PageSize -lt 1) { $PageSize = 1000 }
     Initialize-DumpDb
+    $conn = Add-CursorWait $conn
     $my = Get-Mysql $conn
     try { $ra = Get-ResultArgs $my $conn } catch { return @{ ok=$false; err=$_.Exception.Message } }
     $cnf = New-Cnf $conn -Tool $my
@@ -1723,12 +1738,15 @@ function Is-MarkerWarning { param($Row) $Row.Length -ge 3 -and [string]$Row[1] -
 function Warnings-Json { param([System.Collections.Generic.List[object]]$Warnings)
     ($Warnings | ForEach-Object { '{"statement":'+$_.stmt+',"level":'+(J-Str $_.level)+',"code":'+$_.code+',"message":'+(J-Str $_.message)+'}' }) -join ','
 }
-# What the output window says about one statement that ran: its number, its start on one line, and
-# the rows it changed. "matched" (an UPDATE's "Rows matched" vs. rows actually changed) is not
-# available from mysql.exe's XML output the way ROW_COUNT() is, so it is always null here.
+# What the output window says about one statement that ran: its number, its text, and the rows it
+# changed. The text goes as written - the window puts it on one line and shortens it, with an
+# expander for the whole of it - up to 20,000 characters, so a script of huge INSERTs does not send
+# them all back (as the desktop edition's stmt_report). "matched" (an UPDATE's "Rows matched" vs.
+# rows actually changed) is not available from mysql.exe's XML output the way ROW_COUNT() is, so it
+# is always null here.
 function Stmt-Report { param([int]$Idx, [string]$Stmt, [long]$Affected, [double]$Ms)
-    $oneLine = ($Stmt -replace '\s+', ' ').Trim()
-    $sql = if ($oneLine.Length -gt 80) { $oneLine.Substring(0, 80) + '...' } else { $oneLine }
+    $whole = $Stmt.Trim()
+    $sql = if ($whole.Length -gt 20000) { $whole.Substring(0, 20000) + '...' } else { $whole }
     '{"index":'+$Idx+',"sql":'+(J-Str $sql)+',"affected":'+$Affected+',"matched":null,"ms":'+[long]$Ms+'}'
 }
 # A value the server would store otherwise than typed (cut short, clipped, a zero date) stops a
@@ -5636,9 +5654,11 @@ body.schemas-folded #schemas{display:none} #objects{flex:1;overflow:auto}
  .item{padding:3px 10px 3px 16px;cursor:pointer;white-space:nowrap} #schemas .item{overflow:hidden;text-overflow:ellipsis} .uitem{padding:3px 10px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .uitem:hover{background:var(--hover)} .uitem.sel{background:var(--accent);color:#fff} .item:hover{background:var(--hover)} .item.sel{background:var(--accent);color:#fff}
  .ohdr{padding:3px 8px;font-weight:600;font-size:11px;color:var(--muted);background:var(--panel);border-top:1px solid var(--bd2);position:sticky;top:0;cursor:pointer;user-select:none} .ohdr:hover{color:var(--fg)} .ohdr .caret{display:inline-block;width:12px}
  #content{flex:1;display:flex;flex-direction:column;min-width:0}
- #tabsbar{display:flex;gap:4px;background:var(--panel2);padding:0 6px;overflow-x:auto;overflow-y:hidden;height:38px;box-sizing:border-box;align-items:center;border-bottom:1px solid var(--bd)}
+ /* Tabs that do not fit wrap onto more rows, rather than scrolling out of sight; past five rows the
+    bar scrolls. Its empty space opens a new tab on a double-click. */
+ #tabsbar{display:flex;flex-wrap:wrap;align-content:flex-start;gap:4px;background:var(--panel2);padding:5px 6px;overflow-x:hidden;overflow-y:auto;min-height:38px;max-height:170px;flex:none;box-sizing:border-box;align-items:center;border-bottom:1px solid var(--bd)}
  .tab{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 12px;background:var(--btn);border:1px solid var(--bd);border-radius:var(--r-s);cursor:pointer;white-space:nowrap;box-sizing:border-box}
- .tab.active{background:var(--bg);font-weight:600} .tab .x{margin-left:0;color:var(--muted);font-size:14px;line-height:1} .tab .x:hover{color:#c00}
+ .tab .tablabel{overflow:hidden;text-overflow:ellipsis;max-width:300px} .tab.active{background:var(--bg);font-weight:600} .tab .x{margin-left:0;color:var(--muted);font-size:14px;line-height:1} .tab .x:hover{color:#c00}
  .tab.dragging{opacity:.4}
  .tab.dragover{box-shadow:inset 2px 0 0 var(--accent)}
  .runningdot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:6px;animation:rundotpulse 1s ease-in-out infinite}
@@ -5703,7 +5723,8 @@ body.schemas-folded #schemas{display:none} #objects{flex:1;overflow:auto}
  .fitmax [data-reserve]{display:inline-flex!important}
  .applyn{min-width:6.6em;font-variant-numeric:tabular-nums} .txn{min-width:2.8em;font-variant-numeric:tabular-nums}
  .statusbar{display:flex;min-width:0} .statusbar>.status:first-child{flex:1;min-width:0} .pagerinfo{white-space:nowrap} .pagerinfo:empty{display:none}
- .warnspan{white-space:nowrap;flex:none} .warnspan:empty{display:none} .warnlink{color:var(--warn);font-weight:600} .notelink{color:var(--muted)}
+ .warnspan{white-space:nowrap;flex:none} .warnspan:empty{display:none}
+ .loadall{white-space:nowrap;flex:none;padding-top:1px;padding-bottom:1px} .loadall:empty{display:none} .loadall button{font-size:11px;padding:0 8px} .loadall button+button{margin-left:4px} .loadall .stlan{width:64px;font-size:11px;padding:0 4px;margin:0 4px 0 0;text-align:right;height:20px;box-sizing:border-box;vertical-align:middle} .warnlink{color:var(--warn);font-weight:600} .notelink{color:var(--muted)}
  .stk{display:inline-grid} .stk>span{grid-area:1/1} .stk>.off{visibility:hidden}
  .c-str{color:var(--str)} .c-kw{color:var(--kw);font-weight:600} .c-com{color:var(--com);font-style:italic} .c-num{color:var(--num)}
  .toolbar{padding:4px 8px;background:var(--panel);border-bottom:1px solid var(--bd2);display:flex;gap:9px;align-items:center;flex-wrap:wrap}
@@ -5780,6 +5801,24 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  .cdmsg{font-size:12px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
  .cdmsg.ok{color:#3fb950} .cdmsg.err{color:var(--danger)}
  @media (max-width:720px){.cdrow,.cdrow.cdnarrow{grid-template-columns:1fr}}
+ /* Managing saved connections, the dialog has a sidebar of them: a click loads one into the fields,
+    its copy button duplicates it. Saving a new connection has no sidebar - see connDialog. */
+ .cdmain{flex:1 1 auto;min-height:0;display:flex;gap:12px}
+ .cdmain>.cdbody{flex:1 1 auto;min-width:0}
+ .cdside{flex:none;width:200px;overflow:auto;border-right:1px solid var(--bd2);padding:2px 8px 2px 0;display:none}
+ #mConn.managing .cdside{display:block}
+ #mConn:not(.managing) #cdConnBtn{display:none}
+ .cdsitem{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:var(--r-m);cursor:pointer;font-size:13px;min-width:0}
+ .cdsitem:hover{background:var(--panel2)}
+ .cdsitem.on{background:var(--panel2);box-shadow:inset 3px 0 0 var(--accent)}
+ .cdsdot{flex:none;width:9px;height:9px;border-radius:50%;border:1px solid var(--bd)}
+ .cdsname{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .cdsitem.live .cdsname::after{content:' \25CF';color:#3fb950;font-size:10px}
+ .cdsenv{flex:none;max-width:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;color:var(--muted);border:1px solid var(--bd2);border-radius:4px;padding:0 4px}
+ .cdsdup{flex:none;padding:0 4px;height:22px;line-height:1;opacity:.55}
+ .cdsitem:hover .cdsdup,.cdsitem.on .cdsdup,.cdsdup:focus{opacity:1}
+ .cdsempty{font-size:12px;color:var(--muted);padding:6px}
+ @media (max-width:720px){.cdside{width:140px}}
  .rfField{margin:0 0 10px}
  .rfLabel{display:flex;align-items:baseline;gap:6px;margin:0 0 4px;font-size:12px;color:var(--muted);min-width:0}
  .rfLabel b{color:var(--fg);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -5807,6 +5846,9 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  table.grid td .celled>button:hover{background:var(--hover);color:var(--fg)}
  table.grid td input,table.grid td textarea{width:100%;height:100%;box-sizing:border-box;border:none;font:inherit;padding:2px 8px;background:transparent;color:var(--fg);vertical-align:middle}
  table.grid td textarea{display:block;resize:vertical;white-space:pre-wrap}
+ /* A multi-line value edited with the value panel open: one line over the cell, as a single-line
+    one is, since the panel already shows the whole value - the row keeps its height. */
+ table.grid td .celled.over>textarea{resize:none;overflow:hidden;white-space:pre}
  /* The "Set NULL" button next to the input is a regular <button> (height:28px by default) - taller
     than a grid row, which was what was actually forcing the row to grow while editing. Shrunk to
     match the cell instead. */
@@ -5830,6 +5872,10 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  #log .ln{border-left:3px solid transparent;padding-left:6px;margin-left:-6px} #log .ln.ok{border-left-color:var(--erd-pk)}
  #log .ln.warn{border-left-color:var(--log-warn)} #log .ln.err{border-left-color:var(--err-line);color:#f2b8b0}
  #log .ln.jump{cursor:pointer} #log .ln.jump:hover{background:rgba(255,255,255,.07)}
+ /* The expander of a line whose SQL is shortened. Its glyph is generated content, so a copy of the
+    output does not take it along. */
+ #log .lnx{cursor:pointer;display:inline-block;width:1.2em;opacity:.75} #log .lnx:hover{opacity:1}
+ #log .lnx::before{content:'\25B8'} #log .ln.open>.lnx::before{content:'\25BE'}
  .modal{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:9000}
 /* A floating modal drops the full-screen blocking backdrop and lets its box be dragged around
    freely, so it can sit alongside the rest of the app instead of covering it - meant for the
@@ -5860,6 +5906,12 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  #vHexTabs button{border:1px solid var(--bd);background:var(--btn);color:var(--fg);border-radius:var(--r-s);padding:4px 12px;cursor:pointer;font:inherit}
  #vHexTabs button.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
  #ctx{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:2000000;display:none;min-width:180px}
+ /* A foreign key cell's own way to the row it points at, and the short look at that row on hover. */
+ table.grid td .fkgo{float:right;margin:0 -4px 0 4px;padding:0 3px;border-radius:var(--r-s);color:var(--erd-line,#7aa8d8);cursor:pointer;font-size:11px;opacity:.55;user-select:none}
+ table.grid td .fkgo:hover{opacity:1;background:var(--hover)}
+ #fkPeek{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:1999999;display:none;max-width:420px;padding:6px 8px;font-size:12px;pointer-events:none}
+ #fkPeek .fkph{font-weight:600;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ #fkPeek table{border-collapse:collapse} #fkPeek td{padding:1px 6px 1px 0;vertical-align:top;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px} #fkPeek td:first-child{color:var(--muted)}
  #colPicker,#objTypePicker,#impDbPicker{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:2000000;display:none;min-width:200px;max-height:320px;overflow:auto;padding:6px 0}
  #copyMenu{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9500;display:none;min-width:200px;max-height:320px;overflow:auto;padding:6px 0}
  .cphdr{display:flex;justify-content:space-between;align-items:center;padding:4px 12px 6px;font-size:11px;color:var(--muted);border-bottom:1px solid var(--bd2);margin-bottom:4px}
@@ -5876,7 +5928,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  .logpanel .ln.err{border-left-color:var(--err-line)}
  .cpitem{display:flex;align-items:center;gap:6px;padding:3px 12px;font-size:12px;cursor:pointer;white-space:nowrap}
  .cpitem:hover{background:var(--hover,rgba(127,127,127,.12))}
- #ctx .item{padding:5px 12px} #ctx .sep{height:1px;background:var(--bd2);margin:3px 0}
+ #ctx .item{padding:5px 12px} #ctx .sep{height:1px;background:var(--bd2);margin:3px 0} #ctx .mhead{padding:4px 12px 2px;font-size:11px;color:var(--muted);cursor:default;user-select:none}
  .item.kbsel{background:var(--hover);outline:1px solid var(--accent);outline-offset:-1px}
  #acx{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9600;display:none;max-height:230px;overflow:auto;min-width:160px;font-family:var(--mono);font-size:12px}
  #acx .ai{padding:3px 10px;cursor:pointer;white-space:nowrap} #acx .ai.on{background:var(--accent);color:#fff} #allSchemasBtn.on{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -5957,6 +6009,9 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
     row each, a row's actions at its right, and a note in the middle when there is nothing yet. */
  .dsec{font-size:11px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--muted)}
  .clist{border:1px solid var(--bd);border-radius:var(--r-m);background:var(--panel2);overflow:auto}
+ #plTable.plfixed td,#plTable.plfixed th{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ #plTable th .rz{position:absolute;right:0;top:0;width:7px;height:100%;cursor:col-resize;z-index:3}
+ #plTable th .rz:hover,#plTable th .rz.drag{background:var(--accent);opacity:.55}
  .clist>.item{padding:6px 12px}
  .citem{padding:10px 14px;border-top:1px solid var(--bd2)} .citem:first-child{border-top:0} .citem:hover{background:var(--hover)}
  .citem-h{display:flex;align-items:center;gap:8px;margin-bottom:6px}
@@ -6164,7 +6219,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="barrow" id="barTop">
   <span id="updNote" style="display:none;position:fixed;left:16px;bottom:16px;z-index:9400;background:var(--panel2);border:1px solid var(--bd);border-left:4px solid var(--accent);border-radius:var(--r-m);padding:8px 12px;font-size:13px;white-space:nowrap;box-shadow:0 4px 14px rgba(0,0,0,.3)"><a href="#" id="updLink" style="color:var(--accent)" onclick="openUpdatePage();return false"></a> <button class="sm go" id="updInstall" style="margin:0 4px 0 8px;height:22px;padding:0 10px;font-size:12px" onclick="installUpdate()" title="Download this version, check it against the SHA-256 its release lists, and install it. The app closes while it installs.">Install</button> <a href="#" title="Hide until the next version" style="color:var(--muted);text-decoration:none" onclick="dismissUpdate();return false">&times;</a></span>
 	<span id="connPick"><select id="connlist" onchange="pickConnGuarded();connTitle()" title="Saved connections" style="width:210px;max-width:210px"><option value="" disabled hidden selected>Connections</option></select><span id="connTags"><span id="envChip" class="chip bad" style="display:none"></span><span id="primChip" title="Primary connection - the one that opens at startup" style="display:none"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" stroke="none"><path d="M12 3.6l2.6 5.4 5.9.8-4.3 4.2 1 5.9-5.2-2.8-5.2 2.8 1-5.9L3.5 9.8l5.9-.8z"/></svg></span><span id="pwChip" style="display:none"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span></span></span><button id="connGo" class="primary" title="Connect to the connection picked in the list" onclick="connect()"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button><span id="connStatus" class="chip off dotonly" title="Not connected" role="button" onclick="connStatusClick()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();connStatusClick()}"></span>
-  <button class="sm" title="Start a new connection (clear the form)" onclick="newConn()" data-ic="file" data-fit="3">New</button><button class="sm" title="Save these connection details" onclick="saveConn()" data-ic="save" data-fit="3">Save</button><button id="mgrBtn" class="sm" title="Edit, clone, delete or set primary for the selected connection" onclick="connMenu(event)" data-ic="sliders" data-fit="3">Manage &#9662;</button>
+  <button class="sm" title="Start a new connection (clear the form)" onclick="newConn()" data-ic="file" data-fit="3">New</button><button class="sm" title="Save these connection details" onclick="saveConn()" data-ic="save" data-fit="3">Save</button><button id="mgrBtn" class="sm" title="Manage saved connections - edit, duplicate, clone, delete or set primary" onclick="connMenu(event)" data-ic="sliders" data-fit="3">Manage &#9662;</button>
   <span id="connStatusGroup" style="display:inline-flex;gap:6px;align-items:center;min-width:0"><span class="cspill needsconn"><span id="csIcon" class="csic needsconn" title="The character set the text in results is read as"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z"/></svg></span><select id="browseCs" class="needsconn" onchange="setBrowseCharset(this.value)" style="max-width:150px;font-size:12px" title="Read text in another character set. A value that looks mis-encoded reads correctly in the character set its bytes really are, which tells a storage problem from a display one; binary shows the bytes themselves. The connection is read-only while this is not the server default."></select></span></span>
   <span id="barRight"><span id="topActions" class="needsconn"><span class="tbchunk"><button class="primary" onclick="newTab()" title="Open a new query tab" data-ic="plus" data-fit="4">New Query</button><button class="sm" onclick="openSqlFile()" title="Open a .sql file in a tab of its own (Ctrl+O)" data-ic="file" data-fit="3">Open</button><button class="sm" onclick="if(activeTab)saveSqlFile(activeTab)" title="Save the tab's query to its .sql file (Ctrl+S in the editor). Right-click the tab for Save as." data-ic="save" data-fit="3">Save</button></span><span class="tbchunk"><span class="tbsep"></span><button class="sm" title="The server and the databases on it - sizes, row counts, charsets" onclick="openOverview()" data-ic="gauge" data-fit="2">Overview</button><button class="sm" title="View users and privileges" onclick="openUsers()" data-ic="users" data-fit="2">Users</button><button class="sm" title="View and kill server processes/queries (SHOW FULL PROCESSLIST)" onclick="openProcessList()" data-ic="activity" data-fit="2">Processes</button><button class="sm" title="Browse and reopen previous queries" onclick="openHistory()" data-ic="history" data-fit="2">History</button><button class="sm" title="Save and browse reusable queries" onclick="openLibrary()" data-ic="book" data-fit="2">Library</button></span><span class="tbchunk"><span class="tbsep"></span><button class="sm" title="Export databases with mysqldump" onclick="openExport()" data-ic="export">Export</button><button class="sm" title="Import SQL files or a whole folder" onclick="openImport()" data-ic="import">Import</button><button class="sm" title="Compare table structure between two databases" onclick="openCompare()" data-ic="compare">Compare DB</button></span></span><span class="tbchunk tbfixed"><span class="tbsep"></span><button class="sm" title="Configure or download the mysql / mysqldump client tools" onclick="openSettings()" data-ic="gear">Settings</button><span class="tbsep fixedsep" style="margin:2px 0"></span><button class="sm icopin" id="coffeeBtn" aria-label="Buy me a coffee" title="Buy me a coffee, if NOBS SQL Editor saved you some time" onclick="window.open('https://buymeacoffee.com/monsama','_blank','noopener')" data-ic="coffee">Buy me a coffee</button><button class="sm" title="Stop the local server and exit (the clean way to close the app)" onclick="quit()" data-ic="power">Quit</button></span></span>
  </div>
@@ -6200,7 +6255,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
        alongside "OBJECTS" but comfortably fits on a full-width line of its own. -->
   <div class="hdr" style="flex-direction:column;align-items:flex-start;justify-content:center;gap:1px;padding-top:2px;padding-bottom:2px;line-height:1.2"><span>OBJECTS</span><span id="objdb" class="muted" style="width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span></div>
 <div id="objFilterRow" style="display:flex;gap:4px;margin:4px 6px;align-items:center">
-<input id="objFilter" placeholder="Filter objects..." oninput="objFilterInput()" onkeydown="if(event.key==='ArrowDown'){event.preventDefault();focusList($('objects'));}" style="flex:1;min-width:0;font-size:12px">
+<input id="objFilter" placeholder="Filter objects..." title="Shows the objects whose name holds these letters and digits in this order, anywhere in it: corevalue finds core_value and core_attribute_value. Other characters are ignored." oninput="objFilterInput()" onkeydown="if(event.key==='ArrowDown'){event.preventDefault();focusList($('objects'));}" style="flex:1;min-width:0;font-size:12px">
 <button class="sm" id="objTypeBtn" title="Show or hide object types (tables, views, procedures...)" onclick="event.stopPropagation();toggleObjTypePicker(this)" style="padding:2px 6px;font-size:11px">Types &#9662;</button>
 <button class="sm" id="allSchemasBtn" title="Search this name across all databases" onclick="toggleAllDbs()" style="padding:2px 6px;font-size:11px">All DBs</button>
 </div>
@@ -6227,7 +6282,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="vNote" style="display:none;font-size:11px;color:var(--log-warn);margin-bottom:4px;flex:none"></div>
  <textarea id="vText" spellcheck="false" oninput="updateHexDump()" style="width:100%;height:520px;flex:1;min-height:0;font-family:var(--mono);font-size:12px"></textarea>
  <pre id="vDump" style="display:none;flex:none;max-height:220px;overflow:auto;margin:6px 0 0;padding:6px 8px;border:1px solid var(--bd);border-radius:var(--r-s);background:var(--in);font-family:var(--mono);font-size:12px;line-height:1.35;white-space:pre;user-select:text"></pre>
- <select id="vSelect" style="width:100%;display:none;padding:8px;font-size:13px;flex:none"></select>
+ <select id="vSelect" style="width:100%;display:none;padding:0 8px;font-size:13px;flex:none"></select>
  <div id="vMulti" style="width:100%;display:none;max-height:520px;overflow:auto;padding:8px;border:1px solid var(--bd);border-radius:var(--r-s);background:var(--in);box-sizing:border-box;font-size:13px;flex:1;min-height:0"></div>
  <input id="vDate" style="width:100%;display:none;padding:8px;font-size:13px;box-sizing:border-box;flex:none">
  <div class="row" style="justify-content:flex-end;align-items:center;flex:none">
@@ -6542,6 +6597,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="inpFields" style="flex:1 1 auto;min-height:0;overflow:auto;display:flex;flex-direction:column"></div>
  <div class="row" style="justify-content:flex-end;margin-top:6px;flex:none"><button class="go" id="inpOk" onclick="inpOk()">OK</button><button onclick="inpCancel()">Cancel</button></div></div></div>
 <div class="modal floating" id="mConn"><div class="box" style="width:640px;max-width:94vw;max-height:90vh;display:flex;flex-direction:column;overflow:hidden;top:50px;left:220px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mConn')" title="Drag to move"><h3 id="cdTitle" style="margin:0 0 10px">Connection</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mConn')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+ <div class="cdmain"><div class="cdside" id="cd_side" aria-label="Saved connections"></div>
  <div class="cdbody" onkeydown="if(event.key==='Enter'&&event.target.tagName==='INPUT'&&event.target.type!=='checkbox'){event.preventDefault();cdOk();}">
   <div class="cdrow cdnarrow"><label class="cdf">Name<input id="cd_name" maxlength="60" autocomplete="off" spellcheck="false"></label><label class="cdf" title="Its colour in the bar - to tell servers apart at a glance">Colour<input id="cd_color" type="color"></label></div>
   <div class="setgroup">Server</div>
@@ -6563,8 +6619,8 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
   <label class="cdck"><input type="checkbox" id="cd_ro"> Read-only / safe mode - block all writes</label>
   <div class="cdrow"><label class="cdf">Time limit for queries, in seconds<input id="cd_limit" inputmode="numeric" autocomplete="off" maxlength="5" placeholder="none" oninput="this.value=this.value.replace(/\D+/g,'')"></label></div>
   <div class="cdnote">The server stops a statement run from the editor once it has taken this long. MariaDB stops any statement; MySQL only a SELECT. Empty or 0: no limit.</div>
- </div>
- <div class="cdfoot"><button type="button" id="cdTestBtn" onclick="cdTest()" data-ic="plug">Test connection</button><span class="cdmsg" id="cdMsg"></span><span style="flex:1"></span><button class="go" id="cdOkBtn" onclick="cdOk()">Save</button><button onclick="cdClose(null)">Cancel</button></div></div></div>
+ </div></div>
+ <div class="cdfoot"><button type="button" id="cdTestBtn" onclick="cdTest()" data-ic="plug">Test connection</button><span class="cdmsg" id="cdMsg"></span><span style="flex:1"></span><button type="button" id="cdConnBtn" onclick="cdConnect()" title="Connect to this saved connection">Connect</button><button class="go" id="cdOkBtn" onclick="cdOk()">Save</button><button onclick="cdClose(null)">Cancel</button></div></div></div>
 <div class="modal floating" id="mLib"><div class="box" style="width:1200px;max-width:95vw;height:80vh;max-height:900px;display:flex;flex-direction:column;overflow:hidden;top:60px;left:180px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mLib')" title="Drag to move"><h3 style="margin:0 0 10px">Query library</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mLib')" title="Maximize" id="maxBtn_mLib" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mLib')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="row" style="flex:none"><input id="libName" placeholder="Name for the current query" maxlength="80" style="flex:1" onkeydown="if(event.key==='Enter')libSaveCurrent()"><button class="go" onclick="libSaveCurrent()">Save current query</button></div>
  <div class="row" style="flex:none"><input id="libSearch" placeholder="Search saved queries..." oninput="libRender()" style="flex:1"></div>
@@ -6743,7 +6799,13 @@ function logLinesHtml(lines){return lines.map(l=>{const c=logLineCls(l);return '
 // SET PASSWORD ... = '...'. A quoted value ends at a quote that is not doubled, which is how the app
 // writes one under either sql_mode (strLit doubles quotes; only backslashes differ).
 function sqlNoSecrets(s){return String(s).replace(/(\bidentified\b(?:\s+(?:with|via)\s+[\w$]+)?\s+(?:by|as|using)\s+(?:password\s*)?\(?\s*|\b\w*password\s*(?:=\s*|\(\s*)?|\bset\s+password\b(?:\s+for\s+(?:'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|[^\s=@]+)(?:\s*@\s*(?:'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|[^\s=]+))?)?\s*=\s*(?:password\s*\(\s*)?)(['"])(?:\\[\s\S]|(?!\2)[\s\S]|\2\2)*\2/gi,"$1'***'");}
-function log(s,meta){const l=$('log');const d=document.createElement('div');const k=meta&&meta.kind!=null?meta.kind:logKind(s);d.className='ln'+(k?' '+k:'');d.textContent=sqlNoSecrets(s);
+// A line whose SQL was shortened carries the whole of it (meta.full), and an expander before it
+// switches between the two.
+function log(s,meta){const l=$('log');const d=document.createElement('div');const k=meta&&meta.kind!=null?meta.kind:logKind(s);d.className='ln'+(k?' '+k:'');
+ const txt=sqlNoSecrets(s),full=meta&&meta.full!=null&&meta.full!==s?sqlNoSecrets(meta.full):null;
+ if(full==null)d.textContent=txt;
+ else{const b=document.createElement('span'),x=document.createElement('span');b.className='lnx';b.title='Show the whole statement';x.textContent=txt;d.append(b,x);
+  b.onclick=e=>{e.stopPropagation();const o=d.classList.toggle('open');x.textContent=o?full:txt;b.title=o?'Show it shortened, on one line':'Show the whole statement';};}
  if(meta&&meta.jump){d.classList.add('jump');d.title='Click to show this statement in the editor';d.onclick=()=>logJump(meta.jump);}
  l.appendChild(d);l.scrollTop=l.scrollHeight;}
 function logKind(s){s=String(s);if(/\bERROR\b|^APPLY error|\nFailed:\n/.test(s))return 'err';if(/\bwarnings?\b|\bcancel/i.test(s))return 'warn';if(/\bOK\b|^Applied\b|^Saved\b/.test(s))return 'ok';return '';}
@@ -7521,10 +7583,24 @@ function tidyMenu(items){const out=[];(items||[]).forEach(it=>{if(!it)return;
  if(it==='-'){if(out.length&&out[out.length-1]!=='-')out.push('-');return;}out.push(it);});
  while(out.length&&out[out.length-1]==='-')out.pop();return out;}
 function menu(x,y,items,opts){const m=$('ctx');m.innerHTML='';buildMenuItems(m,tidyMenu(items),!!(opts&&opts.local));m.style.display='block';m.style.visibility='hidden';m.style.left='0';m.style.top='0';const w=m.offsetWidth||190,h=m.offsetHeight||0;let nx=Math.min(x,innerWidth-w-6);if(nx<6)nx=6;let ny=y;if(y+h>innerHeight-6)ny=Math.max(6,innerHeight-h-6);m.style.left=nx+'px';m.style.top=ny+'px';m.style.visibility='visible';}
-function buildMenuItems(container,items,local){items.forEach(it=>{if(it==='-'){const s=document.createElement('div');s.className='sep';container.appendChild(s);return;}const d=document.createElement('div');d.className='item';const isSub=Array.isArray(it[1]);d.textContent=it[0]+(isSub?'  \u25B8':'');const _destr=!local&&/^(drop|truncate|delete|rename|create|alter|import|design|new |duplicate|optimize|repair|analyze|paste|set null|set empty|edit value)/i.test(it[0]||'');if(window.readOnly&&_destr){d.className='item rodis';d.title='Disabled in read-only mode';container.appendChild(d);return;}
+// An entry {head:'text'} is a heading over the entries after it: not something to click.
+function buildMenuItems(container,items,local){items.forEach(it=>{if(it==='-'){const s=document.createElement('div');s.className='sep';container.appendChild(s);return;}
+ if(it&&it.head!=null){const h=document.createElement('div');h.className='mhead';h.textContent=it.head;h.onclick=e=>e.stopPropagation();container.appendChild(h);return;}const d=document.createElement('div');d.className='item';const isSub=Array.isArray(it[1]);d.textContent=it[0]+(isSub?'  \u25B8':'');const _destr=!local&&/^(drop|truncate|delete|rename|create|alter|import|design|new |duplicate|optimize|repair|analyze|paste|set null|set empty|edit value)/i.test(it[0]||'');if(window.readOnly&&_destr){d.className='item rodis';d.title='Disabled in read-only mode';container.appendChild(d);return;}
  if(isSub){d.style.position='relative';const fly=document.createElement('div');fly.className='ctxsub';buildMenuItems(fly,tidyMenu(it[1]),local);d.appendChild(fly);let ht=null;const showFly=()=>{if(ht){clearTimeout(ht);ht=null;}fly.style.display='block';fly.style.left='';fly.style.right='';fly.style.top='0';const r=fly.getBoundingClientRect(),dr=d.getBoundingClientRect();if(dr.right+r.width>innerWidth-4){fly.style.right='100%';}else{fly.style.left='100%';}if(dr.top+r.height>innerHeight-4){fly.style.top=(innerHeight-4-(dr.top+r.height))+'px';}};const hideFly=()=>{ht=setTimeout(()=>{fly.style.display='none';},200);};d.onmouseenter=showFly;d.onmouseleave=hideFly;fly.onmouseenter=()=>{if(ht){clearTimeout(ht);ht=null;}};fly.onmouseleave=hideFly;
+  // A click on an entry that opens a submenu opens it, and leaves the menu up: the click used to reach
+  // the document, whose handler closes every menu. Clicks on the submenu's own entries come through
+  // here too, after they have closed the menu and done their work.
+  d.onclick=e=>{e.stopPropagation();if(e.target===d)showFly();};
  }else{d.onclick=()=>{$('ctx').style.display='none';it[1]();};}
  container.appendChild(d);});}
+// The browser's own menu (Back, Refresh, Save as, Print, Inspect) has nothing to offer in this app,
+// and Refresh in it reloads the whole app. It is kept only where it is useful: in a text box or the
+// editor (Cut, Copy, Paste), and on selected text anywhere else (Copy). Everywhere the app has a menu
+// of its own, that menu shows instead, as before.
+function nativeMenuWanted(e){const el=e.target&&e.target.closest?e.target:null;
+ if(el&&el.closest('input,textarea,select,[contenteditable=""],[contenteditable="true"]'))return true;
+ const sel=window.getSelection&&window.getSelection();return !!(sel&&!sel.isCollapsed&&String(sel).trim());}
+document.addEventListener('contextmenu',e=>{if(!nativeMenuWanted(e))e.preventDefault();});
 document.addEventListener('click',(e)=>{$('ctx').style.display='none';const cp=$('colPicker');if(cp&&cp.style.display==='block'&&!cp.contains(e.target))cp.style.display='none';const cm=$('copyMenu');if(cm&&cm.style.display==='block'&&!cm.contains(e.target))cm.style.display='none';});
 
 // Ctrl+mouse-wheel font zoom on any textarea, same convention as Workbench - delegated on
@@ -7799,6 +7875,7 @@ const ICONS={
  explain:'<path d="M4 5h16M8 12h12M12 19h8"/>',
  format:'<path d="M4 6h16M4 10h10M4 14h16M4 18h10"/>',
  lastq:'<path d="M3 12a9 9 0 1 0 2.6-6.4L3 8M3 3v5h5"/>',
+ refresh:'<path d="M21 12a9 9 0 1 1-2.6-6.4L21 8M21 3v5h-5"/>',
  wholetable:'<rect x="3" y="4" width="18" height="16" rx="1"/><path d="M3 9.5h18M3 14.5h18M9 9.5V20"/>',
  copy:'<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
  wrap:'<path d="M3 6h18M3 12h15a3 3 0 0 1 0 6h-4M16 16l-2 2 2 2M3 18h7"/>',
@@ -7890,7 +7967,7 @@ function watchBar(row){if(!row||row.classList.contains('fitbar'))return;row.clas
 // Connecting and disconnecting show and hide the top bar's action buttons through the body's class.
 function watchTopBar(){watchBar($('barTop'));wireConnList();if(_barRO)new ResizeObserver(syncConnTags).observe($('connTags'));if(_barMO)new MutationObserver(()=>refit($('barTop'),true)).observe(document.body,{attributes:true,attributeFilter:['class']});}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',watchTopBar);else watchTopBar();
-function connMenu(e){e.stopPropagation();if(!$('connlist').value){toast('Select a saved connection first.',true);return;}const b=e.currentTarget.getBoundingClientRect();const isP=($('connlist').value===window._primaryConn);const n=$('connlist').value,hasPw=!!(window._connPw&&window._connPw[n]);const items=[['Edit\u2026',()=>editConn()],['Clone\u2026',()=>cloneConn()],[(isP?'Unset primary':'Set as primary'),()=>setPrimary()],hasPw&&['Clear saved password',()=>forgetPassword()]];if(!document.body.classList.contains('disconnected')){items.push('-');items.push(['Connect with other details\u2026',()=>toggleConnForm()]);}items.push('-');items.push(['Delete\u2026',()=>delConn()]);menu(b.left,b.bottom+2,items,{local:true});}
+function connMenu(e){e.stopPropagation();if(!$('connlist').value){if(connNames().length)editConn();else toast('No saved connections yet - fill in the details and Save.',true);return;}const b=e.currentTarget.getBoundingClientRect();const isP=($('connlist').value===window._primaryConn);const n=$('connlist').value,hasPw=!!(window._connPw&&window._connPw[n]);const items=[['Manage connections\u2026',()=>editConn()],['Clone\u2026',()=>cloneConn()],[(isP?'Unset primary':'Set as primary'),()=>setPrimary()],hasPw&&['Clear saved password',()=>forgetPassword()]];if(!document.body.classList.contains('disconnected')){items.push('-');items.push(['Connect with other details\u2026',()=>toggleConnForm()]);}items.push('-');items.push(['Delete\u2026',()=>delConn()]);menu(b.left,b.bottom+2,items,{local:true});}
 async function forgetPassword(){const n=$('connlist').value;if(!n){toast('Select a connection first.',true);return;}if(!(await ask('Remove the saved password for "'+n+'"? You will need to enter it the next time you connect.')))return;const g=await api('/api/conn-get',{name:n});if(!g.ok){toast('Could not load connection.',true);return;}const r=await api('/api/conn-save',{name:n,conn:{host:g.conn.host,port:g.conn.port,user:g.conn.user,ssl:g.conn.ssl,sslCa:g.conn.sslCa,password:'',...sshOf(g.conn)},savepw:false});if(r.ok){log('Removed saved password for '+n+'.');if(window._connPw)window._connPw[n]=false;if($('connlist').value===n){setPass('');passSavedMark(false);}dropActiveIfSaved(n,'The saved password of the connection you were on was removed');}else toast(r.error||'Could not remove the saved password.',true);}
 async function setPrimary(){const n=$('connlist').value;if(!n){toast('Select a connection first.',true);return;}const target=(n===window._primaryConn)?'':n;const r=await api('/api/conn-primary',{name:target});if(!r.ok){toast(r.error||'Could not set the default connection.',true);return;}await refreshConns();$('connlist').value=n;updatePrimeBtn();log(target?('Primary connection set: '+n+' (opens on startup)'):'Primary connection cleared.');}
 async function refreshConns(){const r=await api('/api/conn-list');const sel=$('connlist');sel.innerHTML='<option value="" disabled hidden>Connections</option>';const n=(r.ok&&r.items)?r.items.length:0;window._primaryConn='';window._connMeta={};window._connPw={};if(r.ok)r.items.forEach(c=>{if(c.primary)window._primaryConn=c.name;window._connPw[c.name]=!!c.hasPassword;window._connMeta[c.name]={accent:c.accent||'',env:c.env||'',readonly:!!c.readonly,timeLimit:+c.timeLimit||0};const o=document.createElement('option');o.value=c.name;
@@ -7997,7 +8074,13 @@ const SSL_NOTES={default:'Encrypted when the server offers it, otherwise not. Th
  verify:'Always encrypted, and the server is checked against the CA and its host name.',
  'verify-ca':'Always encrypted, and the server is checked against the CA but not its host name - for the certificates MySQL and MariaDB make for themselves.'};
 let _cd=null;
-function connDialog(o){return new Promise(resolve=>{if(_cd)_cd.resolve(null);const v=o.values||{};_cd={resolve,savedName:o.savedName||''};
+// o.manage: managing saved connections - a sidebar of them beside the fields (cdRenderSide), a
+// click on one loading it in place of the one shown (cdPick), and Save saving the one shown, whose
+// name is handed back as savedName with the fields.
+function connDialog(o){return new Promise(resolve=>{if(_cd)_cd.resolve(null);_cd={resolve,savedName:o.savedName||'',manage:!!o.manage};
+ const m=$('mConn');m.classList.toggle('managing',_cd.manage);const bx=m.querySelector('.box');if(bx)bx.style.width=_cd.manage?'860px':'640px';
+ cdFill(o);if(_cd.manage)cdRenderSide();show('mConn');const nm=$('cd_name');nm.focus();nm.select();});}
+function cdFill(o){const v=o.values||{};_cd.savedName=o.savedName||'';
  $('cdTitle').textContent=o.title;$('cdOkBtn').textContent=o.okText||'Save';$('cdMsg').textContent='';$('cdMsg').className='cdmsg';
  const set=(id,x)=>{$(id).value=x==null?'':x;};
  set('cd_name',v.name);$('cd_color').value=v.color||'#3b82f6';set('cd_host',v.host);set('cd_port',v.port);set('cd_user',v.user);
@@ -8006,7 +8089,65 @@ function connDialog(o){return new Promise(resolve=>{if(_cd)_cd.resolve(null);con
  $('cd_useSsh').checked=!!v.sshHost;set('cd_sshHost',v.sshHost);set('cd_sshPort',v.sshPort);set('cd_sshUser',v.sshUser);set('cd_sshKey',v.sshKey);
  const sp=$('cd_sshPass');set('cd_sshPass','');sp.placeholder=v.hasSshPassword?'\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022':'only if the server asks for one';sp.classList.toggle('pwsaved',!!v.hasSshPassword);
  set('cd_env',v.env);$('cd_ro').checked=!!v.ro;set('cd_limit',+v.timeLimit>0?+v.timeLimit:'');
- cdSync();show('mConn');const nm=$('cd_name');nm.focus();nm.select();});}
+ cdSync();_cd.snap=JSON.stringify(cdVals());}
+// The saved connections, in the order the connection box lists them.
+function connNames(){return [...$('connlist').options].map(o=>o.value).filter(Boolean);}
+function cdRenderSide(){const s=$('cd_side');if(!s||!_cd)return;const meta=connMeta(),acc=accMap(),cur=_cd.savedName;
+ const live=!document.body.classList.contains('disconnected')?(window._activeConnName||''):'';s.innerHTML='';
+ const names=connNames();if(!names.length){const e=document.createElement('div');e.className='cdsempty';e.textContent='No saved connections yet.';s.appendChild(e);return;}
+ names.forEach(n=>{const it=document.createElement('div');it.className='cdsitem'+(n===cur?' on':'')+(n===live?' live':'');it.title=n+(n===live?' - connected':'');it.dataset.name=n;it.onclick=()=>cdPick(n);
+  const d=document.createElement('span');d.className='cdsdot';d.style.background=acc[n]||'transparent';it.appendChild(d);
+  const t=document.createElement('span');t.className='cdsname';t.textContent=n;it.appendChild(t);
+  const env=(meta[n]&&meta[n].env)||'';if(env){const e=document.createElement('span');e.className='cdsenv';e.textContent=env;e.title=env;it.appendChild(e);}
+  // What can be done to the connection, in a menu of its own: the button, or a right-click on it.
+  const b=document.createElement('button');b.type='button';b.className='sm cdsdup';b.title='More for "'+n+'"';b.setAttribute('aria-label','More for '+n);b.textContent='⋯';
+  const more=e=>{e.preventDefault();e.stopPropagation();const r=b.getBoundingClientRect();cdSideMenu(n,e.type==='contextmenu'?e.clientX:r.left,e.type==='contextmenu'?e.clientY:r.bottom+2);};
+  b.onclick=more;it.oncontextmenu=more;it.appendChild(b);s.appendChild(it);});
+ const on=s.querySelector('.cdsitem.on');if(on&&on.scrollIntoView)on.scrollIntoView({block:'nearest'});}
+function cdSideMenu(n,x,y){menu(x,y,[['Duplicate',()=>cdDup(n)],'-',['Delete...',()=>cdDel(n)]],{local:true});}
+// Deletes a saved connection from the sidebar. The one shown goes with it: the dialog moves on to the
+// next connection in the list, or closes when none is left.
+async function cdDel(n){if(!_cd||!_cd.manage)return;
+ if(n===_cd.savedName&&JSON.stringify(cdVals())!==_cd.snap){if(!(await ask('Delete saved connection "'+n+'" and the changes not saved yet?')))return;}
+ else if(!(await ask('Delete saved connection "'+n+'"?')))return;
+ const names=connNames(),i=names.indexOf(n),sel=$('connlist').value;
+ const r=await api('/api/conn-delete',{name:n});if(r&&r.ok===false){toast(r.error||'Could not delete the connection.',true);return;}
+ accSet(n,'');if(sel===n){window.curAccent='';applyAccent('');}
+ await refreshConns();if(sel!==n&&connNames().includes(sel))$('connlist').value=sel;paintConnGo();
+ dropActiveIfSaved(n,'The connection you were on was deleted');log('Deleted connection "'+n+'".');
+ if(n!==_cd.savedName){cdRenderSide();return;}
+ const left=connNames();if(!left.length){cdClose(null);return;}
+ _cd.snap=JSON.stringify(cdVals());await cdShowSaved(left[Math.min(i,left.length-1)]);}
+// Leaving the connection shown for another: changes not saved yet are let go only when you say so.
+async function cdLeave(){if(!_cd||JSON.stringify(cdVals())===_cd.snap)return true;
+ return !!(await ask('Discard the changes to "'+_cd.savedName+'"?'));}
+// The values the dialog shows for a saved connection, fetched fresh - the password stays saved,
+// never in the page.
+async function connEditValues(n){const g=await api('/api/conn-get',{name:n});if(!g||!g.ok)return null;const m0=connMeta()[n]||{};
+ return {name:n,host:g.conn.host,port:g.conn.port,user:g.conn.user,password:'',savedPw:!!g.conn.hasPassword,
+  ssl:g.conn.ssl,sslCa:g.conn.sslCa,clearPw:!!g.conn.clearPw,...sshOf(g.conn),hasSshPassword:!!g.conn.hasSshPassword,color:accMap()[n]||'#3b82f6',env:m0.env||'',ro:!!m0.readonly,timeLimit:+m0.timeLimit||0,savepw:!!g.conn.hasPassword};}
+async function cdShowSaved(n){const v=await connEditValues(n);if(!v){toast('Could not load connection.',true);return false;}
+ if(!_cd||!_cd.manage)return false;cdFill({title:'Manage connections',okText:'Save',savedName:n,values:v});cdRenderSide();return true;}
+async function cdPick(n){if(!_cd||!_cd.manage||n===_cd.savedName)return;if(!(await cdLeave()))return;await cdShowSaved(n);}
+// A name for a copy no saved connection has yet, within the 60 characters a name may have.
+function connCopyName(n){const have=new Set(connNames().map(x=>x.toLowerCase()));
+ for(let i=1;;i++){const sfx=i===1?' (copy)':' (copy '+i+')';const c=n.slice(0,60-sfx.length)+sfx;if(!have.has(c.toLowerCase()))return c;}}
+// Duplicates a saved connection as it is saved - its password and SSH password come along (keepFrom),
+// as do its colour, environment, read-only and time limit - and shows the copy, its name ready to change.
+async function cdDup(n){if(!_cd||!_cd.manage)return;if(!(await cdLeave()))return;
+ const g=await api('/api/conn-get',{name:n});if(!g||!g.ok){toast('Could not load connection.',true);return;}
+ const m=connMeta()[n]||{},nn=connCopyName(n),c=g.conn;
+ const r=await api('/api/conn-save',{name:nn,conn:{host:c.host,port:c.port,user:c.user,password:'',ssl:c.ssl,sslCa:c.sslCa,clearPw:!!c.clearPw,...sshOf(c)},accent:accMap()[n]||'',env:m.env||'',readonly:!!m.readonly,timeLimit:+m.timeLimit||0,savepw:true,keepFrom:n});
+ if(!r.ok){toast(r.error||'Could not duplicate the connection.',true);return;}
+ const sel=$('connlist').value;await refreshConns();$('connlist').value=sel;paintConnGo();log('Duplicated connection "'+n+'" as "'+nn+'".');
+ if(await cdShowSaved(nn)){const nm=$('cd_name');nm.focus();nm.select();$('cdMsg').className='cdmsg ok';$('cdMsg').textContent='Duplicated - rename it and Save.';}}
+// Switches to the connection shown: the dialog closes, and it is picked and connected to, as the
+// connection box and its button would. Without a saved password, the password box is shown for one.
+async function cdConnect(){if(!_cd||!_cd.manage)return;const n=_cd.savedName;if(!n)return;
+ if(JSON.stringify(cdVals())!==_cd.snap&&!(await ask('Connect to "'+n+'" without saving your changes?')))return;
+ cdClose(null);if(anyPending()&&!(await ask('You have unsaved grid edits. After switching connections they can no longer be saved. Switch anyway?')))return;
+ $('connlist').value=n;await pickConn();connTitle();
+ if((window._connPw||{})[n])await connect();else{document.body.classList.add('show-connform');const p=$('pass');if(p)p.focus();}}
 function cdSync(){const ssl=$('cd_ssl').value;
  $('cd_caWrap').style.display=/^verify/.test(ssl)?'':'none';$('cd_sslNote').textContent=SSL_NOTES[ssl]||'';
  $('cd_pamWrap').style.display=ssl==='disabled'?'none':'';$('cd_ssh').style.display=$('cd_useSsh').checked?'':'none';}
@@ -8016,7 +8157,7 @@ function cdVals(){const g=id=>$(id).value,ssh=$('cd_useSsh').checked;
   sshKey:ssh?g('cd_sshKey').trim():'',sshPassword:ssh?g('cd_sshPass'):'',color:$('cd_color').value,env:g('cd_env'),ro:$('cd_ro').checked,timeLimit:Math.max(0,Math.floor(+g('cd_limit')||0)),savepw:$('cd_savepw').checked};}
 function cdClose(res){hide('mConn');const c=_cd;_cd=null;if(c)c.resolve(res);}
 function cdOk(){const v=cdVals();if(!v.name.trim()){toast('Enter a name for the connection.',true);$('cd_name').focus();return;}
- if(!v.host){toast('Enter the server host.',true);$('cd_host').focus();return;}cdClose(v);}
+ if(!v.host){toast('Enter the server host.',true);$('cd_host').focus();return;}v.savedName=_cd?_cd.savedName:'';cdClose(v);}
 // Tries the values in the dialog - a saved password left untouched included, for the address it was
 // saved for (resolve_saved) - without saving or connecting anything.
 async function cdTest(){if(!_cd)return;const v=cdVals(),m=$('cdMsg'),b=$('cdTestBtn');m.className='cdmsg';m.textContent='Testing...';b.disabled=true;
@@ -8043,21 +8184,25 @@ async function saveConn(){
 // covering name/accent/env/etc. while silently relying on whatever the inline form (behind the
 // dialog) happened to already contain. A dialog titled "Edit connection" that didn't actually
 // let you edit the connection's own host or credentials was the real problem being fixed here.
-async function editConn(){const n0=$('connlist').value;if(!n0){toast('Select a saved connection to edit first.',true);return;}
- const g=await api('/api/conn-get',{name:n0});if(!g.ok){toast('Could not load connection.',true);return;}
- const m0=connMeta()[n0]||{};
- const res=await connDialog({title:'Edit connection',okText:'Save',savedName:n0,values:{name:n0,host:g.conn.host,port:g.conn.port,user:g.conn.user,password:'',savedPw:!!g.conn.hasPassword,
-  ssl:g.conn.ssl,sslCa:g.conn.sslCa,clearPw:!!g.conn.clearPw,...sshOf(g.conn),hasSshPassword:!!g.conn.hasSshPassword,color:accMap()[n0]||'#3b82f6',env:m0.env||'',ro:!!m0.readonly,timeLimit:+m0.timeLimit||0,savepw:!!g.conn.hasPassword}});
- if(!res||!res.name.trim())return;const nn=res.name.trim();
+// It opens as the Manage connections dialog: the saved connections in a sidebar, the one picked in
+// the connection box (or the first) shown, any other a click away. Save saves the one shown.
+async function editConn(name){const sel0=$('connlist').value;let n0=name||sel0||connNames()[0]||'';
+ if(!n0){toast('No saved connections yet - fill in the details and Save.',true);return;}
+ const v0=await connEditValues(n0);if(!v0){toast('Could not load connection.',true);return;}
+ const res=await connDialog({title:'Manage connections',okText:'Save',savedName:n0,manage:true,values:v0});
+ if(!res||!res.name.trim())return;n0=res.savedName||n0;const nn=res.name.trim();
+ // The connection box keeps what it had picked, unless that is the one saved here.
+ const mine=n0===sel0;
  // The connection you are on, if it is this one - as it was when you connected.
  const act=!document.body.classList.contains('disconnected')&&window._activeConnName===n0?window._activeConn:null;
  const r=await api('/api/conn-save',{name:nn,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa,clearPw:!!res.clearPw,...sshOf(sshRes(res))},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,timeLimit:+res.timeLimit||0,savepw:!!res.savepw,keepFrom:n0});if(!r.ok){toast(r.error,true);return;}
  if(nn!==n0){await api('/api/conn-delete',{name:n0});}
- window.curAccent=res.color;applyAccent(res.color);await refreshConns();$('connlist').value=nn;applyEnv(nn);
+ if(!mine){await refreshConns();$('connlist').value=sel0;paintConnGo();}
+ else{window.curAccent=res.color;applyAccent(res.color);await refreshConns();$('connlist').value=nn;applyEnv(nn);}
  // If this connection is the one currently loaded into the (largely internal, now rarely
  // shown) inline form, keep it in sync with what was just saved - otherwise a subsequent
  // Connect click would silently use stale values from before the edit.
- if($('connlist').value===nn){$('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';$('clearpw').checked=!!res.clearPw;sslCaToggle();sshSet(sshRes(res));setPass(res.password);const pwc=$('pwChip');if(pwc)pwc.style.display=(window._connPw||{})[nn]?'inline':'none';passSavedMark(!res.password&&(window._connPw||{})[nn]);}
+ if(mine&&$('connlist').value===nn){$('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';$('clearpw').checked=!!res.clearPw;sslCaToggle();sshSet(sshRes(res));setPass(res.password);const pwc=$('pwChip');if(pwc)pwc.style.display=(window._connPw||{})[nn]?'inline':'none';passSavedMark(!res.password&&(window._connPw||{})[nn]);}
  log('Updated connection: '+nn);
  // The connection you are on names its saved connection, and its password is filled in by that name
  // for the address it was saved for. Renamed, it goes by the new name; given another address, user,
@@ -8277,15 +8422,24 @@ function togglePin(db,name){const p=pinnedTables(db);const i=p.indexOf(name);if(
 function fmtCount(n){n=Math.round(+n||0);return String(n).replace(/\B(?=(\d{3})+(?!\d))/g,"'");}
 function fmtMs(ms){ms=+ms||0;if(ms>=10000)return Math.round(ms/1000)+'s';if(ms>=1000)return (ms/1000).toFixed(1)+'s';return Math.round(ms)+'ms';}
 function runClock(){const d=new Date(),p=n=>String(n).padStart(2,'0');return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());}
-function sqlOneLine(sql,max){const x=String(sql==null?'':sql).replace(/\s+/g,' ').trim();max=max||80;return x.length>max?x.slice(0,max)+'...':x;}
-function runLog(id,msg,kind,jump){const t=T(id);log('['+runClock()+'] '+(t?t.title:'Query')+': '+msg,{kind:kind==='-'?'':(kind||'ok'),jump:jump?{id,sql:jump.sql,n:jump.n||0}:null});}
+// A statement is shown on one line up to LOG_SQL_MAX characters; a longer one gets an expander on its
+// log line that shows the whole of it, as written, up to LOG_SQL_FULL_MAX (the backend reports a
+// script's statements up to the same length).
+const LOG_SQL_MAX=300,LOG_SQL_FULL_MAX=20000;
+function sqlOneLine(sql,max){const x=String(sql==null?'':sql).replace(/\s+/g,' ').trim();max=max||LOG_SQL_MAX;return x.length>max?x.slice(0,max)+'...':x;}
+function sqlWhole(sql){const x=String(sql==null?'':sql).trim();return x.length>LOG_SQL_FULL_MAX?x.slice(0,LOG_SQL_FULL_MAX)+'...':x;}
+// msg is the text, or a function that writes it with the SQL it names put through the formatter it
+// is given: sqlOneLine for the line as shown, sqlWhole for what its expander shows.
+function runLog(id,msg,kind,jump){const t=T(id),head='['+runClock()+'] '+(t?t.title:'Query')+': ';
+ const short=typeof msg==='function'?msg(sqlOneLine):msg,full=typeof msg==='function'?msg(sqlWhole):null;
+ log(head+short,{kind:kind==='-'?'':(kind||'ok'),jump:jump?{id,sql:jump.sql,n:jump.n||0}:null,full:full!=null&&full!==short?head+full:null});}
 function stmtWrites(sql){return /^(insert|update|delete|replace|load\s+data)\b/i.test(sqlHead(String(sql||'')));}
 function rowsAffected(n){n=+n||0;return fmtCount(n)+' row'+(n===1?'':'s')+' affected';}
 function stmtOutcome(st){const a=+st.affected||0,m=st.matched;
  const rows=!stmtWrites(st.sql)?'OK':(m!=null&&+m!==a)?fmtCount(a)+' row'+(a===1?'':'s')+' changed, '+fmtCount(m)+' matched':rowsAffected(a);
  return rows+', '+fmtMs(st.ms);}
 function scriptAffected(sts){const w=(sts||[]).filter(x=>stmtWrites(x.sql));return w.length?w.reduce((a,x)=>a+(+x.affected||0),0):null;}
-function stmtLines(sts,total){return (sts||[]).map(x=>'  '+x.index+(total?'/'+total:'')+'. '+x.sql+' -> '+stmtOutcome(x));}
+function stmtLines(sts,total,f){f=f||sqlOneLine;return (sts||[]).map(x=>'  '+x.index+(total?'/'+total:'')+'. '+f(x.sql)+' -> '+stmtOutcome(x));}
 // The statement behind the grid: the result picked from a script's results, else the last
 // statement run.
 function gridSql(t){const rs=t.resultSets&&t.resultSets[t.resultIdx||0];if(rs)return rs.sql;const s=splitStmts(String(t.curRun||'')).filter(x=>!isCommentOnly(x));return s.length?s[s.length-1]:'';}
@@ -8334,7 +8488,75 @@ function updateStatusLine(id){const t=T(id);if(!t||!t.rows)return;const st=$('st
   const lim=t.hasMore?null:trailingLimit(gridSql(t));
   const limLabel=(lim!=null&&t.rows.length>=lim)?'  |  LIMIT '+fmtCount(lim)+' in the query - there may be more rows':'';
   st.textContent=rowLabel+ms+moreLabel+limLabel+(t.pk?('  |  editable PK: '+t.pk.join(', ')):'');
+  paintLoadAll(id);
 }
+// "Load all rows", next to the row count: reads the rest of the result into the grid, batch after
+// batch from the same open cursor that scrolling reads from, instead of scrolling to the bottom over
+// and over. While it reads, the same button stops it (as does Cancel), keeping what has arrived.
+const LOAD_ALL_WARN=100000;
+// Rows read per round trip by Load all rows and Load more: ten times the page scrolling reads, as
+// they read many pages anyway. The backend still ends a batch early at PAGE_BYTES, for large values.
+const LOAD_ALL_BATCH=10000;
+// Beside it, a number and "Load more": that many more rows, in the same way. The number starts at
+// LOAD_MORE_DEFAULT; a number typed is kept for the tab while the app is open, not saved.
+const LOAD_MORE_DEFAULT=10000;
+function paintLoadAll(id){const t=T(id),b=$('stla_'+id);if(!b)return;
+ if(!t||!(t.loadingAll||(t.hasMore&&t.cursorId))){b.innerHTML='';return;}
+ if(t.loadingAll){b.innerHTML='<button class="sm warn" title="Stop reading rows - the rows loaded so far stay in the grid" onclick="loadAllRows(\''+id+'\')">Stop loading</button>';return;}
+ const n=t.loadMoreN||LOAD_MORE_DEFAULT;
+ // The count, then Load more, then Load all rows. A text box, not a number box: no up/down arrows.
+ b.innerHTML='<input type="text" inputmode="numeric" id="stlan_'+id+'" class="stlan" value="'+n+'" title="How many more rows Load more reads" aria-label="How many more rows to load" oninput="loadMoreSet(\''+id+'\',this.value)" onkeydown="if(event.key===\'Enter\'){event.preventDefault();loadMoreRows(\''+id+'\');}">'
+  +'<button class="sm" title="Read this many more rows of the result into the grid" onclick="loadMoreRows(\''+id+'\')">Load more</button>'
+  +'<button class="sm" title="Read every remaining row of the result into the grid, rather than scrolling to load them '+fmtCount(PAGE_BATCH)+' at a time" onclick="loadAllRows(\''+id+'\')">Load all rows</button>';}
+function hideLoadAll(id){const b=$('stla_'+id);if(b)b.innerHTML='';}
+// The number typed, as a whole count of at least 1; null while it is not one.
+function loadMoreCount(v){const n=Math.floor(Number(String(v).replace(/['\s,_]/g,'')));return Number.isFinite(n)&&n>=1?n:null;}
+function loadMoreSet(id,v){const t=T(id),n=loadMoreCount(v);if(t&&n)t.loadMoreN=n;}
+function loadMoreRows(id){const t=T(id);if(!t)return;const box=$('stlan_'+id),n=loadMoreCount(box?box.value:t.loadMoreN||LOAD_MORE_DEFAULT);
+ if(!n){toast('Type how many more rows to load: a whole number of 1 or more.',true);if(box)box.focus();return;}
+ t.loadMoreN=n;return loadAllRows(id,n);}
+// Reads the rest of the result, or only `more` more rows of it when that is given.
+async function loadAllRows(id,more){const t=T(id);if(!t)return;
+ if(t.loadingAll){t.loadingAll=null;paintLoadAll(id);return;}
+ if(!t.hasMore||!t.cursorId){paintLoadAll(id);return;}
+ const seq=t.runSeq,loaded=t.rows.length,upTo=more?loaded+more:Infinity;
+ // How many rows that will be: the table's estimate when the grid shows the whole table; for any
+ // other query on a table, the table's size is only an upper bound (barring a join); else unknown.
+ const whole=t.table&&t.estRows!=null&&wholeTableShown(t);
+ const big='Every row is held in memory and shown in the grid: a very large result can make the app slow or run out of memory.';
+ let msg=null;
+ if(more){
+  // At most `more` more: asked only when the grid could then hold LOAD_ALL_WARN rows or more.
+  const most=whole?Math.min(upTo,Math.max(t.estRows,loaded)):upTo;
+  if(most>=LOAD_ALL_WARN)msg='Loading '+fmtCount(more)+' more rows makes up to '+fmtCount(most)+' rows in the grid, '+fmtCount(loaded)+' of them loaded so far.\n\n'+big+'\n\nLoad them?';}
+ else if(whole){if(t.estRows>=LOAD_ALL_WARN)msg='This table has about '+fmtCount(t.estRows)+' rows (an estimate), '+fmtCount(loaded)+' of them loaded so far.\n\n'+big+'\n\nLoad all rows anyway?';}
+ else if(t.table&&t.estRows!=null){if(t.estRows>=LOAD_ALL_WARN)msg='How many rows this query returns is not known in advance. Its table, '+t.table+', has about '+fmtCount(t.estRows)+' rows (an estimate).\n\n'+big+'\n\nLoad all rows?';}
+ else msg='How many rows this query returns is not known in advance - '+fmtCount(loaded)+' are loaded so far.\n\n'+big+' Cancel stops the reading at any time.\n\nLoad all rows?';
+ if(msg&&!(await ask(msg)))return;
+ // The dialog may have stood open while a new run started or the cursor ran out.
+ if(!T(id)||t.runSeq!==seq||!t.hasMore||!t.cursorId)return;
+ // A token of this reading's own: Stop and then Load again must not leave two readings going.
+ const tok={};t.loadingAll=tok;paintLoadAll(id);log(more?'Loading '+fmtCount(more)+' more row(s) of the result...':'Loading every row of the result...');
+ let failed=false;
+ try{
+  while(t.loadingAll===tok&&T(id)&&t.runSeq===seq&&t.hasMore&&t.cursorId&&t.rows.length<upTo){
+   // A batch already being read (by a scroll) is waited for, not doubled.
+   if(t.fetchingMore){await new Promise(r=>setTimeout(r,50));continue;}
+   const before=t.rows.length,cur=t.cursorId;
+   // The last batch asks for just what is still wanted, so the count comes out exact.
+   await fetchNextBatch(id,Math.min(LOAD_ALL_BATCH,upTo-before),true);
+   // A read that failed without closing the cursor is not tried over and over; one that closed
+   // it (fetchNextBatch has said why) leaves the rest of the result unread - not "all loaded".
+   if(t.rows.length===before&&t.hasMore&&t.cursorId===cur){failed=true;break;}
+   if(t.rows.length===before&&!t.cursorId){failed=true;break;}
+  }
+ }finally{const reached=t.rows.length>=upTo,stopped=t.hasMore&&t.runSeq===seq&&!reached;if(t.loadingAll===tok)t.loadingAll=null;
+  // The rows read are drawn once, now (the batches were read quietly).
+  if(T(id)&&t.runSeq===seq&&!t.loadingAll){if(t.rows.length!==loaded)renderBody(id);paintLoadAll(id);
+   log(failed?'The rest of the result could not be read; '+fmtCount(t.rows.length)+' row(s) are in the grid. Run the query again to read the rest.'
+    :stopped?'Stopped loading: '+fmtCount(t.rows.length)+' row(s) loaded.'
+    :more&&t.hasMore?'Loaded '+fmtCount(t.rows.length-loaded)+' more row(s), '+fmtCount(t.rows.length)+' in all; the result has more.'
+    :'All '+fmtCount(t.rows.length)+' row(s) loaded.');}}}
 let objData=null;
 async function loadObjects(db) {
     const r = await api('/api/objects', { db });
@@ -8447,17 +8669,22 @@ function toggleObjGroup(key,all){let s=objCollapsed();const fold=!s.has(key);
 function objGroupHdr(box,key,text,folded){const h=document.createElement('div');h.className='ohdr';h.title=(folded?'Click to show':'Click to hide')+' (Shift+click: every group)';
  const c=document.createElement('span');c.className='caret';c.textContent=folded?'\u25B8':'\u25BE';h.appendChild(c);h.appendChild(document.createTextNode(text));
  h.onclick=e=>toggleObjGroup(key,e.shiftKey);box.appendChild(h);return !folded;}
-function renderObjects(){if(allDbs){renderAllDbs();return;}const box=$('objects');box.innerHTML='';if(!objData)return;const db=objData.db,r=objData.r;const f=($('objFilter').value||'').toLowerCase();const tf=window._objTypeFilter;const folded=objCollapsed();
+// The objects filter is fuzzy: the term's letters and digits, in order, anywhere in the name, so
+// "corevalue" finds core_value and core_attribute_value. Anything else typed (_ . - * ...) is
+// ignored, so they need not be typed, and a term of only such characters matches everything.
+function objNameMatcher(f){const t=String(f||'').toLowerCase().replace(/[^\p{L}\p{N}]/gu,'');if(!t)return ()=>true;
+ return n=>{const s=String(n).toLowerCase();let i=0;for(let j=0;j<s.length&&i<t.length;j++)if(s[j]===t[i])i++;return i===t.length;};}
+function renderObjects(){if(allDbs){renderAllDbs();return;}const box=$('objects');box.innerHTML='';if(!objData)return;const db=objData.db,r=objData.r;const f=($('objFilter').value||'').trim().toLowerCase();const fm=objNameMatcher(f);const tf=window._objTypeFilter;const folded=objCollapsed();
  const pinned=tf.has('table')?pinnedTables(db):[];
  if(pinned.length){
-   const fil=pinned.filter(n=>r.tables.includes(n)&&(!f||n.toLowerCase().includes(f)));
+   const fil=pinned.filter(n=>r.tables.includes(n)&&fm(n));
    if(fil.length&&objGroupHdr(box,'pinned','\u2605 Pinned ('+fil.length+')',folded.has('pinned'))){
      fil.forEach(n=>{const d=document.createElement('div');d.className='item';d.title=n;if(objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
       d.onclick=()=>{[...box.querySelectorAll('.item')].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');objOpen(db,'table',n);};
       d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,'table',n);};box.appendChild(d);});}
  }
  const groups=[['Tables',r.tables,'table'],['Views',r.views,'view'],['Sequences',r.sequences||[],'sequence'],['Procedures',r.procedures,'procedure'],['Functions',r.functions,'function'],['Triggers',r.triggers,'trigger'],['Events',r.events,'event']];
- groups.forEach(([label,items,type])=>{if(!tf.has(type))return;const fil=(items||[]).filter(n=>!f||n.toLowerCase().includes(f));if(!fil.length)return;if(!objGroupHdr(box,type,label+' ('+fil.length+(f?'/'+items.length:'')+')',folded.has(type)))return;
+ groups.forEach(([label,items,type])=>{if(!tf.has(type))return;const fil=(items||[]).filter(fm);if(!fil.length)return;if(!objGroupHdr(box,type,label+' ('+fil.length+(f?'/'+items.length:'')+')',folded.has(type)))return;
   // At most OBJ_CAP of a kind are drawn; the rest are counted, and the filter finds them. Ten
   // thousand rows in the sidebar made opening and filtering a large schema hang.
   const more=fil.length-OBJ_CAP;
@@ -8926,7 +9153,9 @@ function toggleOverview() {
         ov.style.display = 'none';
     }
 }
-function objOpen(db,type,name){if(type==='table'){const _id=openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,false,name);openRun(_id);}else if(type==='view'||type==='sequence'){openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,true,null);}else{openDdl(db,type,name);}}
+// A table already open in a tab of its own is shown again rather than opened twice. FK tabs carry
+// the table too but show a filtered slice of it, so they don't count.
+function objOpen(db,type,name){if(type==='table'){const _open=tabs.find(t=>t.db===db&&t.table===name&&!t.ddl&&!/ \(FK: /.test(t.title));if(_open){activate(_open.id);return;}const _id=openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,false,name);openRun(_id);}else if(type==='view'||type==='sequence'){openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,true,null);}else{openDdl(db,type,name);}}
 // A table's menu, in groups: reading it, its structure, its data in and out, its upkeep, and last
 // what changes or removes it. information_schema and performance_schema are the server's views of
 // itself - nothing in them is designed, filled, kept up, renamed or dropped - so their tables and
@@ -9141,6 +9370,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   lastBtn+selBtn+applyBtn+
   '<span class="tbsep"></span>'+
   '<span id="resultActions_'+id+'"'+(tab.ddl?'':' data-reserve')+' style="display:none;gap:9px;align-items:center" class="tbgroup">'+
+  '<button class="sm" id="refbtn_'+id+'" title="Fetch the rows again with the query that produced them, keeping the column filters, the search and the sort" onclick="refreshGrid(\''+id+'\')" data-ic="refresh" data-fit="2">Refresh</button>'+
   '<button title="Copy the grid to the clipboard, as CSV or Markdown, all rows or just the selected (checked) ones (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="event.stopPropagation();toggleCopyMenu(\''+id+'\',this)" data-ic="copy" data-fit="3">Copy \u25BE</button>'+'<button class="sm" id="wrapbtn_'+id+'" title="Toggle text wrapping in the grid" onclick="toggleWrap(\''+id+'\')" data-ic="wrap" data-fit="2"><span class="stk"><span class="off">Wrap: On</span><span>Wrap: Off</span></span></button>'+'<button class="sm" id="colsbtn_'+id+'" title="Show or hide columns" onclick="event.stopPropagation();toggleColPicker(\''+id+'\',this)" data-ic="columns" data-fit="2">Columns</button>'+'<button class="sm" title="Chart the rows the grid shows, as bars or a line" onclick="chartOpen(\''+id+'\')" data-ic="chart" data-fit="2">Chart</button>'+'<button class="sm tog'+(vpOpen?' ison':'')+'" id="vpbtn_'+id+'" aria-pressed="'+vpOpen+'" title="Show the value of the cell you click in a panel under the grid, to read and edit it at full length" onclick="vpToggle()">Value</button>'+'<input type="search" id="gsearch_'+id+'" placeholder="Search" title="Show only the rows holding this text in any column, and mark the cells that hold it (Ctrl+F from the grid; Enter / Shift+Enter: next / previous match; Esc clears). Searches the rows loaded so far, and says how many match in every result of a script." oninput="(v=>gridTypeSoon(\''+id+'\',()=>setGridSearch(\''+id+'\',v)))(this.value)" onkeydown="gsearchKey(event,\''+id+'\',this)" class="gsearch" style="width:170px;font-size:12px">'+'<button class="sm" id="clrflt_'+id+'" style="display:none" title="Clear the column filters and the search" onclick="clearGridFilters(\''+id+'\')" data-ic="clearf" data-fit="2">Clear filters</button>'+
   '</span>'+
   '<span style="flex:1 1 auto"></span>'+
@@ -9152,7 +9382,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   '<button class="tog ison" id="txac_'+id+'" aria-pressed="true" onclick="txToggle(\''+id+'\',this.classList.contains(\'ison\'))" data-ic="autocommit" data-fit="2" title="Auto-commit: every statement is permanent as soon as it runs. Turn it off to keep everything this tab runs in one transaction, on a connection of its own, until you Commit or Roll back.">Auto-commit</button>'+
   '<span id="txbar_'+id+'" style="display:inline-flex;gap:6px;align-items:center;margin-left:6px"><button class="sm" id="txcommit_'+id+'" disabled title="Make this tab\'s changes permanent, including grid edits not applied yet" onclick="txEnd(\''+id+'\',\'commit\')">Commit</button><button class="sm txn" id="txlog_'+id+'" disabled title="What this transaction has run so far" onclick="txShowLog(\''+id+'\')">0</button><button class="sm warn" id="txrollback_'+id+'" disabled title="Undo everything this tab has not committed, including grid edits not applied yet" onclick="txEnd(\''+id+'\',\'rollback\')">Rollback</button></span>'+
   '</span></div>'+
-  '<div class="qfbar" id="qf_'+id+'" style="display:none"></div><div id="rsets_'+id+'" style="display:none;gap:6px;align-items:center;flex-wrap:wrap;padding:4px 8px"></div><div class="result" id="res_'+id+'"></div>'+vpHtml(id)+'<div class="statusbar"><div class="status" id="st_'+id+'">Ready.</div><span class="status warnspan" id="stw_'+id+'"></span>'+pager+'</div>';
+  '<div class="qfbar" id="qf_'+id+'" style="display:none"></div><div id="rsets_'+id+'" style="display:none;gap:6px;align-items:center;flex-wrap:wrap;padding:4px 8px"></div><div class="result" id="res_'+id+'"></div>'+vpHtml(id)+'<div class="statusbar"><div class="status" id="st_'+id+'">Ready.</div><span class="status loadall" id="stla_'+id+'"></span><span class="status warnspan" id="stw_'+id+'"></span>'+pager+'</div>';
  $('panes').appendChild(pane);watchBar(pane.querySelector('.toolbar'));edFoldSync(id);vpWire(id);const ta=$('ed_'+id);ta.value=sql||'';
  const ra1=$('resultActions_'+id);if(ra1)ra1.style.display='none';updateEditBar(id);
  (function(){const es=$('es_'+id),ew=$('ew_'+id);es.addEventListener('mousedown',e=>{if(e.target!==es)return;e.preventDefault();
@@ -9291,7 +9521,12 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
     edReplaceRange(id,ls,le,block);ta.selectionStart=ls;ta.selectionEnd=ls+block.length;}}
  });
  syncHl(id);activate(id);if(run)runTab(id);return id;}
-function activate(id){activeTab=id;const _ov=$('overview');if(_ov)_ov.style.display='none';tabs.forEach(t=>{$('tabbtn_'+t.id).classList.toggle('active',t.id===id);$('pane_'+t.id).classList.toggle('active',t.id===id);});const ta=$('ed_'+id);if(ta)setTimeout(()=>ta.focus(),0);updateSchemaBadge(id);const _t=T(id);if(_t&&_t.cols&&_t.cols.length&&!_t.colsFitted){requestAnimationFrame(()=>autofitAll(id));}}
+// Tabs in the order they were last shown, most recent last: closing the shown tab goes back to
+// the one shown before it, not to whichever happens to sit beside it.
+let tabHistory=[];
+function activate(id){activeTab=id;tabHistory=tabHistory.filter(x=>x!==id);tabHistory.push(id);const _ov=$('overview');if(_ov)_ov.style.display='none';tabs.forEach(t=>{$('tabbtn_'+t.id).classList.toggle('active',t.id===id);$('pane_'+t.id).classList.toggle('active',t.id===id);});const ta=$('ed_'+id);if(ta)setTimeout(()=>ta.focus(),0);updateSchemaBadge(id);const _t=T(id);if(_t&&_t.cols&&_t.cols.length&&!_t.colsFitted){requestAnimationFrame(()=>autofitAll(id));}
+ // A table tab brought back on connect reads its table the first time it is shown, not all at once.
+ if(_t&&_t.runOnShow){_t.runOnShow=false;runTab(id);}}
 // Where the active tab's queries run: that schema's row in the list is marked (.runs). It was a
 // "Schema: x" chip in the top bar; the list already names every schema, so marking the row says
 // the same without the room a label takes. A table or DDL tab keeps the schema it was opened from
@@ -9362,7 +9597,7 @@ document.addEventListener('keydown',e=>{if(e.key!=='F6'||e.ctrlKey||e.altKey||!a
 // F1 opens the list of shortcuts, as help does in most programs, and closes it again.
 document.addEventListener('keydown',e=>{if(e.key==='F1'&&!e.ctrlKey&&!e.altKey&&!e.shiftKey){e.preventDefault();if($('mShortcuts').classList.contains('show'))hide('mShortcuts');else show('mShortcuts');}});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){const open=[...document.querySelectorAll('.modal.show')].filter(m=>!window._floatingMinimized[m.id]);if(open.length){modalClose(open[open.length-1].id);}else if(window._newConnPrev&&!$('ctx').offsetParent)cancelNewConn();}});
-function closeTab(id){const t=T(id);if(t&&t.runningReqId){cancelQuery(id);}delete vpState[id];closeCursorFor(t);txClose(t);const i=tabs.findIndex(t=>t.id===id);if(i<0)return;tabs.splice(i,1);$('tabbtn_'+id).remove();$('pane_'+id).remove();if(activeTab===id&&tabs.length)activate(tabs[tabs.length-1].id);if(tabs.length===0){activeTab=null;}saveSession();toggleOverview();}
+function closeTab(id){const t=T(id);if(t&&t.runningReqId){cancelQuery(id);}delete vpState[id];closeCursorFor(t);txClose(t);const i=tabs.findIndex(t=>t.id===id);if(i<0)return;tabs.splice(i,1);$('tabbtn_'+id).remove();$('pane_'+id).remove();tabHistory=tabHistory.filter(x=>x!==id&&T(x));if(activeTab===id&&tabs.length)activate(tabHistory.length?tabHistory[tabHistory.length-1]:tabs[tabs.length-1].id);if(tabs.length===0){activeTab=null;}saveSession();toggleOverview();}
 // Each saved connection remembers its own open tabs (keyed by connection name; ad-hoc/unsaved
 // connections are keyed by host+user+port so different credentials don't collide).
 function sessionKeyFor(){const cn=$('connlist')?$('connlist').value:'';if(cn)return 'conn:'+cn;return 'adhoc:'+($('user')?$('user').value:'')+'@'+($('host')?$('host').value:'')+':'+($('port')?$('port').value:'');}
@@ -9384,16 +9619,33 @@ function saveSession(key){let k,json;try{k=key||sessionKeyFor();json=JSON.string
  // saved again once it has made room.
  try{if(localStorage.getItem('history')!=null){histMigrate().then(done=>{if(done)saveSession(key);});return;}}catch(e){}
  if(!window._sessionSaveWarned){window._sessionSaveWarned=true;const m='The open tabs could not be saved - the browser storage for this app is full. Copy anything you need out of them before closing the app.';toast(m,true);log(m);}}
+// The query a table tab holds as the app writes it - opening the table, its quick filters (openRun).
+function restoredTableSql(db,table,filters){return 'SELECT * FROM '+qid(db)+'.'+qid(table)+(filters&&filters.length?' WHERE '+filters.join(' AND '):'')+';';}
 function restoreSessionFor(key){if(tabs.length)return;let arr=[];try{const raw=localStorage.getItem('session:'+key);if(raw!=null){arr=JSON.parse(raw);}else if(!localStorage.getItem('_sessionMigrated')){const old=localStorage.getItem('session');if(old)arr=JSON.parse(old);localStorage.setItem('_sessionMigrated','1');}}catch(e){}if(Array.isArray(arr)&&arr.length){arr.forEach(t=>{
-  // Table tabs are always bounded (LIMIT 1000), so it's safe to auto-run them on restore -
-  // otherwise the tab looks silently empty even though the table has data (never actually queried).
+  // Table tabs only ever pull PAGE_BATCH rows per round trip through the cursor-streaming
+  // pipeline regardless of table size, so it's safe to auto-run them on restore - otherwise
+  // the tab looks silently empty even though the table has data (never actually queried).
   // Plain query tabs could be arbitrary/heavy, so those restore WITHOUT auto-running; a clear
   // status message replaces what would otherwise look like a blank, broken result.
-  const id=openTab(t.title,t.sql,t.db,!!t.table,t.table,t.ddl||null);if(t.ddl&&t.gen!=null)T(id).genSql=t.gen;
-  if(t.table&&Array.isArray(t.filters)&&t.filters.length){T(id).filterClauses=t.filters.filter(x=>typeof x==='string');updateFilterBar(id);}
+  // A table tab runs again only while it still holds the table's own query, as the app wrote it
+  // (its quick filters included). One whose text was replaced by a query of your own is a query tab
+  // now: the restore ran that query - whatever it was, and against whatever server you connected
+  // to - so it comes back not run, like any other.
+  const filters=t.table&&Array.isArray(t.filters)?t.filters.filter(x=>typeof x==='string'):[];
+  const gen=t.table&&t.db?restoredTableSql(t.db,t.table,filters):null;
+  const asWritten=!!gen&&String(t.sql||'').trim()===gen;
+  // And it reads its table the first time it is shown (activate), not on connect: ten table tabs
+  // were ten queries before anything was looked at. The tab shown when the restore is done reads
+  // at once.
+  const id=openTab(t.title,t.sql,t.db,false,t.table,t.ddl||null);if(t.ddl&&t.gen!=null)T(id).genSql=t.gen;
+  if(gen&&!asWritten){T(id).genSql=gen;markEdited(id);}
   if(t.file&&typeof t.file.name==='string'){const f=t.file;T(id).file={name:f.name,path:f.path||null,handle:null,bom:!!f.bom,eol:f.eol==='\r\n'?'\r\n':'\n',saved:f.dirty?null:$('ed_'+id).value};const tb=$('tabbtn_'+id);if(tb)tb.title=f.path||'';refreshTabDirty(id);}
-  if(!t.table){const st=$('st_'+id);if(st)st.textContent='Restored - not yet run. Click Run Query.';}
-});}}
+  if(asWritten&&filters.length){T(id).filterClauses=filters;updateFilterBar(id);}
+  const st=$('st_'+id);
+  if(asWritten){T(id).runOnShow=true;if(st)st.textContent='Restored - reads the table when you open this tab.';}
+  else if(st)st.textContent='Restored - not yet run. Click Run Query.';
+});
+ if(activeTab)activate(activeTab);}}
 // Closes every tab without the "unsaved changes" prompt - only called right after the user has
 // already confirmed switching connections (connect() asks that separately, once, up front).
 function clearAllTabsSilently(){[...tabs].forEach(t=>{tabSessClose(t);const b=$('tabbtn_'+t.id);if(b)b.remove();const p=$('pane_'+t.id);if(p)p.remove();});tabs=[];activeTab=null;toggleOverview();markRunSchema(null);}
@@ -9406,6 +9658,9 @@ function clearAllTabsSilently(){[...tabs].forEach(t=>{tabSessClose(t);const b=$(
 // path (runs it, reports OK) instead of the query path that actually displays a result grid.
 // The active schema is still shown via the "Schema: <db>" badge, so nothing is lost here.
 function newTab(){openTab('Query','',curSchema,false,null);}
+// A double-click on the tab bar's empty space - beside or below the tabs - opens a new tab, as in a
+// browser. On a tab it does nothing more than the clicks do.
+document.addEventListener('dblclick',e=>{if(e.target&&e.target.id==='tabsbar')newTab();});
 function sqlFileText(text,f){let s=String(text).replace(/\r\n?/g,'\n');if(f&&f.eol==='\r\n')s=s.replace(/\n/g,'\r\n');return (f&&f.bom?'﻿':'')+s;}
 function sqlFileOpened(name,raw,bom,path,handle){const text=String(raw);
  return {name,path:path||null,handle:handle||null,bom:!!bom,eol:/\r\n/.test(text)?'\r\n':'\n',text:text.replace(/\r\n?/g,'\n')};}
@@ -9868,7 +10123,7 @@ async function runScriptResults(id,sql,reqId,seq){const t0=performance.now();
  if(t.resultSets.length){showResultSet(id,0);}
  else{t.cols=[];t.rows=[];$('res_'+id).innerHTML='';renderResultSetTabs(id);updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';}
  const n=t.resultSets.length;
- if(r.ok){st.className='status';st.textContent='OK. '+stmts.length+' statement(s) executed, '+n+' result(s).';runLog(id,'SCRIPT OK ('+stmts.length+' statements, '+n+' results, '+fmtMs(performance.now()-t0)+')'+(stmts.length===1?': '+sqlOneLine(stmts[0]):''));}
+ if(r.ok){st.className='status';st.textContent='OK. '+stmts.length+' statement(s) executed, '+n+' result(s).';runLog(id,f=>'SCRIPT OK ('+stmts.length+' statements, '+n+' results, '+fmtMs(performance.now()-t0)+')'+(stmts.length===1?': '+f(stmts[0]):''));}
  else{st.className='status err';st.textContent=timeLimitNote(r.error||'Failed.')+(n?' - showing the '+n+' result(s) produced before it.':'');runLog(id,logErr(r.error||'Failed.'),'err',{sql,n:errStmtNo(r.error)});}
  setRunWarnings(id,r.warnings,stmts);
  if(writes&&t.db)loadObjects(t.db);
@@ -9935,7 +10190,7 @@ function timeLimitNote(err,reading){err=String(err==null?'':err);
 // runSql(): send the editor SQL to the server and show the rows (or the error).
 async function runSql(id,sql,paging){const t=T(id);if(!t)return;const userRun=!!t._histNext;t._histNext=false;
  if(!paging&&!(await okToRunUnfiltered(t,splitStmts(String(sql==null?'':sql)).filter(s=>!isCommentOnly(s))))){const s0=$('st_'+id);if(s0){s0.className='status';s0.textContent='Not run.';}return;}
- if(sql!=null&&sql!==t.curRun){t.prevRun=t.curRun;t.curRun=sql;}const st=$('st_'+id);st.className='status';st.textContent='Running\u2026';
+ if(sql!=null&&sql!==t.curRun){t.prevRun=t.curRun;t.curRun=sql;}const st=$('st_'+id);st.className='status';st.textContent='Running\u2026';hideLoadAll(id);
  if(runSessOf(t))await sessFree(t,true); // the tab's kept connection holds the cursor of a result still being read: the close is waited for
  closeCursorFor(t);
  const hr=(!paging&&userRun)?histStart(t,sql):null;
@@ -10011,7 +10266,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;const userRun=!!
     t.lastRunQ={sql:exact?exact.sql:_q,db:runDb,exactText:exact&&exact.cols.length?exact.cols:undefined,timeLimit:timeLimitSec()};const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,timeLimit:t.lastRunQ.timeLimit,requestId:reqId,pageSize:PAGE_BATCH,browse:true,exactText:exact&&exact.cols.length?exact.cols:undefined,session:runSessOf(t)},t.abortCtrl.signal);
     if(r.aborted){if(!stale()){st.className='status';st.textContent='Query cancelled.';}return;}
     if(stale())return;
-    if(!r.ok){st.className='status err';st.textContent=timeLimitNote(r.error);$('res_'+id).innerHTML='';runLog(id,sqlOneLine(_q)+' -> '+logErr(r.error),'err',{sql,n:stmts.length});await schemaGoneNote(id,r.error);if(t.ddl){const _rn=await ddlRestoreIfDropped(t.ddl);if(_rn){st.textContent+=_rn;log(_rn.trim());}}return;}
+    if(!r.ok){st.className='status err';st.textContent=timeLimitNote(r.error);$('res_'+id).innerHTML='';runLog(id,f=>f(_q)+' -> '+logErr(r.error),'err',{sql,n:stmts.length});await schemaGoneNote(id,r.error);if(t.ddl){const _rn=await ddlRestoreIfDropped(t.ddl);if(_rn){st.textContent+=_rn;log(_rn.trim());}}return;}
     t.cols=r.columns;t.binCols=r.binaryCols||[];t.rows=r.rows;t.exact=!!exact;t.pk=null;t.pending=null;t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();
     // Direct clear (not updateEditBar) since a fresh query's table-ness isn't known yet - gives
     // instant feedback instead of showing stale buttons from whatever was loaded before while
@@ -10024,7 +10279,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;const userRun=!!
     t.cursorId=r.cursorId||null;t.hasMore=!!r.hasMore;t.cursorReqId=t.cursorId?reqId:null;
     t.warnFinalNo=stmts.length||1;
     addRunWarnings(id,r.warnings);
-    if(!r.columns.length){st.textContent=r.message||'Query OK.';runLog(id,sqlOneLine(_q)+' -> OK, '+fmtMs(r.elapsedMs));$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';return;}
+    if(!r.columns.length){st.textContent=r.message||'Query OK.';runLog(id,f=>f(_q)+' -> OK, '+fmtMs(r.elapsedMs));$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';return;}
     const ra=$('resultActions_'+id);if(ra)ra.style.display='inline-flex';
     refreshRunTableBinding(id,lastStmt,tableDb);
     // Column types and NULL-ability are read again for every result: the tab may now show another
@@ -10057,7 +10312,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;const userRun=!!
     } else { t.estRows=null; }
     if(stale())return;
     t.lastElapsedMs=r.elapsedMs;
-    runLog(id,sqlOneLine(_q)+' -> '+fmtCount(t.rows.length)+' row'+(t.rows.length===1?'':'s')+(t.hasMore?' (more as you scroll)':'')+', '+fmtMs(r.elapsedMs)+(r.fetchMs!=null&&r.jsonMs!=null&&r.elapsedMs>=300?' (parse '+fmtMs(r.fetchMs)+', JSON '+fmtMs(r.jsonMs)+')':''));
+    runLog(id,f=>f(_q)+' -> '+fmtCount(t.rows.length)+' row'+(t.rows.length===1?'':'s')+(t.hasMore?' (more as you scroll)':'')+', '+fmtMs(r.elapsedMs)+(r.fetchMs!=null&&r.jsonMs!=null&&r.elapsedMs>=300?' (parse '+fmtMs(r.fetchMs)+', JSON '+fmtMs(r.jsonMs)+')':''));
     renderGrid(id);updatePager(id);
     updateStatusLine(id);
     updateSchemaBadge(id);
@@ -10075,7 +10330,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;const userRun=!!
       if(!r.failures.length){
         const ra=scriptAffected(r.statements);
         st.textContent='OK. '+r.succeeded+' of '+r.total+' statement(s) executed'+(ra!=null?', '+rowsAffected(ra):'')+'.';
-        runLog(id,'SCRIPT OK ('+r.succeeded+'/'+r.total+' statements'+(ra!=null?', '+rowsAffected(ra):'')+(r.elapsedMs!=null?', '+fmtMs(r.elapsedMs):'')+')'+(r.statements?'\n'+stmtLines(r.statements,r.total).join('\n'):''));
+        runLog(id,f=>'SCRIPT OK ('+r.succeeded+'/'+r.total+' statements'+(ra!=null?', '+rowsAffected(ra):'')+(r.elapsedMs!=null?', '+fmtMs(r.elapsedMs):'')+')'+(r.statements?'\n'+stmtLines(r.statements,r.total,f).join('\n'):''));
       } else {
         st.className='status err';
         st.textContent=r.succeeded+' of '+r.total+' succeeded, '+r.failures.length+' failed (see log for details).';
@@ -10088,16 +10343,16 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;const userRun=!!
         const succNote=succeededIdx.length?' (statement(s) '+succeededIdx.join(', ')+')':'';
         const detail=r.failures.map(f=>'Statement '+f.index+' of '+r.total+': '+f.error+'\n  '+f.preview).join('\n\n');
         const ra=scriptAffected(r.statements);
-        runLog(id,'SCRIPT: '+r.succeeded+' of '+r.total+' succeeded'+succNote+(ra!=null?', '+rowsAffected(ra):'')+'.'+(r.statements&&r.statements.length?'\n'+stmtLines(r.statements,r.total).join('\n'):'')+'\n\nFailed:\n'+detail,'err',{sql,n:r.failures[0].index});
+        runLog(id,f=>'SCRIPT: '+r.succeeded+' of '+r.total+' succeeded'+succNote+(ra!=null?', '+rowsAffected(ra):'')+'.'+(r.statements&&r.statements.length?'\n'+stmtLines(r.statements,r.total,f).join('\n'):'')+'\n\nFailed:\n'+detail,'err',{sql,n:r.failures[0].index});
       }
       if(t.db)loadObjects(t.db);
     } else if(r.ok){if(hr&&r.affected!=null)hr.affected=+r.affected;const sts=r.statements,ra=scriptAffected(sts);
       st.textContent='OK. '+stmts.length+' statement(s) executed'+(ra!=null?', '+rowsAffected(ra):'')+'.';
-      if(sts&&sts.length===1)runLog(id,sts[0].sql+' -> '+stmtOutcome(sts[0]));
-      else runLog(id,'SCRIPT OK ('+stmts.length+' statements'+(ra!=null?', '+rowsAffected(ra):'')+(r.elapsedMs!=null?', '+fmtMs(r.elapsedMs):'')+')'+(sts?'\n'+stmtLines(sts,sts.length).join('\n'):''));
+      if(sts&&sts.length===1)runLog(id,f=>f(sts[0].sql)+' -> '+stmtOutcome(sts[0]));
+      else runLog(id,f=>'SCRIPT OK ('+stmts.length+' statements'+(ra!=null?', '+rowsAffected(ra):'')+(r.elapsedMs!=null?', '+fmtMs(r.elapsedMs):'')+')'+(sts?'\n'+stmtLines(sts,sts.length,f).join('\n'):''));
       if(t.db)loadObjects(t.db);}
     else{st.className='status err';st.textContent=timeLimitNote(r.error);const sts=r.statements;
-      runLog(id,'SCRIPT ERROR: '+r.error+(sts&&sts.length?'\nRan before it:\n'+stmtLines(sts).join('\n'):''),'err',{sql,n:errStmtNo(r.error)});await schemaGoneNote(id,r.error);}
+      runLog(id,f=>'SCRIPT ERROR: '+r.error+(sts&&sts.length?'\nRan before it:\n'+stmtLines(sts,0,f).join('\n'):''),'err',{sql,n:errStmtNo(r.error)});await schemaGoneNote(id,r.error);}
     setRunWarnings(id,r.warnings,stmts);
   }
  } finally {
@@ -10283,16 +10538,18 @@ function closeCursorFor(t){if(!t||!t.cursorId)return;const cid=t.cursorId;t.curs
 // the existing Cancel button/cancelQuery(id) plumbing keeps working unmodified during a slow
 // "fetch next" too, not just on the very first page.
 // t.fetchingMore makes an overlapping call (e.g. two scroll events firing close together) a no-op.
-async function fetchNextBatch(id){const t=T(id);if(!t||!t.cursorId||t.runningReqId||t.fetchingMore)return;
+// quiet: a read that is one of many (Load all rows, Load more) - the grid is drawn and the reading
+// told in the log once at the end, not after every batch; the row count still moves on each.
+async function fetchNextBatch(id,size,quiet){const t=T(id);if(!t||!t.cursorId||t.runningReqId||t.fetchingMore)return;
  const st=$('st_'+id);const wasClassName=st?st.className:'';const wasText=st?st.textContent:'';
  t.fetchingMore=true;t.abortCtrl=new AbortController();t.runningReqId=t.cursorReqId;setRunning(id,true);
  // The rows this appends belong to the run that opened the cursor. If a newer run has started
  // since, they are someone else's rows - see the run stamp in runSql.
  const seq=t.runSeq;
  const stale=()=>!T(id)||t.runSeq!==seq;
- if(st){st.className='status';st.textContent='Fetching next '+PAGE_BATCH+' rows\u2026';}
+ if(st){st.className='status';st.textContent='Fetching next '+fmtCount(size||PAGE_BATCH)+' rows\u2026';}
  try{
-  const r=await api('/api/fetch-cursor-batch',{cursorId:t.cursorId,requestId:t.cursorReqId,pageSize:PAGE_BATCH},t.abortCtrl.signal);
+  const r=await api('/api/fetch-cursor-batch',{cursorId:t.cursorId,requestId:t.cursorReqId,pageSize:size||PAGE_BATCH},t.abortCtrl.signal);
   if(r.aborted){if(T(id)&&st){st.className='status';st.textContent='Query cancelled.';}return;}
   if(stale())return;
   if(!r.ok){if(st){st.className='status err';st.textContent=timeLimitNote(r.error,true);}log(logErr(r.error));t.cursorId=null;t.cursorReqId=null;t.hasMore=false;return;}
@@ -10303,7 +10560,7 @@ async function fetchNextBatch(id){const t=T(id);if(!t||!t.cursorId||t.runningReq
   // renderBody (not renderGrid) deliberately: it only rewrites tbody's own innerHTML, not the
   // scrollable wrap element's - renderGrid replacing wrap's innerHTML resets scrollTop to 0,
   // which would yank the view back to the top on every background scroll-triggered prefetch.
-  renderBody(id);updatePager(id);updateStatusLine(id);
+  if(!quiet)renderBody(id);updatePager(id);updateStatusLine(id);
  } finally {
   if(T(id)){t.fetchingMore=false;t.runningReqId=null;t.abortCtrl=null;setRunning(id,false);}
  }
@@ -10408,6 +10665,11 @@ function sqlBlankStringsAndComments(s){let out='',q=null;
   out+=c;}
  return out;}
 async function openRun(id){const t=T(id);const where=combinedFilterWhere(t);const wh=where?(' WHERE '+where):'';const sql='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+wh+';';t.genSql=sql;edSetAll(id,sql);syncHl(id);await runSql(id,sql);updateFilterBar(id);}
+// After Apply the rows are read again, with the column filters and sort kept. The query that
+// produced them runs again when it only reads, so a SELECT of your own - its columns, joins and
+// order - stays as written; otherwise the table is read as opening it does.
+async function applyReload(id){const t=T(id);if(!t)return;const q=t.curRun;
+ await rerunKeepingView(id,runOnlyReads(q)?()=>runSql(id,q):()=>openRun(id));}
 
 // ---- editable grid with pending changes ----
 function clip(v,n){const s=String(v);return s.length>n?s.slice(0,n)+'\u2026':s;}
@@ -10644,13 +10906,21 @@ function renderGrid(id){const t=T(id);const ed=!!t.pk;if(!t.filters)t.filters={}
  t.cols.forEach((c,ci)=>{h+='<th style="top:24px;padding:1px"><input data-ci="'+ci+'" oninput="(v=>gridTypeSoon(\''+id+'\',()=>setFilter(\''+id+'\','+ci+',v)))(this.value)" value="'+esc(t.filters[ci]||'')+'" placeholder="filter" style="width:100%;font-weight:400;font-size:11px"></th>';});
  h+='<th style="top:24px"></th>';
  h+='</tr></thead><tbody id="tbody_'+id+'"></tbody></table>';
- $('res_'+id).innerHTML=h;renderBody(id);syncFilterRowTop(id);requestAnimationFrame(()=>autofitAll(id));wireColResize(id);updateStatusLine(id);refreshTabDirty(id);syncFilterUi(id);vpRefresh(id);
+ // Drawn again for the same run - an edit, a sort, a filter - the grid stays where it was scrolled
+ // to: replacing its HTML put it back at the top, away from the row just edited. A new result starts
+ // at the top.
+ const _w=$('res_'+id),_keep=_w&&t._drawnSeq!=null&&t._drawnSeq===t.runSeq?[_w.scrollTop,_w.scrollLeft]:null;t._drawnSeq=t.runSeq;
+ _w.innerHTML=h;renderBody(id);
+ // Only once the rows give it its height can it scroll there; then the rows there are drawn.
+ if(_keep){_w.scrollTop=_keep[0];_w.scrollLeft=_keep[1];renderBody(id);}
+ syncFilterRowTop(id);requestAnimationFrame(()=>autofitAll(id));wireColResize(id);updateStatusLine(id);refreshTabDirty(id);syncFilterUi(id);vpRefresh(id);
  const wrap=$('res_'+id);if(wrap&&!wrap.dataset.kbWired){wrap.tabIndex=-1;wrap.addEventListener('keydown',e=>{
    if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&!e.altKey&&(e.key==='c'||e.key==='C')){
     const tg=e.target;if(tg&&(tg.tagName==='INPUT'||tg.tagName==='TEXTAREA'))return;
     const t=T(id);
     if(t&&t.cellSel&&t.cellSel.size){e.preventDefault();const n=t.cellSel.size;
      copyText(pickedCellsText(id),'Copied '+n+' cell'+(n===1?'':'s')+'.');return;}
+    if(gridTextSelected(id))return;
     if(t&&t.selected&&t.selected.size){e.preventDefault();copySelRows(id);return;}
     return;}
    // Esc lets the picked cells go; pressed again, the ticked rows. Not while typing in a cell.
@@ -10764,6 +11034,46 @@ function syncFilterUi(id){const t=T(id);if(!t)return;const on=!!t.search,any=on|
  const box=$('gsearch_'+id);if(box)box.classList.toggle('on',on);const b=$('clrflt_'+id);if(b)b.style.display=any?'':'none';}
 function clearGridFilters(id){const t=T(id);if(!t)return;t.filters={};const fr=$('filterrow_'+id);if(fr)fr.querySelectorAll('input').forEach(i=>i.value='');
  const box=$('gsearch_'+id);if(box)box.value='';setGridSearch(id,'');}
+// Whether every statement of a run only reads, so running it again changes nothing.
+function runOnlyReads(sql){return !!(sql&&String(sql).trim())&&splitStmts(String(sql)).filter(s=>!isCommentOnly(s)).every(s=>/^(select|show|describe|desc|explain|with|table|values|use)\b/i.test(sqlHead(s)));}
+// The grid's Refresh button: the query that produced the rows runs again - not whatever the editor
+// holds now - with the column filters and the sort kept (rerunKeepingView). Edits not applied yet
+// would go with the old rows, so that is asked first, and so is a run that does more than read:
+// running it again would change data.
+async function refreshGrid(id){const t=T(id);if(!t)return;const sql=t.curRun;
+ if(!sql||!String(sql).trim()){toast('Nothing to refresh - run a query first.',true);return;}
+ if(t.runningReqId){toast('A query is still running in this tab.',true);return;}
+ const n=pendingCount(t);if(n>0&&!(await ask('This tab has '+n+' change'+(n===1?'':'s')+' not applied yet. Refresh and discard '+(n===1?'it':'them')+'?')))return;
+ if(!runOnlyReads(sql)&&!(await ask('The query that produced these rows also runs statements that are not plain reads. Run all of it again?')))return;
+ await rerunKeepingView(id,()=>runSql(id,sql));}
+// Reads the grid's rows again through run() - Refresh, and the reload after Apply - and puts the
+// column filters, the sort and the scroll position back on the new rows. A run clears filters and
+// sort (runSql), so they are kept here by column name and given back to the columns still there; a
+// column that is gone takes its filter with it. The search belongs to the tab and stays anyway.
+// As many rows as were loaded are read again - a run reads the first page only, so after loading
+// 5,000 rows an Apply showed 1,000 - and the scroll position is put back once the grid is drawn,
+// so the row just edited is still in front of you rather than the top of the table.
+async function rerunKeepingView(id,run){const t=T(id);if(!t)return;
+ const cols=t.cols||[],filters={};Object.entries(t.filters||{}).forEach(([ci,v])=>{if(v&&cols[ci]!=null)filters[cols[ci]]=v;});
+ const sortName=t.sortCol>=0?cols[t.sortCol]:null,sortDir=t.sortDir;
+ const w=$('res_'+id),top=w?w.scrollTop:0,left=w?w.scrollLeft:0,loaded=(t.rows||[]).length;
+ const seq0=t.runSeq||0;
+ await run();
+ // Only the run started here gets them back: one started meanwhile shows rows of its own.
+ const mine=()=>T(id)&&t.runSeq===seq0+1;
+ if(!mine()||t.resultSets||!t.cols||!t.cols.length||!$('tbody_'+id))return;
+ const nf={};Object.keys(filters).forEach(c=>{const ci=t.cols.indexOf(c);if(ci>=0)nf[ci]=filters[c];});
+ const si=sortName!=null?t.cols.indexOf(sortName):-1;
+ if(Object.keys(nf).length||si>=0){t.filters=nf;t._hitAt=null;if(si>=0){t.sortCol=si;t.sortDir=sortDir;}
+  renderGrid(id);updatePager(id);updateStatusLine(id);}
+ while(mine()&&t.hasMore&&t.cursorId&&t.rows.length<loaded){const before=t.rows.length;
+  // A batch already being read (by a scroll) is waited for, not doubled.
+  if(t.fetchingMore){await new Promise(r=>setTimeout(r,50));continue;}
+  await fetchNextBatch(id,Math.min(5000,loaded-before));if(t.rows.length===before)break;}
+ if(!mine())return;
+ // The grid draws its columns' widths in the next frame (autofitAll); the position goes back after.
+ await new Promise(r=>{requestAnimationFrame(()=>requestAnimationFrame(r));setTimeout(r,150);}); // a hidden window draws no frames
+ const w2=$('res_'+id);if(mine()&&w2){w2.scrollTop=top;w2.scrollLeft=left;renderBody(id);}}
 // q is already lower-cased. The same case-insensitive "contains" a column filter uses, on any column.
 function rowHasText(row,q){return row.some(v=>v!=null&&String(v).toLowerCase().includes(q));}
 function sortBy(id,ci){const t=T(id);if(t.sortCol===ci){if(t.sortDir>0){t.sortDir=-1;}else{t.sortCol=-1;t.sortDir=1;}}else{t.sortCol=ci;t.sortDir=1;}$('sortrow_'+id).innerHTML=sortHeader(id,!!t.pk);renderBody(id);syncFilterRowTop(id);wireColResize(id);updatePager(id);updateStatusLine(id);}
@@ -10775,9 +11085,14 @@ function viewIndices(id){const t=T(id);
  const key=t.rows.length+'\u0001'+JSON.stringify(t.filters||{})+'\u0001'+(t.search||'')+'\u0001'+t.sortCol+'\u0001'+t.sortDir;
  if(t._viewMemo&&t._viewMemo.rows===t.rows&&t._viewMemo.key===key)return t._viewMemo.view;
  const view=viewIndicesFresh(t);t._viewMemo={rows:t.rows,key,view};return view;}
+// A column filter is a case-insensitive "contains"; a * in it stands for any run of characters
+// (greedy), so "a*z" keeps values holding an a with a z somewhere after it. Nothing else is special.
+function wildMatcher(f){f=String(f);if(!f.includes('*')){f=f.toLowerCase();return s=>s.toLowerCase().includes(f);}
+ const re=new RegExp(f.split('*').map(p=>p.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('.*'),'is');return s=>re.test(s);}
 function viewIndicesFresh(t){let view=t.rows.map((r,ri)=>ri);
  const fk=Object.keys(t.filters).filter(k=>t.filters[k]!=='' && t.filters[k]!=null);
- if(fk.length)view=view.filter(ri=>fk.every(ci=>{const v=t.rows[ri][ci];return v!=null&&String(v).toLowerCase().includes(String(t.filters[ci]).toLowerCase());}));
+ const fm=fk.map(ci=>[ci,wildMatcher(t.filters[ci])]);
+ if(fk.length)view=view.filter(ri=>fm.every(([ci,m])=>{const v=t.rows[ri][ci];return v!=null&&m(String(v));}));
  // The toolbar's search, ANDed with the column filters.
  const q=t.search?String(t.search).toLowerCase():'';
  if(q)view=view.filter(ri=>rowHasText(t.rows[ri],q));
@@ -10803,16 +11118,31 @@ function viewIndicesFresh(t){let view=t.rows.map((r,ri)=>ri);
 function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=new Set();const view=viewIndices(id);t._total=view.length;const q=t.search?String(t.search).toLowerCase():'';
  const wrap=$('res_'+id);const rowH=t._rowH||23;const VIRT_THRESHOLD=300;const BUFFER=15;
  let startIdx=0,endIdx=view.length,topH=0,botH=0;
+ // The rows above the ones drawn are a spacer of their number times an estimated row height. Rows
+ // differ by a pixel or two (a badge, the arrow to a referenced row), so the rows drawn from the
+ // scroll position alone landed up to dozens of rows from where they had been on screen: under a
+ // pointer that had not moved, another row, and a click after a scroll picked a cell a few rows up
+ // or down. So the row at the top of the view (anchor) is found among the rows drawn before; when
+ // it is still at the same place in the result - no sort or filter moved it - the rows are drawn
+ // around it, and it is put back exactly where it was on screen (below).
+ const tb=$('tbody_'+id);let anchor=null;
  if(view.length>VIRT_THRESHOLD&&wrap){
   const scrollTop=wrap.scrollTop,viewportH=wrap.clientHeight||600;
-  startIdx=Math.max(0,Math.floor(scrollTop/rowH)-BUFFER);
-  endIdx=Math.min(view.length,Math.ceil((scrollTop+viewportH)/rowH)+BUFFER);
+  if(tb&&t._bodyStart!=null){const wr=wrap.getBoundingClientRect(),vTop=wr.top+((wrap.querySelector('thead')||{}).offsetHeight||0),vBot=wr.top+wrap.clientHeight;
+   const trs=tb.querySelectorAll('tr[data-r]');
+   for(let k=0;k<trs.length;k++){const r=trs[k].getBoundingClientRect();if(r.bottom<=vTop)continue;
+    const pos=t._bodyStart+k;if(r.top<vBot&&view[pos]===+trs[k].getAttribute('data-r'))anchor={ri:trs[k].getAttribute('data-r'),top:r.top,pos,above:Math.max(0,r.top-vTop)};break;}}
+  if(anchor){startIdx=Math.max(0,anchor.pos-Math.ceil(anchor.above/rowH)-BUFFER);endIdx=Math.min(view.length,anchor.pos+Math.ceil(viewportH/rowH)+BUFFER);}
+  else{startIdx=Math.max(0,Math.floor(scrollTop/rowH)-BUFFER);endIdx=Math.min(view.length,Math.ceil((scrollTop+viewportH)/rowH)+BUFFER);}
   if(startIdx>=view.length)startIdx=Math.max(0,view.length-1);
   if(endIdx<startIdx)endIdx=startIdx;
   topH=startIdx*rowH;botH=(view.length-endIdx)*rowH;
  }
+ t._bodyStart=startIdx;
  const slice=view.slice(startIdx,endIdx),gf=gridFocusOf(id);
  const nCols=1+(ed?1:0)+t.cols.length;
+ // The foreign key columns, each with its key's parts, for the arrow that goes to the row.
+ const fkp={};if(t.table&&t.fk&&t.fk.length)t.cols.forEach((c,ci)=>{const fp=fkPartsOf(t,c);if(fp)fkp[ci]=fp;});
  let h='';
  if(topH>0)h+='<tr class="vpad" style="height:'+topH+'px"><td colspan="'+nCols+'" style="padding:0;border:none"></td></tr>';
  slice.forEach((ri,k)=>{const row=t.rows[ri];const del=ed&&t.pending.del.has(ri);const vi=startIdx+k,up=vi>0?view[vi-1]:null,dn=vi<view.length-1?view[vi+1]:null;const fr=gf&&gf.ri===ri;h+='<tr data-r="'+ri+'" class="'+(del?'del':'')+(fr?' kbrow':'')+(t.selected.has(ri)?' rowpick':'')+'">';
@@ -10821,12 +11151,20 @@ function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=
   row.forEach((v,ci)=>{const key=ri+':'+ci;const pend=t.pending&&(key in t.pending.upd);const val=pend?t.pending.upd[key]:v;
    const cls=(ed?'editable'+(pend?' dirty':''):'')+(q&&val!=null&&String(val).toLowerCase().includes(q)?' hit':'')+cellPickCls(t,ri,ci,up,dn)+(fr&&gf.ci===ci?' kbfocus':'');
    const attr=(cls?'class="'+cls.trim()+'" ':'')+(ed?'onclick="cellClick(this,\''+id+'\','+ri+','+ci+',event)" ondblclick="editCell(this,\''+id+'\','+ri+','+ci+')" onmousedown="gridDragStart(event,\''+id+'\','+ri+','+ci+')" onmouseover="gridDragOver(event,\''+id+'\','+ri+','+ci+')" ':'onclick="cellClick(this,\''+id+'\','+ri+','+ci+',event)" ondblclick="viewCell(\''+id+'\','+ri+','+ci+')" onmousedown="gridDragStart(event,\''+id+'\','+ri+','+ci+')" onmouseover="gridDragOver(event,\''+id+'\','+ri+','+ci+')" ')+'oncontextmenu="cellMenu(event,\''+id+'\','+ri+','+ci+')"';
-   h+='<td '+attr+' title="'+esc(clip(val,300))+'">'+cellHtml(val,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci])+'</td>';});h+='</tr>';});
+   const go=fkGoHtml(id,ri,ci,fkp[ci]);
+   h+='<td '+attr+' title="'+esc(clip(val,300))+'">'+go+cellHtml(val,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci])+'</td>';});h+='</tr>';});
  if(botH>0)h+='<tr class="vpad" style="height:'+botH+'px"><td colspan="'+nCols+'" style="padding:0;border:none"></td></tr>';
  if(ed)t.pending.ins.forEach((row,ii)=>{h+='<tr class="insrow"><td></td><td class="delcell" onclick="delIns(\''+id+'\','+ii+')">\u00D7</td>';
    t.cols.forEach((c,ci)=>{const v=row[c];const cAttr=esc(c).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27').replace(/\n/g,'\\n').replace(/\r/g,'\\r');h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+cAttr+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+cAttr+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+cAttr+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci])+'</td>';});h+='</tr>';});
- $('tbody_'+id).innerHTML=h;
- if(wrap&&slice.length){const sampleTr=wrap.querySelector('tbody tr[data-r]');if(sampleTr){const mh=sampleTr.getBoundingClientRect().height;if(mh>4)t._rowH=mh;}}
+ tb.innerHTML=h;
+ // The anchor back where it was on screen: the spacer above takes up the difference, or, near the
+ // top where there is none to take it, the scroll position does.
+ if(anchor){const tr=tb.querySelector('tr[data-r="'+anchor.ri+'"]');
+  if(tr){const d=tr.getBoundingClientRect().top-anchor.top,pad=tb.firstElementChild;
+   if(Math.abs(d)>=0.5){if(pad&&pad.classList.contains('vpad')&&topH-d>=0)pad.style.height=(topH-d)+'px';else wrap.scrollTop+=d;}}}
+ // The estimate: the middle height of the rows drawn, changed only when it is really off.
+ if(wrap&&slice.length){const hs=[...tb.querySelectorAll('tr[data-r]')].map(tr=>tr.getBoundingClientRect().height).filter(x=>x>4).sort((a,b)=>a-b);
+  if(hs.length){const mh=hs[hs.length>>1];if(!t._rowH||Math.abs(mh-t._rowH)>0.5)t._rowH=mh;}}
  updateEditBar(id);}
 // renderBody() (the grid's own virtualized-scroll re-render, up to ~60/sec while actively
 // scrolling) calls this every time, but the pending count/selection it depends on almost never
@@ -11404,9 +11742,12 @@ function typeIntoCells(id,ch){const t=T(id);if(!(t&&t.pk&&t.pending))return fals
  inlineEdit(td,id,ri,ci,{initial:ch,keys});return true;}
 let clickTimer=null;
 let gridFocus={}; // per-tab: {ri, ci} of the currently keyboard-focused cell
-function gridCellEl(id,ri,ci){const t=T(id);const wrap=$('res_'+id);if(!wrap||!t)return null;const off=(!!t.pk)?2:1;
+// A row that is not drawn is scrolled to and drawn - unless noScroll: only looking, as to take a mark
+// off a cell (the row gets its marks when it is drawn). Taking the focus mark off the cell focused
+// before a scroll scrolled back to it: the first click after scrolling landed far from where it was.
+function gridCellEl(id,ri,ci,noScroll){const t=T(id);const wrap=$('res_'+id);if(!wrap||!t)return null;const off=(!!t.pk)?2:1;
  let tr=wrap.querySelector('tr[data-r="'+ri+'"]');
- if(!tr){
+ if(!tr&&!noScroll){
   const view=viewIndices(id);const pos=view.indexOf(ri);
   if(pos>=0){const rowH=t._rowH||23;wrap.scrollTop=Math.max(0,pos*rowH-rowH*4);renderBody(id);tr=wrap.querySelector('tr[data-r="'+ri+'"]');}
  }
@@ -11415,7 +11756,7 @@ function gridCellEl(id,ri,ci){const t=T(id);const wrap=$('res_'+id);if(!wrap||!t
 // nothing is marked until a cell is picked again.
 function gridFocusOf(id){const f=gridFocus[id],t=T(id);return f&&t&&f.rows===t.rows?f:null;}
 // The focused cell's row and column name are marked too (kbrow, kbcol), more quietly than the cell.
-function gridMarkFocus(id,f,on){const el=gridCellEl(id,f.ri,f.ci);if(el){el.classList.toggle('kbfocus',on);if(el.parentNode)el.parentNode.classList.toggle('kbrow',on);}
+function gridMarkFocus(id,f,on){const el=gridCellEl(id,f.ri,f.ci,true);if(el){el.classList.toggle('kbfocus',on);if(el.parentNode)el.parentNode.classList.toggle('kbrow',on);}
  const t=T(id),hdr=$('sortrow_'+id),th=hdr&&t&&hdr.children[1+(t.pk?1:0)+f.ci];if(th)th.classList.toggle('kbcol',on);}
 function gridSetFocus(id,ri,ci,scroll){const t=T(id);if(!t)return;const view=viewIndices(id);if(view.indexOf(ri)<0)return;
  const old=gridFocus[id];if(old)gridMarkFocus(id,old,false);
@@ -11874,15 +12215,34 @@ function gridDragStart(e,id,ri,ci){if(e.button!==0)return;
  // Ctrl or shift held: the press belongs to the grid, not to the browser's text selection, which
  // would otherwise streak from wherever the caret last was to the cell that was clicked.
  if(e.ctrlKey||e.metaKey||e.shiftKey){e.preventDefault();dropTextSelection();}
- window._gridDrag={id,ri,ci,add:e.ctrlKey||e.metaKey,moved:false,base:null};}
+ window._gridDrag={id,ri,ci,add:e.ctrlKey||e.metaKey,moved:false,base:null,x:e.clientX,y:e.clientY};}
+// Whether the pointer itself has moved since the press. Rows can move under a pointer that has not:
+// the grid draws the rows scrolled to a frame later, at a height it estimates, so a click just after
+// scrolling had the row under it change while the button was down - and the browser's mouseover on
+// the new row picked the cells from the one clicked down to it, five or six of them.
+// A press or move without a position (one made by code, at 0,0 - no real one is at the window's
+// corner, over the toolbar) counts as moved, as it always did.
+function gridDragMoved(d,e){const at=v=>v&&typeof v.clientX==='number'&&(v.clientX||v.clientY);
+ return !at(e)||d.x==null||!(d.x||d.y)||Math.abs(e.clientX-d.x)>3||Math.abs(e.clientY-d.y)>3;}
 // The press becomes a cell selection: the cells picked so far kept (Ctrl) or let go, and no text
 // selected anywhere on the page while it lasts.
 // A press in a result cell picks cells, never text: the browser's own selection is not let start
 // there. Cleared after the fact it came back on the next move, ran from the cell into the rest of the
 // window, and could stay behind when the button was let go. The cell's editor and any other text box
 // select text as always.
+// A read-only result is the exception: no cell opens for editing there, so a press that stays in one
+// cell selects that cell's characters, to copy part of a value. Leaving the cell still picks cells.
+function gridReadOnly(id){const t=T(id);return !t||!t.pk||document.body.classList.contains('ro');}
 document.addEventListener('selectstart',e=>{const n=e.target&&(e.target.nodeType===1?e.target:e.target.parentElement);
- if(n&&n.closest&&n.closest('[id^="res_"] table.grid td')&&!n.closest('input,textarea,[contenteditable="true"]'))e.preventDefault();});
+ if(!(n&&n.closest&&n.closest('[id^="res_"] table.grid td')&&!n.closest('input,textarea,[contenteditable="true"]')))return;
+ const w=n.closest('[id^="res_"]'),d=window._gridDrag;
+ if(w&&gridReadOnly(w.id.slice(4))&&!(d&&d.moved)&&!document.body.classList.contains('gridpicking'))return;
+ e.preventDefault();});
+// Characters selected with the mouse in a cell of this result: what Ctrl+C copies, ahead of ticked rows.
+function gridTextSelected(id){if(!window.getSelection)return false;const s=window.getSelection();
+ if(!s||s.isCollapsed||!s.anchorNode)return false;
+ const w=$('res_'+id),n=s.anchorNode.nodeType===1?s.anchorNode:s.anchorNode.parentElement;
+ return !!(w&&n&&w.contains(n)&&n.closest('td'));}
 function gridDragBegin(d,t){d.moved=true;
  if(!d.add)t.cellSel.clear();
  d.base=new Set(t.cellSel);
@@ -11894,6 +12254,7 @@ function gridDragOver(e,id,ri,ci){const d=window._gridDrag;
  if(d&&d.moved)dropTextSelection();
  if(!d||d.id!==id||(e.buttons!==undefined&&!(e.buttons&1)))return;
  if(!d.moved&&d.ri===ri&&d.ci===ci)return;
+ if(!d.moved&&!gridDragMoved(d,e))return;
  const t=T(id);if(!t.cellSel)t.cellSel=new Set();
  if(!d.moved)gridDragBegin(d,t);
  t.cellSel=new Set(d.base);d.lastCi=ci;
@@ -11911,7 +12272,7 @@ document.addEventListener('mousemove',e=>{const d=window._gridDrag;
  // Leaving the cell the press began on, in any direction, is a selection - also where no other cell
  // is passed on the way (from the last row straight down, out of the results). Left to the browser,
  // that drag selected text from the cell into the rest of the window.
- if(d&&!d.moved&&(e.buttons&1)){const c=gridCellEl(d.id,d.ri,d.ci),t=T(d.id);
+ if(d&&!d.moved&&(e.buttons&1)&&gridDragMoved(d,e)){const c=gridCellEl(d.id,d.ri,d.ci,true),t=T(d.id);
   if(c&&t){const r=c.getBoundingClientRect();
    if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom){if(!t.cellSel)t.cellSel=new Set();gridDragBegin(d,t);
     t.cellSel=new Set(d.base);t.cellSel.add(d.ri+':'+d.ci);d.lastCi=d.ci;t._cellAnchor=d.ri+':'+d.ci;paintCellPick(d.id);}}}
@@ -12031,13 +12392,25 @@ function insClick(td,id,ii,col){{const t0=T(id);if(t0&&t0.pending&&t0.pending.in
 // regenerates every cell from persisted state, and a not-yet-committed inline edit isn't part of
 // that state. Reverting only the one cell that actually needs reverting avoids the whole class of
 // race entirely.
+// The cell comes back as the grid draws it, the arrow to a referenced row included: an inline edit
+// left by clicking another row used to take the arrow with it.
 function cellRevert(td,id,ri,ci){const t=T(id);const key=ri+':'+ci;const pend=t.pending&&(key in t.pending.upd);const val=pend?t.pending.upd[key]:t.rows[ri][ci];
- td.className='editable'+(pend?' dirty':'');td.title=String(clip(val,300));td.innerHTML=cellHtml(val,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci]);}
+ const fp=t.table&&t.fk&&t.fk.length?fkPartsOf(t,t.cols[ci]):null;
+ td.className='editable'+(pend?' dirty':'');td.title=String(clip(val,300));td.innerHTML=fkGoHtml(id,ri,ci,fp)+cellHtml(val,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci]);}
+// The little arrow in a foreign key cell that opens the row it points at, with a preview on hover;
+// nothing where the cell is no key (fp null) or a part of the key is NULL.
+function fkGoHtml(id,ri,ci,fp){if(!fp||!fkRefOf(id,ri,ci,fp))return '';const a='\''+id+'\','+ri+','+ci;
+ return '<span class="fkgo" title="" onmousedown="event.stopPropagation()" ondblclick="event.stopPropagation()" onclick="fkGo(event,'+a+')" onmouseenter="fkPeek(this,'+a+')" onmouseleave="fkPeekHide()">↗</span>';}
 function insCellRevert(td,id,ii,col){const t=T(id);const v=t.pending.ins[ii][col];const ci=t.cols.indexOf(col);
  td.className='editable';td.title=(v===undefined?'undefined':String(v));td.innerHTML=cellHtml(v===undefined?null:v,t.bitCols&&t.bitCols[ci],t.binCols&&t.binCols[ci]);}
 // With opts ({initial, keys}) the edit was started by typing: the box opens at once holding what was
 // typed - waiting for the column type would lose the keys that follow - and is written to every
 // cell in keys.
+// The box an inline edit types into. A multi-line value gets a textarea about as tall as its lines,
+// which grows the row - unless the value panel is open: that already shows the whole value, so the
+// textarea is one line laid over the cell, like a single-line value's input, and the row stays put.
+function cellEdOpen(td,cur,isMulti,nullOk){const tall=isMulti&&!vpOpen;
+ td.classList.add('cellEditing');td.innerHTML=(tall?'':td.innerHTML)+'<div class="celled'+(tall?'':' over')+'">'+(isMulti?'<textarea rows="'+(tall?Math.min(8,Math.max(2,String(cur).split(/\r\n|\r|\n/).length)):1)+'"></textarea>':'<input>')+(nullOk?'<button tabindex="-1" title="Set NULL">&empty;</button>':'')+'</div>';}
 async function inlineEdit(td,id,ri,ci,opts){const t=T(id);const key=ri+':'+ci;const cur=opts?opts.initial:(key in t.pending.upd)?t.pending.upd[key]:t.rows[ri][ci];
  if(!opts){
  // Enum/boolean columns always go through editCell's dropdown - a plain inline text input would
@@ -12062,7 +12435,7 @@ async function inlineEdit(td,id,ri,ci,opts){const t=T(id);const key=ri+':'+ci;co
  // No inp.select() here on purpose - auto-selecting the whole value made entering edit mode look
  // like a big blue highlight box instead of just dropping into the text, so the cursor is placed
  // at the end of the existing value instead (still lets you type to replace via Home+shift, etc).
- td.classList.add('cellEditing');td.innerHTML=(isMulti?'':td.innerHTML)+'<div class="celled'+(isMulti?'':' over')+'">'+(isMulti?'<textarea rows="'+Math.min(8,Math.max(2,String(cur).split(/\r\n|\r|\n/).length))+'"></textarea>':'<input>')+(nullOk?'<button tabindex="-1" title="Set NULL">&empty;</button>':'')+'</div>';const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('.celled button');
+ cellEdOpen(td,cur,isMulti,nullOk);const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('.celled button');
  // A BIT value comes as bytes (0x01) but the cell shows it as a number, and the box shows what the
  // cell did; a number typed back is stored as that bit pattern (see bitAt in applyChangesRun).
  const bitHex=!opts&&!!(t.bitCols&&t.bitCols[ci])&&typeof cur==='string'&&/^0x[0-9A-Fa-f]+$/.test(cur);
@@ -12081,7 +12454,7 @@ async function inlineEdit(td,id,ri,ci,opts){const t=T(id);const key=ri+':'+ci;co
  inp.addEventListener('blur',()=>setTimeout(()=>{if(!done){if(dirty)set(inp.value);else cellRevert(td,id,ri,ci);}},120));}
 function inlineEditIns(td,id,ii,col){const t=T(id);if(isGenCol(id,col)){toast(genColMsg(col),true);return;}const cur=t.pending.ins[ii][col];
  const isMulti=cur!=null&&/[\r\n]/.test(String(cur));const nullOk=canNullIns(id,col);
- td.classList.add('cellEditing');td.innerHTML=(isMulti?'':td.innerHTML)+'<div class="celled'+(isMulti?'':' over')+'">'+(isMulti?'<textarea rows="'+Math.min(8,Math.max(2,String(cur).split(/\r\n|\r|\n/).length))+'"></textarea>':'<input>')+(nullOk?'<button tabindex="-1" title="Set NULL">&empty;</button>':'')+'</div>';const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('.celled button');inp.value=(cur==null?'':cur);inp.focus();let done=false,dirty=false;
+ cellEdOpen(td,cur,isMulti,nullOk);const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('.celled button');inp.value=(cur==null?'':cur);inp.focus();let done=false,dirty=false;
  if(nb)colMeta(id).then(()=>{if(!canNullIns(id,col))nb.remove();});
  const set=v=>{done=true;if(v!==null)v=keepLineEnds(cur,v);t.pending.ins[ii][col]=v;renderGrid(id);};
  inp.addEventListener('input',()=>dirty=true);
@@ -12150,14 +12523,14 @@ async function cellMenu(e,id,ri,ci){e.preventDefault();const t=T(id);const key=r
   !multi&&editable&&!sel&&['Delete row',()=>{if(!t.pending.del.has(ri))toggleDel(id,ri);}],
   editable&&sel&&['Delete '+(nsel===1?'the selected row':nsel+' selected rows'),()=>deleteSel(id)],
   '-'];
- if(t.table){const col=t.cols[ci];if(!multi)items.push(['Quick filter',qfSub(id,col,cur)]);if(t.filterClauses&&t.filterClauses.length){if(t.filterClauses.length>1)items.push(['Remove filter',t.filterClauses.map((c,i)=>[clip(c,60),()=>removeFilterClause(id,i)])]);items.push(['Clear filter ('+t.filterClauses.length+')',()=>clearFilters(id)]);}
-  const fkd=(t.fkDetails||[]).find(f=>f[0]===col);
-  // The key is followed into the database it names, on every column it has; a part that is NULL
-  // points nowhere.
-  if(!multi&&fkd&&cur!=null){const refDb=fkd[3]||t.db,parts=fkd[4]!=null?(t.fkDetails||[]).filter(f=>f[4]===fkd[4]&&(f[3]||t.db)===refDb&&f[1]===fkd[1]):[fkd];
-   const valOf=c=>{const i=t.cols.indexOf(c),k=ri+':'+i;return i<0?undefined:(t.pending&&(k in t.pending.upd))?t.pending.upd[k]:t.rows[ri][i];};
-   const pairs=parts.map(f=>[f[2],valOf(f[0])]);
-   if(pairs.every(p=>p[1]!=null))items.push(['Go to referenced row ('+(refDb!==t.db?refDb+'.':'')+fkd[1]+'.'+pairs.map(p=>p[0]).join('+')+')',()=>goToFkRow(refDb,fkd[1],pairs)]);}
+ // The clipboard's value for the quick filter, read before the menu shows (it cannot be read while
+ // building it). Copied in this app from a cell, the value itself is used rather than its text, so
+ // a binary one keeps its type.
+ let clipQf=null;if(t.table&&!multi){clipQf=await qfReadClip(true);const c1=window._cellClipboard;
+  if(clipQf!=null&&c1&&cellClipCount()===1){const v=c1.flat().find(x=>x!==undefined);if(v!=null&&qfClipUsable(cellCopyValue(v))===clipQf)clipQf=v;}}
+ if(t.table){const col=t.cols[ci];if(!multi)items.push(['Quick filter',qfMenu(id,col,cur,clipQf)]);if(t.filterClauses&&t.filterClauses.length){if(t.filterClauses.length>1)items.push(['Remove filter',t.filterClauses.map((c,i)=>[clip(c,60),()=>removeFilterClause(id,i)])]);items.push(['Clear filter ('+t.filterClauses.length+')',()=>clearFilters(id)]);}
+  const fr=!multi&&fkRefOf(id,ri,ci);
+  if(fr)items.push(['Go to referenced row ('+fr.label+')',()=>goToFkRow(fr.db,fr.table,fr.pairs)]);
   items.push('-');}
  // With no row ticked, the rows that picked cells are on are "the selected ones" to an export:
  // cells picked on two rows export those two rows, as ticking them would.
@@ -12176,12 +12549,58 @@ async function cellMenu(e,id,ri,ci){e.preventDefault();const t=T(id);const key=r
 // value is written for the column's type, so an empty binary key (0x) and a text key that looks
 // like hex both find their row.
 async function goToFkRow(db,refTable,pairs){
- const bc=await tableBinCols(db,refTable,pairs.map(p=>p[0]));
- const cond=pairs.map((p,i)=>qid(p[0])+'='+litAs(p[1],bc?bc[i]:null)).join(' AND ');
+ const cond=await fkCond(db,refTable,pairs);
  const _i=openTab(refTable+' (FK: '+pairs.map(p=>p[0]+'='+p[1]).join(', ')+')','SELECT * FROM '+qid(db)+'.'+qid(refTable)+' WHERE '+cond+';',db,false,refTable);
  T(_i).filterClauses=[cond];
  await openRun(_i);
 }
+// The WHERE that finds the row a key points at, each value written for its column's type.
+async function fkCond(db,refTable,pairs){
+ const bc=await tableBinCols(db,refTable,pairs.map(p=>p[0]));
+ return pairs.map((p,i)=>qid(p[0])+'='+litAs(p[1],bc?bc[i]:null)).join(' AND ');}
+// The foreign key a table's column is part of, as its parts: [column, referenced db, table, column].
+// The key is followed into the database it names, on every column it has. null when it is no key.
+function fkPartsOf(t,col){
+ if(!t||!t.table)return null;const all=t.fkDetails||[],fkd=all.find(f=>f[0]===col);if(!fkd)return null;
+ const refDb=fkd[3]||t.db;
+ return {db:refDb,table:fkd[1],parts:fkd[4]!=null?all.filter(f=>f[4]===fkd[4]&&(f[3]||t.db)===refDb&&f[1]===fkd[1]):[fkd]};}
+// Where one cell's key points, with the values as they stand (an edit waiting for Apply counts) -
+// or null, also when a part of the key is NULL: that points nowhere.
+function fkRefOf(id,ri,ci,fp){
+ const t=T(id);if(!t||!t.rows||!t.rows[ri])return null;fp=fp||fkPartsOf(t,t.cols[ci]);if(!fp)return null;
+ const valOf=c=>{const i=t.cols.indexOf(c),k=ri+':'+i;return i<0?undefined:(t.pending&&(k in t.pending.upd))?t.pending.upd[k]:t.rows[ri][i];};
+ const pairs=fp.parts.map(f=>[f[2],valOf(f[0])]);
+ if(!pairs.every(p=>p[1]!=null))return null;
+ return {db:fp.db,table:fp.table,pairs,label:(fp.db!==t.db?fp.db+'.':'')+fp.table+'.'+pairs.map(p=>p[0]).join('+')};}
+// The little arrow in a key's cell: a click opens the row, as the cell menu's 'Go to referenced row'
+// does; resting on it shows a short look at that row. Neither is a click on the cell.
+function fkGo(e,id,ri,ci){e.stopPropagation();e.preventDefault();fkPeekHide();$('ctx').style.display='none';const fr=fkRefOf(id,ri,ci);if(fr)goToFkRow(fr.db,fr.table,fr.pairs);}
+let _fkPeekTok=0,_fkPeekTimer=null;const _fkPeekCache=new Map();
+function fkPeekHide(){_fkPeekTok++;clearTimeout(_fkPeekTimer);const p=$('fkPeek');if(p)p.style.display='none';}
+function fkPeek(el,id,ri,ci){
+ fkPeekHide();const tok=_fkPeekTok;
+ _fkPeekTimer=setTimeout(async()=>{
+  const fr=fkRefOf(id,ri,ci);if(!fr)return;
+  const where=qid(fr.db)+'.'+qid(fr.table);let r;
+  try{const cond=await fkCond(fr.db,fr.table,fr.pairs);const ck=(window._activeConnName||'')+'|'+where+'|'+cond;const hit=_fkPeekCache.get(ck);
+   if(hit&&Date.now()-hit.at<30000)r=hit.r;else{if(tok!==_fkPeekTok)return;r=await api('/api/query',{sql:'SELECT * FROM '+where+' WHERE '+cond+' LIMIT 2',db:fr.db});if(r&&r.ok){if(_fkPeekCache.size>200)_fkPeekCache.clear();_fkPeekCache.set(ck,{at:Date.now(),r});}}}
+  catch(err){r={ok:false,error:String(err&&err.message||err)};}
+  if(tok!==_fkPeekTok||!el.isConnected)return;
+  let p=$('fkPeek');if(!p){p=document.createElement('div');p.id='fkPeek';document.body.appendChild(p);}
+  const head='<div class="fkph">'+esc((fr.db!==T(id).db?fr.db+'.':'')+fr.table)+' <span class="muted" style="font-weight:400">'+esc(fr.pairs.map(q=>q[0]+' = '+clip(q[1],40)).join(', '))+'</span></div>';
+  let body;
+  if(!r||!r.ok)body='<div class="muted">'+esc((r&&r.error)||'Could not read the row.')+'</div>';
+  else if(!r.rows.length)body='<div class="muted">No row there - the key points at nothing.</div>';
+  else{const row=r.rows[0],bin=r.binaryCols||[],bit=r.bitCols||[],MAX=12;
+   body='<table>'+r.columns.slice(0,MAX).map((c,i)=>{const v=row[i];return '<tr><td>'+esc(c)+'</td><td>'+cellHtml(typeof v==='string'&&v.length>200?v.slice(0,200):v,bit[i],bin[i])+'</td></tr>';}).join('')+'</table>'+
+    (r.columns.length>MAX?'<div class="muted" style="margin-top:3px">+ '+(r.columns.length-MAX)+' more column'+(r.columns.length-MAX===1?'':'s')+'</div>':'')+
+    (r.rows.length>1?'<div class="muted" style="margin-top:3px">More than one row matches.</div>':'');}
+  p.innerHTML=head+body+'<div class="muted" style="margin-top:4px;font-size:11px">Click to open it in a tab.</div>';
+  p.style.display='block';p.style.visibility='hidden';p.style.left='0';p.style.top='0';
+  const b=el.getBoundingClientRect(),w=p.offsetWidth,h=p.offsetHeight;
+  let x=Math.min(b.left,innerWidth-w-6);if(x<6)x=6;let y=b.bottom+4;if(y+h>innerHeight-6)y=Math.max(6,b.top-h-4);
+  p.style.left=x+'px';p.style.top=y+'px';p.style.visibility='visible';},350);}
+document.addEventListener('scroll',fkPeekHide,true);document.addEventListener('mousedown',fkPeekHide,true);
 // The Windows clipboard's text format ends at the first NUL. Copying "a<NUL>b" puts "a" on it and
 // drops the rest, and the Clipboard API still reports success - measured: a three-character value
 // arrived as one. Nothing here can carry a NUL through it, so what this does is stop calling that
@@ -12301,7 +12720,7 @@ function copyColumn(id,ci){const t=T(id);const vals=t.rows.map((row,ri)=>{const 
 // The comparisons are built when picked, with the value written for the column's type (see litAs):
 // lit() alone turned an empty binary value into the text '0x' and a text value like 0x41 into a
 // byte, so the filter found nothing, or the wrong rows.
-function qfSub(id,col,val){const q=qid(col);const lv=lit(val);
+function qfSub(id,col,val,noNull){const q=qid(col);const lv=lit(val);
  const cmp=op=>async()=>{const bc=await gridBinCols(id);const ci=T(id).cols.indexOf(col);await addFilterClause(id,q+' '+op+' '+litAs(val,bc&&ci>=0?bc[ci]:null));};const esc=s=>String(s).replace(/([%_\\])/g,'\\$1').replace(/'/g,"''");const sub=[];
  if(val===null){sub.push([q+' IS NULL',()=>addFilterClause(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>addFilterClause(id,q+' IS NOT NULL')]);return sub;}
  const sv=String(val).trim();const isNum=/^-?\d+(\.\d+)?$/.test(sv);const isDate=/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/.test(sv);
@@ -12315,7 +12734,60 @@ function qfSub(id,col,val){const q=qid(col);const lv=lit(val);
  // string, a backslash in the value was taken as an escape and the filter matched nothing.
  const likeSql=p=>' LIKE '+strLit(p)+' ESCAPE '+strLit('\\'),lk=String(like).replace(/([%_\\])/g,'\\$1');
  sub.push([q+" LIKE '%"+ld+"%'",()=>addFilterClause(id,q+likeSql('%'+lk+'%'))]);sub.push([q+" LIKE '"+ld+"%'",()=>addFilterClause(id,q+likeSql(lk+'%'))]);if(!isDate)sub.push([q+" LIKE '%"+ld+"'",()=>addFilterClause(id,q+likeSql('%'+lk))]);}
+ if(noNull)return sub;
  sub.push('-');sub.push([q+' IS NULL',()=>addFilterClause(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>addFilterClause(id,q+' IS NOT NULL')]);return sub;}
+// The comparisons the "Custom value..." dialog offers, and the clause each one makes of a typed
+// value. Values are written as qfSub writes them: by the column's type for the plain comparisons,
+// and as a LIKE pattern with %, _ and \ escaped for "contains" and the like. "LIKE pattern" is the
+// one that takes the value as written, wildcards and all.
+const QF_OPS=[['=','='],['<>','<> (not equal)'],['>','>'],['>=','>='],['<','<'],['<=','<='],['contains','contains'],['notcontains','does not contain'],['starts','starts with'],['ends','ends with'],['like','LIKE pattern (% and _ as typed)'],['notlike','NOT LIKE pattern']];
+async function qfClause(id,col,op,val){const q=qid(col);
+ const lk=String(val).replace(/([%_\\])/g,'\\$1'),likeSql=(not,p)=>' '+(not?'NOT ':'')+'LIKE '+strLit(p)+' ESCAPE '+strLit('\\');
+ switch(op){
+  case 'contains':return q+likeSql(false,'%'+lk+'%');
+  case 'notcontains':return q+likeSql(true,'%'+lk+'%');
+  case 'starts':return q+likeSql(false,lk+'%');
+  case 'ends':return q+likeSql(false,'%'+lk);
+  case 'like':return q+' LIKE '+strLit(val);
+  case 'notlike':return q+' NOT LIKE '+strLit(val);
+ }
+ const bc=await gridBinCols(id),ci=T(id).cols.indexOf(col);
+ return q+' '+op+' '+litAs(val,bc&&ci>=0?bc[ci]:null);}
+// Quick filter on a value typed in, rather than one taken from a cell: starts from the right-clicked
+// cell's value (or the clipboard's), selected, so typing replaces it.
+async function qfCustom(id,col,init){
+ const res=await inputBox({title:'Quick filter: '+col,okText:'Filter',fields:[
+  {key:'op',label:'Column '+col,type:'select',options:QF_OPS.map(o=>({value:o[0],label:o[1]})),value:'='},
+  {key:'val',label:'Value',value:init==null?'':String(init)}]});
+ if(!res)return;
+ await addFilterClause(id,await qfClause(id,col,res.op,res.val));}
+// What the system clipboard holds, if it is something a filter can use: text, one value of it. An
+// image or a file list reads as no text; a range of cells (tab-separated) or a whole document is not
+// one value, and is not offered. A single line end at the end - which a cell copied from a
+// spreadsheet comes with - is not part of the value. null when there is nothing usable or the
+// clipboard cannot be read without asking (a browser asks for permission, and that is left for a
+// click, not every right-click).
+const QF_CLIP_MAX=1000;
+function qfClipUsable(s){if(typeof s!=='string')return null;s=s.replace(/\r?\n$/,'');
+ if(!s.length||s.length>QF_CLIP_MAX||s.indexOf('\t')>=0||s.indexOf('\0')>=0)return null;return s;}
+async function qfReadClip(silent){
+ try{if(!navigator.clipboard||!navigator.clipboard.readText)return null;
+  if(silent&&!window.__TAURI__){const p=navigator.permissions&&await navigator.permissions.query({name:'clipboard-read'}).catch(()=>null);if(!p||p.state!=='granted')return null;}
+  const s=await Promise.race([navigator.clipboard.readText(),new Promise(r=>setTimeout(()=>r(null),400))]);
+  return qfClipUsable(s);
+ }catch(e){return null;}}
+// A short look at the clipboard's value for a menu label: line ends and other control characters
+// shown as visible marks, so a value with a line end in it does not read as two.
+function qfClipPreview(s){const v=String(s).replace(/\r?\n/g,'⏎').replace(/[\x00-\x1F\x7F]/g,'·');return '"'+(v.length>24?v.slice(0,24)+'…':v)+'"';}
+// The quick-filter submenu for a cell: the comparisons on its value, then a value typed in, then the
+// clipboard's - its own comparisons when it could be read already, else read when clicked.
+function qfMenu(id,col,cur,clipText){const sub=qfSub(id,col,cur);
+ sub.push('-');sub.push(['Custom value...',()=>qfCustom(id,col,cur)]);
+ // The clipboard value's comparisons are right here, under a heading naming the value, not one
+ // submenu further in.
+ if(clipText!=null){sub.push('-',{head:'Clipboard value '+qfClipPreview(clipText)},...qfSub(id,col,clipText,true),['Other comparison with the clipboard value...',()=>qfCustom(id,col,clipText)]);}
+ else sub.push(['Clipboard value...',async()=>{const s=await qfReadClip(false);if(s==null){toast('The clipboard holds no single text value to filter on.',true);return;}qfCustom(id,col,s);}]);
+ return sub;}
 // Adds one more ANDed condition to the table tab's active quick filter (does not replace the
 // existing ones) - lets right-clicking two different cells build up a compound WHERE, matching
 // how Heidi's quick-filter stacking works. Re-picking the exact same condition is a no-op.
@@ -12507,7 +12979,7 @@ async function applyChangesRun(id,preview,anyway){const t=T(id);const S=[];const
  // was saved, since until then the reload is still reading on the tab's connection.
  // What was done, by kind: rows updated (however many of their cells), inserted and deleted.
  const nIns=S.filter(x=>x.startsWith('INSERT INTO')).length,what=[[updWh.length,'updated'],[nIns,'inserted'],[delWh.length,'deleted']].filter(x=>x[0]).map(x=>fmtCount(x[0])+' row'+(x[0]===1?'':'s')+' '+x[1]).join(', ');
- if(r.ok){runLog(id,'Applied '+changes+' change(s): '+what+'.');toast('Applied '+changes+' change(s)'+(ws.length?', with '+warnText(ws):'')+'.','ok');invalidateTableCache(t.db,t.table);await openRun(id);refreshTabDirty(id);if(ws.length)setRunWarnings(id,ws,stmts);return true;}else{runLog(id,'APPLY error: '+err,'err');toast(/Result consisted of more than one row/.test(String(r.error))?ONE_ROW_REFUSED:'Apply failed: '+err,true);return false;}}
+ if(r.ok){runLog(id,'Applied '+changes+' change(s): '+what+'.');toast('Applied '+changes+' change(s)'+(ws.length?', with '+warnText(ws):'')+'.','ok');invalidateTableCache(t.db,t.table);await applyReload(id);refreshTabDirty(id);if(ws.length)setRunWarnings(id,ws,stmts);return true;}else{runLog(id,'APPLY error: '+err,'err');toast(/Result consisted of more than one row/.test(String(r.error))?ONE_ROW_REFUSED:'Apply failed: '+err,true);return false;}}
 
 function ddlFailureNote(err, sql){
  const e = String(err || "");
@@ -13353,23 +13825,103 @@ async function refreshProcessList(){
  const hiddenCount=r.rows.length-filteredRows.length;
  r.rows=filteredRows;
  $('plStatus').textContent=r.rows.length+' process(es)'+(hiddenCount?' (hid '+hiddenCount+' - this connection\'s own SHOW PROCESSLIST)':'')+'.';
- let h='<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr>';
- r.columns.forEach((c,ci)=>{const wide=(ci===idIdx)?'min-width:70px;':'';h+='<th style="text-align:left;padding:4px 6px;border-bottom:1px solid var(--bd2);position:sticky;top:0;background:var(--panel2);'+wide+'">'+esc(c)+'</th>';});
- h+='<th style="padding:4px 6px;border-bottom:1px solid var(--bd2);position:sticky;top:0;background:var(--panel2);width:1%"></th></tr></thead><tbody>';
- r.rows.forEach(row=>{
+ window._plData={columns:r.columns,rows:r.rows,idIdx,infoIdx};
+ // Auto-refresh redraws every 3s - hold off while a column edge is mid-drag, or the table being
+ // dragged would be swapped out from under the pointer; the drag's own end draws the latest data.
+ if(_plDragging)_plPendingRender=true;else renderProcessList();
+}
+// Sort column/direction and hand-set column widths survive refreshes (auto-refresh included),
+// keyed by column NAME so they still line up should the PROCESSLIST column set ever differ.
+let _plSort={col:null,dir:1};let _plWidths=null;let _plDragging=false;let _plPendingRender=false;
+function plSetSort(ci){
+ const d=window._plData;if(!d)return;const name=d.columns[ci];
+ if(_plSort.col===name)_plSort.dir=-_plSort.dir;else{_plSort.col=name;_plSort.dir=1;}
+ renderProcessList();
+}
+// Numbers (Id, Time) compare numerically, everything else as text. NULL is the lowest value, and
+// an empty one comes just after it, as the server sorts them: first going up, last going down.
+function plSortRows(rows,ci,dir){
+ const rank=v=>v==null?0:v===''?1:2;
+ return rows.slice().sort((x,y)=>{const a=x[ci],b=y[ci],ra=rank(a),rb=rank(b);
+  if(ra<2||rb<2)return (ra-rb)*dir;
+  const an=Number(a),bn=Number(b);
+  const c=(!isNaN(an)&&!isNaN(bn))?an-bn:String(a).localeCompare(String(b),undefined,{numeric:true,sensitivity:'base'});
+  return c*dir;});
+}
+function plHasWidths(){const d=window._plData;return !!(d&&_plWidths&&d.columns.every(c=>_plWidths[c]>0));}
+function renderProcessList(){
+ const d=window._plData;if(!d)return;const{columns,idIdx,infoIdx}=d;
+ const sci=_plSort.col==null?-1:columns.indexOf(_plSort.col);
+ const rows=sci>=0?plSortRows(d.rows,sci,_plSort.dir):d.rows;
+ const thBase='text-align:left;padding:4px 6px;border-bottom:1px solid var(--bd2);position:sticky;top:0;background:var(--panel2);';
+ let h='<table id="plTable" style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr>';
+ columns.forEach((c,ci)=>{const wide=(ci===idIdx)?'min-width:70px;':'';const arrow=ci===sci?(_plSort.dir>0?' \u25B2':' \u25BC'):'';
+  h+='<th style="'+thBase+wide+'cursor:pointer;user-select:none" onclick="plSetSort('+ci+')" title="Click to sort (again to reverse) - drag the right edge to resize, double-click it to fit">'+esc(c)+arrow+'<span class="rz" data-ci="'+ci+'"></span></th>';});
+ h+='<th style="'+thBase+'width:1%"></th></tr></thead><tbody>';
+ rows.forEach(row=>{
   h+='<tr>';
   row.forEach(v=>{h+='<td style="padding:4px 6px;border-bottom:1px solid var(--bd2)">'+cellHtml(v)+'</td>';});
   const pid=idIdx>=0?row[idIdx]:null;
-  // Same reasoning as the filtering above: this connection's own SHOW [FULL] PROCESSLIST row
-  // can never actually be killed, so - when "Show hidden" reveals it anyway - it gets no Kill
-  // button at all rather than one that would only ever fail.
+  // Same reasoning as the filtering in refreshProcessList: this connection's own SHOW [FULL]
+  // PROCESSLIST row can never actually be killed, so - when "Show hidden" reveals it anyway -
+  // it gets no Kill button at all rather than one that would only ever fail.
   const info=infoIdx>=0?String(row[infoIdx]||'').trim().toLowerCase():'';
   const isSelf=(info==='show full processlist'||info==='show processlist');
   h+='<td style="padding:4px 6px;border-bottom:1px solid var(--bd2)">'+((pid!=null&&!isSelf)?'<button class="sm warn" onclick="killProcess(\''+esc(pid).replace(/\\/g,'\\\\').replace(/\x27/g,'\\x27').replace(/\n/g,'\\n').replace(/\r/g,'\\r')+'\')">Kill</button>':'')+'</td>';
   h+='</tr>';
  });
  h+='</tbody></table>';
- $('plGrid').innerHTML=h;
+ const grid=$('plGrid');const sl=grid.scrollLeft,st=grid.scrollTop;
+ grid.innerHTML=h;
+ if(plHasWidths())plApplyWidths();
+ grid.scrollLeft=sl;grid.scrollTop=st;
+ plWireResize();
+}
+// Until a column is resized the table lays itself out (100% wide, content-sized columns). The
+// first drag snapshots every column's current width; from then on the table is fixed-layout at
+// exactly those widths (long cells cut off with an ellipsis), scrolling sideways when they add
+// up past the dialog's width.
+function plMeasureWidths(){
+ const d=window._plData,table=$('plTable');if(!d||!table)return;
+ const ths=table.querySelectorAll('thead th');const w={};
+ d.columns.forEach((c,ci)=>{w[c]=Math.max(40,Math.round(ths[ci]?ths[ci].getBoundingClientRect().width:120));});
+ _plWidths=Object.assign(w,_plWidths||{});
+}
+function plApplyWidths(){
+ const d=window._plData,table=$('plTable');if(!d||!table)return;
+ let cg=table.querySelector('colgroup');
+ if(!cg){cg=document.createElement('colgroup');d.columns.forEach(()=>cg.appendChild(document.createElement('col')));const last=document.createElement('col');last.style.width='60px';cg.appendChild(last);table.insertBefore(cg,table.firstChild);}
+ d.columns.forEach((c,ci)=>{cg.children[ci].style.width=_plWidths[c]+'px';});
+ table.classList.add('plfixed');table.style.tableLayout='fixed';
+ table.style.width=(d.columns.reduce((s,c)=>s+_plWidths[c],0)+60)+'px';
+}
+function plWireResize(){
+ const d=window._plData,table=$('plTable');if(!d||!table)return;
+ table.querySelectorAll('thead .rz').forEach(rz=>{
+  const ci=+rz.getAttribute('data-ci');const name=d.columns[ci];let sx=0,sw=0,drag=false;
+  rz.addEventListener('pointerdown',e=>{e.stopPropagation();e.preventDefault();
+   if(!plHasWidths()){plMeasureWidths();plApplyWidths();}
+   drag=true;_plDragging=true;sx=e.clientX;sw=_plWidths[name];try{rz.setPointerCapture(e.pointerId);}catch(_){}rz.classList.add('drag');});
+  rz.addEventListener('pointermove',e=>{if(!drag)return;_plWidths[name]=Math.max(40,Math.round(sw+(e.clientX-sx)));plApplyWidths();});
+  const end=e=>{if(!drag)return;drag=false;_plDragging=false;rz.classList.remove('drag');try{rz.releasePointerCapture(e.pointerId);}catch(_){}
+   // Only redraw if a refresh arrived mid-drag - redrawing unconditionally would replace this
+   // handle between the two clicks of a double-click, so the auto-fit would never fire.
+   if(_plPendingRender){_plPendingRender=false;renderProcessList();}};
+  rz.addEventListener('pointerup',end);rz.addEventListener('pointercancel',end);
+  rz.addEventListener('click',e=>e.stopPropagation());
+  rz.addEventListener('dblclick',e=>{e.stopPropagation();plAutofitCol(ci);});
+ });
+}
+// Double-click a column edge: size that column to its widest header/cell text (capped at 600px).
+function plAutofitCol(ci){
+ const d=window._plData,table=$('plTable');if(!d||!table)return;
+ if(!plHasWidths())plMeasureWidths();
+ const probe=document.createElement('span');probe.style.cssText='position:absolute;visibility:hidden;white-space:pre;font-size:12px';document.body.appendChild(probe);
+ let mx=0;
+ [table.querySelectorAll('thead th')[ci],...table.querySelectorAll('tbody tr>td:nth-child('+(ci+1)+')')].forEach(c=>{if(!c)return;probe.textContent=c.textContent;mx=Math.max(mx,probe.getBoundingClientRect().width);});
+ probe.remove();
+ _plWidths[d.columns[ci]]=Math.min(Math.max(40,Math.ceil(mx)+20),600);
+ renderProcessList();
 }
 async function killProcess(pid){
  if(!(await ask('Kill process '+pid+'? This immediately terminates its current query/connection.')))return;
@@ -15120,7 +15672,11 @@ function acAccept(id){const ta=acTa||$('ed_'+id);const pos=ta.selectionStart;con
  // it: the backtick used to stay in front of the suggestion, doubled by its own quoting or left open.
  const m=before.match(/\x60[^\x60\n]*$|[A-Za-z_][A-Za-z0-9_$]*$/);const start=pos-(m?m[0].length:0);const quoted=!!(m&&m[0][0]==='\x60');
  const mAfter=quoted?(after.match(/^[^\x60\n]*\x60/)||after.match(/^[A-Za-z0-9_$]+/)):after.match(/^[A-Za-z0-9_$]+/);const end=pos+(mAfter?mAfter[0].length:0);const val=acItems[acIdx]||'';
- edReplaceRange(id,start,end,val);const np=start+val.length;ta.selectionStart=ta.selectionEnd=np;acHide();syncHl(id);ta.focus();}
+ // LIKE comes with its pattern quotes, '%%', and the cursor between the two % to type the search
+ // term right away - unless a quoted pattern already follows it.
+ const likePat=!quoted&&/^(NOT\s+)?LIKE$/i.test(val)&&!/^\s*['"]/.test(ta.value.slice(end));
+ const ins=likePat?val+" '%%'":val;
+ edReplaceRange(id,start,end,ins);const np=start+(likePat?val.length+3:ins.length);ta.selectionStart=ta.selectionEnd=np;acHide();syncHl(id);ta.focus();}
 
 let csvTarget={db:null,table:null};
 async function exportFull(db,name,fmt){fmt=fmt||'csv';const ext=(fmt==='inserts')?'sql':'csv';const defName=name+(fmt==='inserts'?'_inserts.sql':'.csv');

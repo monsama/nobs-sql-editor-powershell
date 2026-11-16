@@ -285,7 +285,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull', 'copyInserts']) {
                 pending: { upd, del: new Set(), ins } };
     const env = {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, runLog: () => {}, invalidateTableCache: () => {},
-      openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, sessFree: async () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, true, false],
+      openRun: async () => {}, applyReload: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, sessFree: async () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, true, false],
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m), fmtCount: n => String(n), splitStmts: () => [], warnFromWrites: () => [],
       histStart: () => null, histKeep: () => {}, clip: v => String(v), ONE_ROW_REFUSED: '', warnText: () => '',
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
@@ -310,7 +310,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull', 'copyInserts']) {
 {
   const SRC = src;
   const CHECK = (c, l, d) => eq(c, true, l + (c ? '' : ' -> ' + d));
-  const names = ['goToFkRow', 'qfSub', 'litAs', 'lit', 'strLit'];
+  const names = ['goToFkRow', 'fkCond', 'qfSub', 'litAs', 'lit', 'strLit'];
   const body = names.map(n => extractFunction(SRC, n)).join('\n');
   const make = (bin) => {
     const tab = { cols: ['id', 'v'], filterClauses: null };
@@ -382,7 +382,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull', 'copyInserts']) {
                 pending: { upd: { '0:1': 'y' }, del: new Set(), ins: [] } };
     const env = {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, runLog: () => {}, invalidateTableCache: () => {},
-      openRun: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, sessFree: async () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, false],
+      openRun: async () => {}, applyReload: async () => {}, refreshTabDirty: () => {}, sessOf: () => undefined, sessFree: async () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, false],
       tableNulTextCount: async () => nulRows, fmtCount: n => String(n), splitStmts: () => [], warnFromWrites: () => [],
       histStart: () => null, histKeep: () => {}, clip: v => String(v), ONE_ROW_REFUSED: '', warnText: () => '',
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),

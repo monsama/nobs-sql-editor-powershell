@@ -35,6 +35,12 @@ foreach ($file in Get-ChildItem (Join-Path $here '*.Tests.ps1') | Sort-Object Na
 
     # The source is whatever the file's own header says it was generated from.
     $header = ($text -split "`n" | Select-Object -First 15) -join "`n"
+    # A test this edition has taken over from the editor's says so in its header ("this edition's own
+    # copy now", with why) and is not held to the editor's file - it is listed, so it stays in sight.
+    if ($header -match "this edition's own copy") {
+        "  own   $($file.Name) is this edition's own copy (see its header), not compared"
+        continue
+    }
     $named = [regex]::Match($header, 'tests/(ui/[a-z0-9-]+\.test|browser/[a-z0-9-]+\.browser)\.mjs')
     if (-not $named.Success) {
         "  FAIL  $($file.Name) embeds a copy but its header does not name the editor file it came from"
